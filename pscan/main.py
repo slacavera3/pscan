@@ -1,6 +1,7 @@
 import sys
 import time
 import os
+import numpy as np
 
 # Safe cross-platform imports
 from pscan import stage_driver
@@ -12,6 +13,13 @@ try:
 except ImportError:
     a2d_driver = None
     print("[SYSTEM] Running on Windows. A2D Comedi drivers disabled.")
+
+# Windows-only drivers (Linux will safely ignore these)
+try:
+    from pscan import driver_ixon
+except ImportError:
+    driver_ixon = None
+    print("[SYSTEM] pyAndorSDK2 not found. iXon driver disabled on this OS.")
 
 def parse_config(filepath):
     """Parses the .con file into a dictionary of actions."""
@@ -33,11 +41,23 @@ def main():
     stage.connect()
     counts_per_mm = 34304.0
 
+    # Initialize iXon if running on the Windows Machine
+    ixon = None
+    ixon_configured = False
+    if driver_ixon and os.name == 'nt':
+        try:
+            ixon = driver_ixon.IXonCamera()
+            ixon.connect()
+        except Exception as e:
+            print(f"[WARNING] iXon hardware not found: {e}")
+
     print("Starting automated acquisition pipeline...")
     
     # Core Orchestration Loop
+    trace_idx = 0
     for action in actions:
-        # Example of the dynamic settling logic replacing the hardcoded sleep
+        
+        # Dynamic settling logic replacing the hardcoded sleep
         if action['type'] == 'apt_stage':
             x_val = action.get('x_target')
             y_val = action.get('y_target')
@@ -63,7 +83,32 @@ def main():
         elif action['type'] == 'scope':
             print(f"Triggering LeCroy (Segments: {action.get('segments', 1)})...")
             # lecroy_driver.acquire(...)
+            
+        elif action['type'] == 'ixon':
+            if ixon:
+                # Only run the heavy setup function on the very first pixel
+                if not ixon_configured:
+                    ixon.setup(
+                        exposure=float(action.get('exposure', 0.1)),
+                        em_gain=int(action.get('em_gain', 72)),
+                        kinetic_cycle=float(action.get('kinetic_cycle', 0.5)),
+                        shutter_open=action.get('shutter_open', 'True').lower() == 'true'
+                    )
+                    ixon_configured = True
+                
+                print(f"Acquiring iXon Frame {trace_idx}...")
+                frame_data = ixon.acquire()
+                
+                if frame_data is not None:
+                    # Save array to disk using a generic naming convention
+                    np.save(f"ixon_data_{trace_idx:05d}.npy", frame_data)
+                
+                trace_idx += 1
 
+    # Safe Shutdown
+    if ixon:
+        ixon.shutdown()
+        
     print("Pipeline complete.")
 
 if __name__ == "__main__":

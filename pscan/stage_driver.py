@@ -40,9 +40,11 @@ class ThorlabsStage:
             self.ser.write(struct.pack('<HBBBB', 0x0018, 0x00, 0x00, self.DEST_MOTHERBOARD, self.SOURCE_PC))
             time.sleep(0.2)
             
-            # Enable channels properly (0x01 for X, 0x02 for Y)
-            self.set_enable('x', True)
-            self.set_enable('y', True)
+            # Use OS-isolated param1 for channel enables to protect Linux functionality
+            param1_y = 0x02 if os.name == 'nt' else 0x01 
+            
+            self.ser.write(struct.pack('<HBBBB', 0x0210, 0x01, 0x01, self.DEST_CH1, self.SOURCE_PC))
+            self.ser.write(struct.pack('<HBBBB', 0x0210, param1_y, 0x01, self.DEST_CH2, self.SOURCE_PC))
             time.sleep(0.5)
             print("Thorlabs stage controller initialized successfully.")
         except Exception as e:
@@ -59,16 +61,6 @@ class ThorlabsStage:
         if ax == 'x': return self.DEST_CH1
         if ax == 'y': return self.DEST_CH2
         raise ValueError(f"Unknown axis identifier target: {axis_name}")
-
-    def set_enable(self, axis, enable):
-        dest = self._get_dest_channel(axis)
-        param1 = 0x01 if str(axis).lower() == 'x' else 0x02
-        state = 0x01 if enable else 0x02
-        self.ser.write(struct.pack('<HBBBB', 0x0210, param1, state, dest, self.SOURCE_PC))
-
-    def home_axis(self, axis):
-        dest = self._get_dest_channel(axis)
-        self.ser.write(struct.pack('<HBBBB', 0x0443, 0x01, 0x00, dest, self.SOURCE_PC))
 
     def move_absolute(self, axis, position_mm, counts_per_mm):
         dest = self._get_dest_channel(axis)
@@ -95,3 +87,30 @@ class ThorlabsStage:
         
         # CRITICAL: Execute ping!
         self.ser.write(struct.pack('<HBBBB', 0x0448, 0x01, 0x00, dest, self.SOURCE_PC))
+
+    def get_position(self, axis, counts_per_mm):
+        dest = self._get_dest_channel(axis)
+        self.ser.reset_input_buffer()
+        self.ser.write(struct.pack('<HBBBB', 0x0411, 0x01, 0x00, dest, self.SOURCE_PC))
+        
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            if self.ser.in_waiting >= 12:
+                data = self.ser.read(12)
+                if data[0:2] == b'\x12\x04':
+                    _, _, _, _, _, _, pos = struct.unpack('<HBBBBHl', data)
+                    return pos / counts_per_mm
+        return None
+
+    def wait_to_settle(self, axis, target_mm, counts_per_mm, tolerance_mm=0.001, timeout_sec=2.0):
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            current_pos = self.get_position(axis, counts_per_mm)
+            if current_pos is not None:
+                error = abs(current_pos - target_mm)
+                if error <= tolerance_mm:
+                    time.sleep(0.02)
+                    return True
+            time.sleep(0.005)
+        print(f"[WARNING] Stage {axis.upper()} timed out before fully settling!")
+        return False

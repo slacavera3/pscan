@@ -119,6 +119,17 @@ action script
 script echo "Acquisition step complete!"
 end
 
+# 9. ACQUIRE ANDOR IXON FRAMES
+# The camera block executes at every coordinate.
+# If shutter_open is True, the shutter stays open for the entire run.
+# NOT TTL DRIVEN YET, WILL BE MUCH FASTER
+action ixon
+exposure 0.1
+em_gain 72
+kinetic_cycle 0.5
+shutter_open True
+end
+
 ### Disclaimer & License
 Author: Sal
 Year: 2026
