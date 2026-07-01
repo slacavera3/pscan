@@ -18,25 +18,19 @@ if [ "$(uname)" = "Linux" ]; then
     fi
 fi
 
-# 2. The Anti-Bandaid: Enforce Directory Structure
-# If the labmate somehow cloned an incomplete repo, this fixes it silently.
+# 2. Enforce Directory Structure
 if [ ! -f "pscan/__init__.py" ]; then
     echo "[SYSTEM] Enforcing Python package structure..."
     mkdir -p pscan
     touch pscan/__init__.py
 fi
 
-# 3. Synchronize Python Environment
-echo -e "\n[PIP] Synchronizing Python environment globally..."
-sudo pip install -e . --break-system-packages
+# 3. Standard Global Installation
+echo -e "\n[PIP] Installing Python package globally..."
 
-# 4. The Anti-Bandaid: Fix Root Ownership
-# Because sudo pip creates root-owned metadata, we forcibly return ownership 
-# to the labmate so they never see a 'Permission Denied' traceback.
-if [ "$(uname)" = "Linux" ]; then
-    echo "[SYSTEM] Cleaning up permissions..."
-    sudo chown -R $USER:$USER .
-fi
+# Notice the '-e' is completely gone. This copies the files to the system 
+# directory safely without polluting the local user folder with root permissions.
+sudo pip install . --break-system-packages
 
 echo -e "\n[SUCCESS] Installation complete!"
 echo "You can now run 'pscan' or 'pystage' from anywhere in the terminal."
