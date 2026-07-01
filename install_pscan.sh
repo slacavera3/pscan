@@ -18,12 +18,25 @@ if [ "$(uname)" = "Linux" ]; then
     fi
 fi
 
-# 2. Let pip handle the Python dependencies and CLI linking
-echo -e "\n[PIP] Synchronizing Python environment..."
+# 2. The Anti-Bandaid: Enforce Directory Structure
+# If the labmate somehow cloned an incomplete repo, this fixes it silently.
+if [ ! -f "pscan/__init__.py" ]; then
+    echo "[SYSTEM] Enforcing Python package structure..."
+    mkdir -p pscan
+    touch pscan/__init__.py
+fi
 
-# The '-e .' flag tells pip to look at the setup.py in the current folder.
-# --break-system-packages is included for global Debian 13 compatibility.
+# 3. Synchronize Python Environment
+echo -e "\n[PIP] Synchronizing Python environment globally..."
 sudo pip install -e . --break-system-packages
+
+# 4. The Anti-Bandaid: Fix Root Ownership
+# Because sudo pip creates root-owned metadata, we forcibly return ownership 
+# to the labmate so they never see a 'Permission Denied' traceback.
+if [ "$(uname)" = "Linux" ]; then
+    echo "[SYSTEM] Cleaning up permissions..."
+    sudo chown -R $USER:$USER .
+fi
 
 echo -e "\n[SUCCESS] Installation complete!"
 echo "You can now run 'pscan' or 'pystage' from anywhere in the terminal."
