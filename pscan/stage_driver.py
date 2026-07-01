@@ -36,15 +36,11 @@ class ThorlabsStage:
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
             
-            # Init motherboard
+            # Init motherboard and enable channels (Restored strictly to your master copy)
             self.ser.write(struct.pack('<HBBBB', 0x0018, 0x00, 0x00, self.DEST_MOTHERBOARD, self.SOURCE_PC))
             time.sleep(0.2)
-            
-            # Use OS-isolated param1 for channel enables to protect Linux functionality
-            param1_y = 0x02 if os.name == 'nt' else 0x01 
-            
             self.ser.write(struct.pack('<HBBBB', 0x0210, 0x01, 0x01, self.DEST_CH1, self.SOURCE_PC))
-            self.ser.write(struct.pack('<HBBBB', 0x0210, param1_y, 0x01, self.DEST_CH2, self.SOURCE_PC))
+            self.ser.write(struct.pack('<HBBBB', 0x0210, 0x02, 0x01, self.DEST_CH2, self.SOURCE_PC))
             time.sleep(0.5)
             print("Thorlabs stage controller initialized successfully.")
         except Exception as e:
