@@ -131,30 +131,36 @@ def main():
     x_enabled = True
     y_enabled = True
     needs_refresh = False
+    needs_redraw = True  # <--- New UI flag
 
     while True:
-        os.system('cls' if os.name == 'nt' else 'clear')
-        x_status = "[ON]" if x_enabled else "[OFF]"
-        y_status = "[ON]" if y_enabled else "[OFF]"
-        
-        print("==================================================")
-        print(f" THORLABS PRECISION CONTROL CLI ({port})")
-        print("==================================================")
-        print(f" X-Axis Position: {x_pos:8.5f} mm  {x_status}")
-        print(f" Y-Axis Position: {y_pos:8.5f} mm  {y_status}")
-        print(f"\n Current Step Size: {current_step:.5f} mm")
-        print("==================================================")
-        print("   Up/Down/L/R : Jog Axes   |  J : Set Step Size")
-        print("   G           : Go To Abs  |  C : Center (0.0, 0.0)")
-        print("   1 / 2       : Toggle X/Y |  R : Refresh Pos")
-        print("   H           : Home Stage |  Q : Quit")
-        print("==================================================")
-        print(f" [MSG] {msg}")
-        
+        # Only clear and redraw the screen if something changed!
+        if needs_redraw:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            x_status = "[ON]" if x_enabled else "[OFF]"
+            y_status = "[ON]" if y_enabled else "[OFF]"
+            
+            print("==================================================")
+            print(f" THORLABS PRECISION CONTROL CLI ({port})")
+            print("==================================================")
+            print(f" X-Axis Position: {x_pos:8.5f} mm  {x_status}")
+            print(f" Y-Axis Position: {y_pos:8.5f} mm  {y_status}")
+            print(f"\n Current Step Size: {current_step:.5f} mm")
+            print("==================================================")
+            print("   Up/Down/L/R : Jog Axes   |  J : Set Step Size")
+            print("   G           : Go To Abs  |  C : Center (0.0, 0.0)")
+            print("   1 / 2       : Toggle X/Y |  R : Refresh Pos")
+            print("   H           : Home Stage |  Q : Quit")
+            print("==================================================")
+            print(f" [MSG] {msg}")
+            
+            needs_redraw = False  # Reset flag after drawing
+
         key = get_key()
         
         if key:
             key_str = key.lower() if isinstance(key, str) else ''
+            needs_redraw = True  # A key was pressed, we will need to redraw
             
             if key_str == 'q':
                 break
