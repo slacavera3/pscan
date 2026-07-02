@@ -179,17 +179,27 @@ def main():
                 msg = "Invalid coordinates entered. Move cancelled."
 
         elif key_str == 'c':
-            if x_enabled: stage.move_absolute(1, 55.0)
-            if y_enabled: stage.move_absolute(2, 37.5)
+            if x_enabled: 
+                stage.move_absolute(1, 55.0)
+                time.sleep(0.1) # Give motherboard time to route the X command
+            if y_enabled: 
+                stage.move_absolute(2, 37.5)
             msg = "Commanded Center (55.0, 37.5). Moving..."
             time.sleep(2.0)
-            
+
         elif key_str == 'h':
             msg = "HOMING... Please wait 10 seconds!"
+        
+            # Buffer the enables too, just to be safe
             stage.set_enable(1, True)
+            time.sleep(0.1)
             stage.set_enable(2, True)
+            time.sleep(0.1)
+        
             x_enabled, y_enabled = True, True
+        
             stage.home_axis(1)
+            time.sleep(0.1) # <--- The critical fix
             stage.home_axis(2)
             time.sleep(10.0)
             
