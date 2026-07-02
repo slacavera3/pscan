@@ -55,9 +55,32 @@ scp.channels={{{ch_str}}};
             raise RuntimeError("Scope not connected. Call connect() first.")
             
         try:
-            # 1. CALCULATE REQUIRED TRIGGERS BASED ON 1000 SEGMENTS
+            # 1. CALCULATE REQUIRED TRIGGERS BASED ON SCRAPED NUMBER OF SEGMENTS
+            # UNIVERSAL LECROY SWEEPS INJECTION
             triggers_required = 1
             if sweeps is not None:
+                # Dynamically query the current segment count
+                self.instr.write("SEQ?")
+                seq_resp = self.instr.read().strip()
+                
+                segments = 1
+                if "ON" in seq_resp.upper():
+                    match = re.search(r'ON,\s*(\d+)', seq_resp.upper())
+                    if match:
+                        segments = int(match.group(1))
+                
+                for ch in channels:
+                    ch_clean = ch.strip().upper()
+                    if ch_clean.startswith('F'):
+                        print(f" -> Forcing {sweeps} sweeps via VBS on {ch_clean}...")
+                        self.instr.write(f'VBS "app.Math.{ch_clean}.Operator1.Sweeps={int(sweeps)}" ')
+                        self.instr.write(f'VBS "app.Math.{ch_clean}.Operator2.Sweeps={int(sweeps)}" ')
+                        self.instr.write(f'VBS "app.Math.{ch_clean}.Math.Average.Sweeps={int(sweeps)}" ')
+                
+                # Dynamically calculate triggers based on active segments
+                if segments > 0:
+                    triggers_required = max(1, int(sweeps // segments))
+
                 # Force the VBS UI update with strict double quotes
                 for ch in channels:
                     ch_clean = ch.strip().upper()

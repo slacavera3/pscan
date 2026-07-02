@@ -11,25 +11,29 @@ import serial.tools.list_ports
 if os.name == 'nt':
     import msvcrt
     def get_key():
-        key = msvcrt.getch()
-        if key in (b'\xe0', b'\x00'): 
-            return key + msvcrt.getch()
-        return key.decode('utf-8', 'ignore')
+        if msvcrt.kbhit():
+            key = msvcrt.getch()
+            if key in (b'\xe0', b'\x00'): 
+                return key + msvcrt.getch()
+            return key.decode('utf-8', 'ignore')
+        return None
 else:
+    import select
     import tty
     import termios
     def get_key():
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(sys.stdin.fileno())
-            ch = sys.stdin.read(1)
-            # Catch multi-byte Linux arrow keys
-            if ch == '\x1b':
-                ch += sys.stdin.read(2)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        return ch
+        if select.select([sys.stdin], [], [], 0)[0]:
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(sys.stdin.fileno())
+                ch = sys.stdin.read(1)
+                if ch == '\x1b':
+                    ch += sys.stdin.read(2)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            return ch
+        return None
 
 # ==========================================
 # 2. The Fixed Stage Driver
@@ -37,7 +41,7 @@ else:
 class SimpleStage:
     def __init__(self):
         self.ser = None
-        self.scale = 34304.0  # Hardware Encoder Scale
+        self.scale = 34304.0 
 
     def connect(self):
         for p in serial.tools.list_ports.comports():
@@ -52,7 +56,6 @@ class SimpleStage:
         time.sleep(0.1)
         self.ser.reset_input_buffer()
         
-        # Init Motherboard & Enable Both Axes
         self.ser.write(struct.pack('<HBBBB', 0x0018, 0x00, 0x00, 0x50, 0x01))
         time.sleep(0.1)
         self.set_enable(1, True)
@@ -61,11 +64,16 @@ class SimpleStage:
         return port
 
     def set_enable(self, axis_id, enable=True):
-        dest = 0x20 + axis_id
-        cmd = 0x01 if enable else 0x02
-        # Strictly isolate Windows requirement so Linux remains completely untouched
-        param1 = axis_id if os.name == 'nt' else 0x01
-        self.ser.write(struct.pack('<HBBBB', 0x0210, param1, cmd, dest, 0x01))
+        try:
+            dest = 0x20 + axis_id
+            cmd = 0x01 if enable else 0x02
+            param1 = axis_id if os.name == 'nt' else 0x01
+            self.ser.write(struct.pack('<HBBBB', 0x0210, param1, cmd, dest, 0x01))
+        except (serial.SerialException, OSError):
+            print("\n\n[HARDWARE FAULT] USB connection lost!")
+            print(" -> This is usually caused by a motor power surge (Back-EMF) when re-enabling.")
+            print(" -> Please power-cycle the Thorlabs controller, replug the USB, and restart pystage.")
+            sys.exit(1)
 
     def home_axis(self, axis_id):
         dest = 0x20 + axis_id
@@ -114,14 +122,15 @@ def main():
         print(f"Connection failed: {e}")
         return
 
-    current_step = 0.005 # Default step size
+    current_step = 0.5 
     msg = "Connected. Use Arrow Keys to jog."
 
-    x_pos = stage.get_position(1) or 55.0
-    y_pos = stage.get_position(2) or 37.5
+    x_pos = stage.get_position(1) or 0.0
+    y_pos = stage.get_position(2) or 0.0
     
     x_enabled = True
     y_enabled = True
+    needs_refresh = False
 
     while True:
         os.system('cls' if os.name == 'nt' else 'clear')
@@ -136,106 +145,114 @@ def main():
         print(f"\n Current Step Size: {current_step:.5f} mm")
         print("==================================================")
         print("   Up/Down/L/R : Jog Axes   |  J : Set Step Size")
-        print("   G           : Go To Abs  |  C : Center (55, 37.5)")
-        print("   1 / 2       : Toggle X/Y |  H : Home Stage")
-        print("   Q           : Quit")
+        print("   G           : Go To Abs  |  C : Center (0.0, 0.0)")
+        print("   1 / 2       : Toggle X/Y |  R : Refresh Pos")
+        print("   H           : Home Stage |  Q : Quit")
         print("==================================================")
         print(f" [MSG] {msg}")
         
         key = get_key()
-        # Safe string conversion prevents Windows bytes crash
-        key_str = key.lower() if isinstance(key, str) else ''
         
-        if key_str == 'q':
-            break
+        if key:
+            key_str = key.lower() if isinstance(key, str) else ''
             
-        elif key_str == '1':
-            x_enabled = not x_enabled
-            stage.set_enable(1, x_enabled)
-            msg = f"X-Axis power {'ENABLED' if x_enabled else 'DISABLED'}."
-            
-        elif key_str == '2':
-            y_enabled = not y_enabled
-            stage.set_enable(2, y_enabled)
-            msg = f"Y-Axis power {'ENABLED' if y_enabled else 'DISABLED'}."
-            
-        elif key_str == 'j':
-            try:
-                val = input("\n -> Enter new step size (mm): ")
-                current_step = abs(float(val))
-                msg = f"Step size updated to {current_step} mm."
-            except ValueError:
-                msg = "Invalid input. Step size unchanged."
+            if key_str == 'q':
+                break
                 
-        elif key_str == 'g':
-            try:
-                tgt_x = input("\n -> Enter absolute X target (mm): ")
-                tgt_y = input(" -> Enter absolute Y target (mm): ")
-                if x_enabled: stage.move_absolute(1, float(tgt_x))
-                if y_enabled: stage.move_absolute(2, float(tgt_y))
-                msg = f"Commanded Absolute Move to ({tgt_x}, {tgt_y})."
-                time.sleep(1.0)
-            except ValueError:
-                msg = "Invalid coordinates entered. Move cancelled."
-
-        elif key_str == 'c':
-            if x_enabled: 
-                stage.move_absolute(1, 55.0)
-                time.sleep(0.1) # Give motherboard time to route the X command
-            if y_enabled: 
-                stage.move_absolute(2, 37.5)
-            msg = "Commanded Center (55.0, 37.5). Moving..."
-            time.sleep(2.0)
-
-        elif key_str == 'h':
-            msg = "HOMING... Please wait 10 seconds!"
-        
-            # Buffer the enables too, just to be safe
-            stage.set_enable(1, True)
-            time.sleep(0.1)
-            stage.set_enable(2, True)
-            time.sleep(0.1)
-        
-            x_enabled, y_enabled = True, True
-        
-            stage.home_axis(1)
-            time.sleep(0.1) # <--- The critical fix
-            stage.home_axis(2)
-            time.sleep(10.0)
-            
-        # Arrow Key Relative Jogging (Cross-platform byte codes)
-        elif key == '\x1b[C' or key == b'\xe0M': # Right Arrow
-            if x_enabled:
-                stage.move_relative(1, current_step)
-                msg = f"Jogged X +{current_step} mm"
-                time.sleep(0.2)
-            else: msg = "X-Axis is disabled! Press '1' to enable."
-            
-        elif key == '\x1b[D' or key == b'\xe0K': # Left Arrow
-            if x_enabled:
-                stage.move_relative(1, -current_step)
-                msg = f"Jogged X -{current_step} mm"
-                time.sleep(0.2)
-            else: msg = "X-Axis is disabled! Press '1' to enable."
-            
-        elif key == '\x1b[A' or key == b'\xe0H': # Up Arrow
-            if y_enabled:
-                stage.move_relative(2, current_step)
-                msg = f"Jogged Y +{current_step} mm"
-                time.sleep(0.2)
-            else: msg = "Y-Axis is disabled! Press '2' to enable."
+            elif key_str == '1':
+                x_enabled = not x_enabled
+                stage.set_enable(1, x_enabled)
+                msg = f"X-Axis power {'ENABLED' if x_enabled else 'DISABLED'}."
                 
-        elif key == '\x1b[B' or key == b'\xe0P': # Down Arrow
-            if y_enabled:
-                stage.move_relative(2, -current_step)
-                msg = f"Jogged Y -{current_step} mm"
-                time.sleep(0.2)
-            else: msg = "Y-Axis is disabled! Press '2' to enable."
-            
-        real_x = stage.get_position(1)
-        real_y = stage.get_position(2)
-        if real_x is not None: x_pos = real_x
-        if real_y is not None: y_pos = real_y
+            elif key_str == '2':
+                y_enabled = not y_enabled
+                stage.set_enable(2, y_enabled)
+                msg = f"Y-Axis power {'ENABLED' if y_enabled else 'DISABLED'}."
+                
+            elif key_str == 'j':
+                try:
+                    val = input("\n -> Enter new step size (mm): ")
+                    current_step = abs(float(val))
+                    msg = f"Step size updated to {current_step} mm."
+                except ValueError:
+                    msg = "Invalid input. Step size unchanged."
+                    
+            elif key_str == 'g':
+                try:
+                    tgt_x = input("\n -> Enter absolute X target (mm): ")
+                    tgt_y = input(" -> Enter absolute Y target (mm): ")
+                    if x_enabled: stage.move_absolute(1, float(tgt_x))
+                    if y_enabled: stage.move_absolute(2, float(tgt_y))
+                    msg = f"Commanded Absolute Move to ({tgt_x}, {tgt_y})."
+                    time.sleep(1.0)
+                    needs_refresh = True
+                except ValueError:
+                    msg = "Invalid coordinates entered. Move cancelled."
+
+            elif key_str == 'r':
+                msg = "Positions refreshed directly from hardware."
+                needs_refresh = True
+                
+            elif key_str == 'c':
+                if x_enabled: 
+                    stage.move_absolute(1, 0.0)
+                    time.sleep(0.1) 
+                if y_enabled: 
+                    stage.move_absolute(2, 0.0)
+                msg = "Commanded Center (0.0, 0.0). Moving..."
+                time.sleep(2.0)
+                needs_refresh = True
+                
+            elif key_str == 'h':
+                msg = "HOMING... Please wait 10 seconds!"
+                stage.set_enable(1, True)
+                time.sleep(0.1)
+                stage.set_enable(2, True)
+                time.sleep(0.1)
+                x_enabled, y_enabled = True, True
+                stage.home_axis(1)
+                time.sleep(0.1) 
+                stage.home_axis(2)
+                time.sleep(10.0)
+                needs_refresh = True
+                
+            elif key == '\x1b[C' or key == b'\xe0M':
+                if x_enabled:
+                    stage.move_relative(1, current_step)
+                    msg = f"Jogged X +{current_step} mm"
+                    needs_refresh = True
+                else: msg = "X-Axis is disabled! Press '1' to enable."
+                
+            elif key == '\x1b[D' or key == b'\xe0K':
+                if x_enabled:
+                    stage.move_relative(1, -current_step)
+                    msg = f"Jogged X -{current_step} mm"
+                    needs_refresh = True
+                else: msg = "X-Axis is disabled! Press '1' to enable."
+                
+            elif key == '\x1b[A' or key == b'\xe0H':
+                if y_enabled:
+                    stage.move_relative(2, current_step)
+                    msg = f"Jogged Y +{current_step} mm"
+                    needs_refresh = True
+                else: msg = "Y-Axis is disabled! Press '2' to enable."
+                    
+            elif key == '\x1b[B' or key == b'\xe0P':
+                if y_enabled:
+                    stage.move_relative(2, -current_step)
+                    msg = f"Jogged Y -{current_step} mm"
+                    needs_refresh = True
+                else: msg = "Y-Axis is disabled! Press '2' to enable."
+                
+            if needs_refresh:
+                time.sleep(0.2) 
+                real_x = stage.get_position(1)
+                real_y = stage.get_position(2)
+                if real_x is not None: x_pos = real_x
+                if real_y is not None: y_pos = real_y
+                needs_refresh = False
+
+        time.sleep(0.01)
 
     os.system('cls' if os.name == 'nt' else 'clear')
     print("Stage CLI closed.")
