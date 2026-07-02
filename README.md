@@ -40,7 +40,11 @@ If you are deploying on a new machine:
 3. Run the installer:
    ./install_pscan.sh
 
-(For Windows 7 installation, you can install directly via pip from the repository using 'pip install -e .' in the root folder).
+-- Remote Installation (Via GitHub) on Windows (7)
+If you are deploying on a new machine:
+1. pip install git+https://github.com/slacavera3/pscan.git
+
+2. If you're deploying on a machine which already has a copy of the repository for some reason: 'pip install -e .' in the root folder).
 
 ### Usage
 
@@ -62,42 +66,42 @@ The orchestrator reads flat .con files. Below is a comprehensive template showin
 
 CRITICAL NOTE FOR LECROY SCOPES: The 'action scope' block must explicitly declare 'segments' (or 'sweeps' / 'averages') so the driver knows exactly how many trigger pulses to wait for before timing out.
 
-# ==========================================
-# pscan Configuration Template
-# ==========================================
+## ==========================================
+## pscan Configuration Template
+## ==========================================
 
-# 1. LOOP COUNT
-# Defines how many times the acquisition pipeline repeats per coordinate.
+## 1. LOOP COUNT
+## Defines how many times the acquisition pipeline repeats per coordinate.
 action count
 count 1
 end
 
-# 2. X-AXIS HARDWARE 
-# scan: <start_mm> <stop_mm> <step_mm>
+## 2. X-AXIS HARDWARE 
+## scan: <start_mm> <stop_mm> <step_mm>
 action apt_stage
 axis 0
 scan 53.555 53.565 0.005
 end
 
-# 3. Y-AXIS HARDWARE
-# 'restore' sends the axis back to start_mm after the scan finishes.
+## 3. Y-AXIS HARDWARE
+## 'restore' sends the axis back to start_mm after the scan finishes.
 action apt_stage
 axis 1
 scan 37.000 37.010 0.005
 restore
 end
 
-# 4. SYSTEM DELAY
+## 4. SYSTEM DELAY
 action delay
 time 1.5
 end
 
-# 5. WEBCAM ACQUISITION
+## 5. WEBCAM ACQUISITION
 action webcam
 device 0
 end
 
-# 6. NI A2D ACQUISITION (Comedi)
+## 6. NI A2D ACQUISITION (Comedi)
 action a2d
 channel 1
 range 0
@@ -105,24 +109,24 @@ sample_rate 10000
 n_samples 100
 end
 
-# 7. LECROY OSCILLOSCOPE ACQUISITION
-# 'segments' is REQUIRED for dynamic trace allocation.
+## 7. LECROY OSCILLOSCOPE ACQUISITION
+## 'segments' is REQUIRED for dynamic trace allocation.
 action scope
 ip 192.168.1.100
 channels F1, F2
 segments 1000
 end
 
-# 8. EXTERNAL SYSTEM SCRIPT
-# Executes a raw terminal command on the host OS
+## 8. EXTERNAL SYSTEM SCRIPT
+## Executes a raw terminal command on the host OS
 action script
 script echo "Acquisition step complete!"
 end
 
-# 9. ACQUIRE ANDOR IXON FRAMES
-# The camera block executes at every coordinate.
-# If shutter_open is True, the shutter stays open for the entire run.
-# NOT TTL DRIVEN YET, WILL BE MUCH FASTER
+## 9. ACQUIRE ANDOR IXON FRAMES
+## The camera block executes at every coordinate.
+## If shutter_open is True, the shutter stays open for the entire run.
+## NOT TTL DRIVEN YET, WILL BE MUCH FASTER
 action ixon
 exposure 0.1
 em_gain 72
