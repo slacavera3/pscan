@@ -1,115 +1,261 @@
 import sys
-import time
 import os
+import time
+import subprocess
+import cv2
+import shutil
 import numpy as np
 
-# Safe cross-platform imports
-from pscan import stage_driver
-from pscan import lecroy_driver
+# Cross-platform module imports
+from config_parser import (
+    parse_flat_con_file, categorize_pipeline, 
+    compile_pipeline_list, compile_stage_parameters
+)
+from lecroy_driver import LeCroyScope
+from a2d_driver import NIDriver
+from stage_driver import ThorlabsStage
 
-# Linux-only drivers (Windows will safely ignore these)
+# OS-Specific Andor Import
 try:
-    from pscan import a2d_driver
+    if os.name == 'nt':
+        from driver_ixon import IXonCamera
+        ANDOR_AVAILABLE = True
+    else:
+        ANDOR_AVAILABLE = False
 except ImportError:
-    a2d_driver = None
-    print("[SYSTEM] Running on Windows. A2D Comedi drivers disabled.")
+    ANDOR_AVAILABLE = False
 
-# Windows-only drivers (Linux will safely ignore these)
-try:
-    from pscan import driver_ixon
-except ImportError:
-    driver_ixon = None
-    print("[SYSTEM] pyAndorSDK2 not found. iXon driver disabled on this OS.")
+def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename, 
+                          total_a2d_blocks, global_total_traces, 
+                          call_state, silent_acq=False):
+    is_first = (call_state['current_trace_idx'] == 0)
+    
+    for step_idx, action in enumerate(pipeline):
+        act_type = action['type']
+        p = action['params']
+        
+        if act_type == 'script':
+            if not silent_acq: 
+                print(f" -> Executing system command: '{p['cmd']}'...")
+            subprocess.run(
+                p['cmd'], shell=True, check=True, 
+                capture_output=True, text=True
+            )
+            
+        elif act_type == 'delay':
+            time.sleep(p['seconds'])
+            
+        elif act_type == 'webcam':
+            idx = call_state['current_trace_idx']
+            img_filename = (
+                f"{base_filename}_count{global_total_traces}_"
+                f"webcam_trace{idx}.jpg"
+            )
+            if not silent_acq:
+                print(f" -> Grabbing USB frame -> {img_filename}...")
+            
+            cam = cv2.VideoCapture(p['device'])
+            if cam.isOpened():
+                time.sleep(0.1)
+                ret, frame = cam.read()
+                if ret: 
+                    cv2.imwrite(img_filename, frame)
+                cam.release()
+                
+        elif act_type == 'scope' and scope:
+            output_name = f"{base_filename}_count{global_total_traces}_scope0"
+            scope.acquire_multi_channel(
+                channels=p['channels'], output_base_name=output_name,
+                save_for_matlab=True, is_first_trace=is_first, 
+                total_loops=global_total_traces,
+                sweeps=p.get('sweeps')  
+            )
+            
+        elif act_type == 'a2d':
+            idx_num = p['legacy_index']
+            output_name = (
+                f"{base_filename}_count{global_total_traces}_"
+                f"a2d{idx_num}_{total_a2d_blocks}f.d"
+            )
+            ni_daq.acquire_a2d(
+                channel=p['channel'], range_val=p['range'], 
+                n_samples=p['n_samples'], sample_rate=p['sample_rate'], 
+                output_filename=output_name, is_first_trace=is_first
+            )
+            
+            # Legacy increment rule for A2D
+            if (step_idx == len(pipeline) - 1 or 
+                pipeline[step_idx+1]['type'] != 'scope'):
+                call_state['current_trace_idx'] += 1
 
-def parse_config(filepath):
-    """Parses the .con file into a dictionary of actions."""
-    print(f"Loading configuration: {filepath}")
-    # (Your existing .con parsing logic goes here, preserving 'segments' for the scope)
-    # Returning a dummy structure for demonstration of the main loop
-    return [{'type': 'count', 'val': 1}]
+        elif act_type == 'ixon' and ixon:
+            # Setup the camera only once at the beginning of the scan
+            if not call_state.get('ixon_configured'):
+                ixon.setup(
+                    exposure=p['exposure'],
+                    em_gain=p['em_gain'],
+                    kinetic_cycle=p['kinetic_cycle'],
+                    shutter_open=p['shutter_open']
+                )
+                call_state['ixon_configured'] = True
+
+            idx = call_state['current_trace_idx']
+            img_filename = (
+                f"{base_filename}_count{global_total_traces}_"
+                f"ixon_trace{idx}.npy"
+            )
+            
+            if not silent_acq:
+                print(f" -> Acquiring iXon frame -> {img_filename}...")
+                
+            frame_data = ixon.acquire()
+            if frame_data is not None:
+                np.save(img_filename, frame_data)
+                
+            # If ixon is the only/last acquisition block, increment trace index
+            if (step_idx == len(pipeline) - 1 or 
+                pipeline[step_idx+1]['type'] not in ('scope', 'a2d')):
+                call_state['current_trace_idx'] += 1
 
 def main():
+    name_was_changed = False
+
     if len(sys.argv) < 2:
-        print("Usage: pscan <config.con>")
+        print("Usage: python3 py_main.py <path_to_config.con>")
         sys.exit(1)
 
-    config_path = sys.argv[1]
-    actions = parse_config(config_path)
-    
-    # Initialize hardware connections
-    stage = stage_driver.ThorlabsStage()
-    stage.connect()
-    counts_per_mm = 34304.0
+    con_filepath = sys.argv[1]
+    if not os.path.exists(con_filepath):
+        print(f"Error: File '{con_filepath}' not found.")
+        sys.exit(1)
 
-    # Initialize iXon if running on the Windows Machine
+    original_base = os.path.splitext(os.path.basename(con_filepath))[0]
+    base_filename = original_base
+    
+    all_blocks = parse_flat_con_file(con_filepath)
+    stages_str, count_val, r_set, r_acq, r_tear = categorize_pipeline(all_blocks)
+    
+    a2d_global_counter = [1]
+    stage_params = compile_stage_parameters(stages_str)
+    setup_pipeline = compile_pipeline_list(r_set, a2d_global_counter)
+    acquisition_pipeline = compile_pipeline_list(r_acq, a2d_global_counter)
+    teardown_pipeline = compile_pipeline_list(r_tear, a2d_global_counter)
+    
+    axis_0_pos = stage_params.get(0, {}).get('positions', [None]) 
+    axis_1_pos = stage_params.get(1, {}).get('positions', [None]) 
+    
+    total_a2d_blocks = sum(1 for act in acquisition_pipeline if act['type'] == 'a2d')
+    global_total_traces = len(axis_0_pos) * len(axis_1_pos) * count_val
+    
+    scope_ip = next((act['params']['ip'] for act in acquisition_pipeline if act['type'] == 'scope'), None)
+    ixon_in_pipeline = any(act['type'] == 'ixon' for act in acquisition_pipeline + setup_pipeline + teardown_pipeline)
+    
+    counts_per_mm = 34304.0 
+
+    while True:
+        scope_target = f"{base_filename}_count{global_total_traces}_scope0.dat"
+        a2d_target = f"{base_filename}_count{global_total_traces}_a2d1_{total_a2d_blocks}f.d"
+        
+        scope_exists = scope_ip and os.path.exists(scope_target)
+        a2d_exists = total_a2d_blocks > 0 and os.path.exists(a2d_target)
+        has_collision = scope_exists or a2d_exists
+        
+        if has_collision:
+            print(f"\n[WARNING] Outputs for '{base_filename}' exist!")
+            msg = " -> Overwrite files (o) or Change base filename (c)? "
+            choice = input(msg).strip().lower()
+            if choice == 'o': 
+                break
+            elif choice == 'c':
+                new_base = input(" -> Enter new base filename: ").strip()
+                if new_base: 
+                    base_filename = os.path.splitext(os.path.basename(new_base))[0]
+                    name_was_changed = True
+                continue
+        else:
+            break
+
+    if name_was_changed:
+        shutil.copy(con_filepath, f"{base_filename}.con")
+
+    scope = LeCroyScope(scope_ip) if scope_ip else None
+    ni_daq = NIDriver()
+    stage = ThorlabsStage() if stage_params else None
     ixon = None
-    ixon_configured = False
-    if driver_ixon and os.name == 'nt':
-        try:
-            ixon = driver_ixon.IXonCamera()
-            ixon.connect()
-        except Exception as e:
-            print(f"[WARNING] iXon hardware not found: {e}")
 
-    print("Starting automated acquisition pipeline...")
+    if scope:
+        print(f"\nOpening session to LeCroy at {scope_ip}...")
+        scope.connect()
+    if stage:
+        stage.connect()
+    if ixon_in_pipeline and ANDOR_AVAILABLE:
+        print("\nConnecting to Windows iXon Camera...")
+        ixon = IXonCamera()
+        ixon.connect()
+
+    print(f"\nGrid: {len(axis_0_pos)} X steps x {len(axis_1_pos)} Y steps.")
+    print(f"Total Traces Target: {global_total_traces}")
     
-    # Core Orchestration Loop
-    trace_idx = 0
-    for action in actions:
-        
-        # Dynamic settling logic replacing the hardcoded sleep
-        if action['type'] == 'apt_stage':
-            x_val = action.get('x_target')
-            y_val = action.get('y_target')
+    call_state = {'current_trace_idx': 0, 'ixon_configured': False}
+    
+    if setup_pipeline:
+        print("\nExecuting Pre-Scan Initialization Commands...")
+        run_pipeline_sequence(
+            setup_pipeline, scope, ni_daq, ixon, base_filename, 
+            total_a2d_blocks, global_total_traces, call_state
+        )
+
+    print("\nExecuting Data Acquisition Sequence...")
+    
+    for x_val in axis_0_pos:
+        if x_val is not None and stage_params.get(0):
+            stage.move_absolute('x', x_val, counts_per_mm)
             
+        for y_val in axis_1_pos:
+            if y_val is not None and stage_params.get(1):
+                stage.move_absolute('y', y_val, counts_per_mm)
+                
             if x_val is not None or y_val is not None:
-                if stage:
-                    # Dynamically wait for axes to hit their exact targets
-                    if x_val is not None:
-                        stage.wait_to_settle('x', x_val, counts_per_mm)
-                    if y_val is not None:
-                        stage.wait_to_settle('y', y_val, counts_per_mm)
-                else:
-                    # Fallback if running without hardware
-                    time.sleep(0.2)
-                    
-        elif action['type'] == 'a2d':
-            if a2d_driver is None:
-                print("[WARNING] Skipping A2D action (Not supported on Windows)")
-            else:
-                print("Triggering Comedi A2D...")
-                # a2d_driver.acquire(...)
-
-        elif action['type'] == 'scope':
-            print(f"Triggering LeCroy (Segments: {action.get('segments', 1)})...")
-            # lecroy_driver.acquire(...)
+                settle_time = 1.5 if call_state['current_trace_idx'] == 0 else 0.2
+                time.sleep(settle_time)
+                
+            for c_val in range(count_val):
+                current_num = call_state['current_trace_idx'] + 1
+                x_str = f"{x_val:7.4f} mm" if x_val is not None else "Static"
+                y_str = f"{y_val:7.4f} mm" if y_val is not None else "Static"
+                
+                print(
+                    f" -> Position: X = {x_str}, Y = {y_str} "
+                    f"| Loop {c_val+1}/{count_val} "
+                    f"| Trace {current_num}/{global_total_traces}..."
+                )
+                
+                run_pipeline_sequence(
+                    acquisition_pipeline, scope, ni_daq, ixon, base_filename, 
+                    total_a2d_blocks, global_total_traces, call_state, 
+                    silent_acq=True
+                )
             
-        elif action['type'] == 'ixon':
-            if ixon:
-                # Only run the heavy setup function on the very first pixel
-                if not ixon_configured:
-                    ixon.setup(
-                        exposure=float(action.get('exposure', 0.1)),
-                        em_gain=int(action.get('em_gain', 72)),
-                        kinetic_cycle=float(action.get('kinetic_cycle', 0.5)),
-                        shutter_open=action.get('shutter_open', 'True').lower() == 'true'
-                    )
-                    ixon_configured = True
-                
-                print(f"Acquiring iXon Frame {trace_idx}...")
-                frame_data = ixon.acquire()
-                
-                if frame_data is not None:
-                    # Save array to disk using a generic naming convention
-                    np.save(f"ixon_data_{trace_idx:05d}.npy", frame_data)
-                
-                trace_idx += 1
+        if 1 in stage_params and stage_params[1]['restore']:
+            y_start = stage_params[1]['start_pos']
+            stage.move_absolute('y', y_start, counts_per_mm)
 
-    # Safe Shutdown
-    if ixon:
-        ixon.shutdown()
-        
-    print("Pipeline complete.")
+    if 0 in stage_params and stage_params[0]['restore']:
+        x_start = stage_params[0]['start_pos']
+        stage.move_absolute('x', x_start, counts_per_mm)
+
+    if teardown_pipeline:
+        print("\nExecuting Post-Scan Teardown Commands...")
+        run_pipeline_sequence(
+            teardown_pipeline, scope, ni_daq, ixon, base_filename, 
+            total_a2d_blocks, global_total_traces, call_state
+        )
+
+    if scope: scope.disconnect()
+    if stage: stage.disconnect()
+    if ixon: ixon.shutdown()
+    
+    print("\nSequence Complete!")
 
 if __name__ == "__main__":
     main()
