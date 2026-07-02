@@ -7,18 +7,18 @@ import shutil
 import numpy as np
 
 # Cross-platform module imports
-from config_parser import (
+from pscan.config_parser import (
     parse_flat_con_file, categorize_pipeline, 
     compile_pipeline_list, compile_stage_parameters
 )
-from lecroy_driver import LeCroyScope
-from a2d_driver import NIDriver
-from stage_driver import ThorlabsStage
+from pscan.lecroy_driver import LeCroyScope
+from pscan.a2d_driver import NIDriver
+from pscan.stage_driver import ThorlabsStage
 
 # OS-Specific Andor Import
 try:
     if os.name == 'nt':
-        from driver_ixon import IXonCamera
+        from pscan.driver_ixon import IXonCamera
         ANDOR_AVAILABLE = True
     else:
         ANDOR_AVAILABLE = False
