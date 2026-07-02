@@ -83,11 +83,6 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
                 output_filename=output_name, is_first_trace=is_first
             )
             
-            # Legacy increment rule for A2D
-            if (step_idx == len(pipeline) - 1 or 
-                pipeline[step_idx+1]['type'] != 'scope'):
-                call_state['current_trace_idx'] += 1
-
         elif act_type == 'ixon' and ixon:
             # Setup the camera only once at the beginning of the scan
             if not call_state.get('ixon_configured'):
@@ -112,11 +107,6 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
             if frame_data is not None:
                 np.save(img_filename, frame_data)
                 
-            # If ixon is the only/last acquisition block, increment trace index
-            if (step_idx == len(pipeline) - 1 or 
-                pipeline[step_idx+1]['type'] not in ('scope', 'a2d')):
-                call_state['current_trace_idx'] += 1
-
 def main():
     name_was_changed = False
 
@@ -207,6 +197,9 @@ def main():
 
     print("\nExecuting Data Acquisition Sequence...")
     
+    # NEW: Single source of truth for the trace index
+    master_trace_idx = 0
+    
     for x_val in axis_0_pos:
         if x_val is not None and stage_params.get(0):
             stage.move_absolute('x', x_val, counts_per_mm)
@@ -216,17 +209,20 @@ def main():
                 stage.move_absolute('y', y_val, counts_per_mm)
                 
             if x_val is not None or y_val is not None:
-                settle_time = 1.5 if call_state['current_trace_idx'] == 0 else 0.2
+                # With the index fixed, this will now properly drop to 0.2s!
+                settle_time = 1.5 if master_trace_idx == 0 else 0.2
                 time.sleep(settle_time)
                 
             for c_val in range(count_val):
-                current_num = call_state['current_trace_idx'] + 1
+                # Sync the state dictionary so auto-formatting file names works perfectly
+                call_state['current_trace_idx'] = master_trace_idx
+                current_num = master_trace_idx + 1
+                
                 x_str = f"{x_val:7.4f} mm" if x_val is not None else "Static"
                 y_str = f"{y_val:7.4f} mm" if y_val is not None else "Static"
                 
                 print(
                     f" -> Position: X = {x_str}, Y = {y_str} "
-                    f"| Loop {c_val+1}/{count_val} "
                     f"| Trace {current_num}/{global_total_traces}..."
                 )
                 
@@ -235,6 +231,9 @@ def main():
                     total_a2d_blocks, global_total_traces, call_state, 
                     silent_acq=True
                 )
+                
+                # Tick the master counter at the end of the loop
+                master_trace_idx += 1
             
         if 1 in stage_params and stage_params[1]['restore']:
             y_start = stage_params[1]['start_pos']
