@@ -208,6 +208,7 @@ def main():
                 time.sleep(0.1) 
                 stage.home_axis(2)
                 time.sleep(10.0)
+                msg = "Stage homed, ready for next action..."
                 needs_refresh = True
                 
             elif key == '\x1b[C' or key == b'\xe0M':
