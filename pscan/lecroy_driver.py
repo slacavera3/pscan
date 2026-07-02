@@ -2,6 +2,7 @@ import vxi11
 import struct
 import numpy as np
 import os
+import re
 
 class LeCroyScope:
     def __init__(self, ip_address):
@@ -55,21 +56,28 @@ scp.channels={{{ch_str}}};
             raise RuntimeError("Scope not connected. Call connect() first.")
             
         try:
-            # FIX: If the con file specifies sweeps, aggressively enforce it!
+            # UNIVERSAL LECROY SWEEPS INJECTION
             if sweeps is not None:
-                # Force Sequence Mode Segments
-                # self.instr.write(f"SEQ ON,{sweeps}")
-                
-                # Also force any Math Summing channels (F1, F2, etc.)
                 for ch in channels:
-                    if ch.upper().startswith('F'):
-                        # CRITICAL FIX: LeCroy VBS strictly requires double quotes!
-                        self.instr.write(
-                            f"""VBS "app.Math.{ch.upper()}.Operator1.Sweeps={sweeps}" """
-                        )
-                        self.instr.write(
-                            f"""VBS "app.Math.{ch.upper()}.Operator2.Sweeps={sweeps}" """
-                        )
+                    ch_clean = ch.strip().upper()
+                    if ch_clean.startswith('F'):
+                        # 1. Ask the scope for the exact equation it is currently using
+                        self.instr.write(f"{ch_clean}:DEF?")
+                        current_def = self.instr.read().strip()
+                        
+                        # 2. Because CHDR is OFF, it returns the raw payload. We must prepend the command header.
+                        if not current_def.upper().startswith(f"{ch_clean}:DEF"):
+                            current_def = f"{ch_clean}:DEF " + current_def
+                            
+                        # 3. Surgically find and replace the SWEEPS parameter using Regex
+                        new_def = re.sub(r'SWEEPS,\s*\d+', f'SWEEPS,{sweeps}', current_def, flags=re.IGNORECASE)
+                        
+                        # 4. If the replace worked, push the altered command back to the scope
+                        if new_def != current_def:
+                            print(f" -> Pushing {sweeps} sweeps to LeCroy {ch_clean}...")
+                            self.instr.write(new_def)
+                        else:
+                            print(f" -> [WARNING] {ch_clean} does not appear to be an Average function. Cannot apply sweeps.")
 
             self.instr.write("CLSW")
             self.instr.write("TRMD SINGLE")
