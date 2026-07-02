@@ -18,7 +18,7 @@ from pscan.stage_driver import ThorlabsStage
 # OS-Specific Andor Import
 try:
     if os.name == 'nt':
-        from pscan.driver_ixon import IXonCamera
+        from pscan.ixon_driver import IXonCamera
         ANDOR_AVAILABLE = True
     else:
         ANDOR_AVAILABLE = False
