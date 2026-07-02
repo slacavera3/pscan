@@ -11,29 +11,24 @@ import serial.tools.list_ports
 if os.name == 'nt':
     import msvcrt
     def get_key():
-        if msvcrt.kbhit():
-            key = msvcrt.getch()
-            if key in (b'\xe0', b'\x00'): 
-                return key + msvcrt.getch()
-            return key.decode('utf-8', 'ignore')
-        return None
+        key = msvcrt.getch() # Blocking wait
+        if key in (b'\xe0', b'\x00'): 
+            return key + msvcrt.getch()
+        return key.decode('utf-8', 'ignore')
 else:
-    import select
     import tty
     import termios
     def get_key():
-        if select.select([sys.stdin], [], [], 0)[0]:
-            fd = sys.stdin.fileno()
-            old_settings = termios.tcgetattr(fd)
-            try:
-                tty.setraw(sys.stdin.fileno())
-                ch = sys.stdin.read(1)
-                if ch == '\x1b':
-                    ch += sys.stdin.read(2)
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-            return ch
-        return None
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1) # Blocking wait, suppresses SSH echo natively
+            if ch == '\x1b':
+                ch += sys.stdin.read(2)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
 
 # ==========================================
 # 2. The Fixed Stage Driver
@@ -131,36 +126,31 @@ def main():
     x_enabled = True
     y_enabled = True
     needs_refresh = False
-    needs_redraw = True  # <--- New UI flag
 
     while True:
-        # Only clear and redraw the screen if something changed!
-        if needs_redraw:
-            os.system('cls' if os.name == 'nt' else 'clear')
-            x_status = "[ON]" if x_enabled else "[OFF]"
-            y_status = "[ON]" if y_enabled else "[OFF]"
-            
-            print("==================================================")
-            print(f" THORLABS PRECISION CONTROL CLI ({port})")
-            print("==================================================")
-            print(f" X-Axis Position: {x_pos:8.5f} mm  {x_status}")
-            print(f" Y-Axis Position: {y_pos:8.5f} mm  {y_status}")
-            print(f"\n Current Step Size: {current_step:.5f} mm")
-            print("==================================================")
-            print("   Up/Down/L/R : Jog Axes   |  J : Set Step Size")
-            print("   G           : Go To Abs  |  C : Center (0.0, 0.0)")
-            print("   1 / 2       : Toggle X/Y |  R : Refresh Pos")
-            print("   H           : Home Stage |  Q : Quit")
-            print("==================================================")
-            print(f" [MSG] {msg}")
-            
-            needs_redraw = False  # Reset flag after drawing
-
+        os.system('cls' if os.name == 'nt' else 'clear')
+        x_status = "[ON]" if x_enabled else "[OFF]"
+        y_status = "[ON]" if y_enabled else "[OFF]"
+        
+        print("==================================================")
+        print(f" THORLABS PRECISION CONTROL CLI ({port})")
+        print("==================================================")
+        print(f" X-Axis Position: {x_pos:8.5f} mm  {x_status}")
+        print(f" Y-Axis Position: {y_pos:8.5f} mm  {y_status}")
+        print(f"\n Current Step Size: {current_step:.5f} mm")
+        print("==================================================")
+        print("   Up/Down/L/R : Jog Axes   |  J : Set Step Size")
+        print("   G           : Go To Abs  |  C : Center (0.0, 0.0)")
+        print("   1 / 2       : Toggle X/Y |  R : Refresh Pos")
+        print("   H           : Home Stage |  Q : Quit")
+        print("==================================================")
+        print(f" [MSG] {msg}")
+        
+        # Script naturally halts here. No flickering.
         key = get_key()
         
         if key:
             key_str = key.lower() if isinstance(key, str) else ''
-            needs_redraw = True  # A key was pressed, we will need to redraw
             
             if key_str == 'q':
                 break
@@ -190,7 +180,6 @@ def main():
                     if x_enabled: stage.move_absolute(1, float(tgt_x))
                     if y_enabled: stage.move_absolute(2, float(tgt_y))
                     msg = f"Commanded Absolute Move to ({tgt_x}, {tgt_y})."
-                    time.sleep(1.0)
                     needs_refresh = True
                 except ValueError:
                     msg = "Invalid coordinates entered. Move cancelled."
@@ -206,7 +195,6 @@ def main():
                 if y_enabled: 
                     stage.move_absolute(2, 0.0)
                 msg = "Commanded Center (0.0, 0.0). Moving..."
-                time.sleep(2.0)
                 needs_refresh = True
                 
             elif key_str == 'h':
@@ -257,8 +245,6 @@ def main():
                 if real_x is not None: x_pos = real_x
                 if real_y is not None: y_pos = real_y
                 needs_refresh = False
-
-        time.sleep(0.01)
 
     os.system('cls' if os.name == 'nt' else 'clear')
     print("Stage CLI closed.")
