@@ -2,6 +2,7 @@ import vxi11
 import struct
 import numpy as np
 import os
+import re
 
 class LeCroyScope:
     def __init__(self, ip_address):
