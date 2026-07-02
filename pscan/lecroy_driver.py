@@ -2,7 +2,6 @@ import vxi11
 import struct
 import numpy as np
 import os
-import re
 
 class LeCroyScope:
     def __init__(self, ip_address):
@@ -56,33 +55,26 @@ scp.channels={{{ch_str}}};
             raise RuntimeError("Scope not connected. Call connect() first.")
             
         try:
-            # UNIVERSAL LECROY SWEEPS INJECTION
+            # 1. CALCULATE REQUIRED TRIGGERS BASED ON 1000 SEGMENTS
+            triggers_required = 1
             if sweeps is not None:
+                # Force the VBS UI update with strict double quotes
                 for ch in channels:
                     ch_clean = ch.strip().upper()
                     if ch_clean.startswith('F'):
-                        # 1. Ask the scope for the exact equation it is currently using
-                        self.instr.write(f"{ch_clean}:DEF?")
-                        current_def = self.instr.read().strip()
-                        
-                        # 2. Because CHDR is OFF, it returns the raw payload. We must prepend the command header.
-                        if not current_def.upper().startswith(f"{ch_clean}:DEF"):
-                            current_def = f"{ch_clean}:DEF " + current_def
-                            
-                        # 3. Surgically find and replace the SWEEPS parameter using Regex
-                        new_def = re.sub(r'SWEEPS,\s*\d+', f'SWEEPS,{sweeps}', current_def, flags=re.IGNORECASE)
-                        
-                        # 4. If the replace worked, push the altered command back to the scope
-                        if new_def != current_def:
-                            print(f" -> Pushing {sweeps} sweeps to LeCroy {ch_clean}...")
-                            self.instr.write(new_def)
-                        else:
-                            print(f" -> [WARNING] {ch_clean} does not appear to be an Average function. Cannot apply sweeps.")
+                        self.instr.write(f"""VBS "app.Math.{ch_clean}.Operator1.Sweeps = {sweeps}" """)
+                
+                # If Sweeps = 5000, we must fire the 1000-segment sequence 5 times.
+                triggers_required = max(1, int(sweeps // 1000))
 
+            # 2. CLEAR SWEEPS ONCE
             self.instr.write("CLSW")
-            self.instr.write("TRMD SINGLE")
-            self.instr.write("ARM; WAIT; *OPC?")
-            self.instr.read()
+            
+            # 3. LOOP ACQUISITION TO REACH TARGET SWEEPS
+            for i in range(triggers_required):
+                self.instr.write("TRMD SINGLE")
+                self.instr.write("ARM; WAIT; *OPC?")
+                self.instr.read()
             
         except Exception as e:
             print(f"\nTrigger Timeout Error: {e}")
