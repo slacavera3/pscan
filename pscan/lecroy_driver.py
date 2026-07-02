@@ -58,7 +58,7 @@ scp.channels={{{ch_str}}};
             # FIX: If the con file specifies sweeps, aggressively enforce it!
             if sweeps is not None:
                 # Force Sequence Mode Segments
-                self.instr.write(f"SEQ ON,{sweeps}")
+                #self.instr.write(f"SEQ ON,{sweeps}")
                 
                 # Also force any Math Summing channels (F1, F2, etc.)
                 for ch in channels:
