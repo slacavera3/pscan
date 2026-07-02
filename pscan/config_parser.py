@@ -94,7 +94,7 @@ def compile_pipeline_list(raw_pipeline, a2d_counter):
         if t == 'scope':
             ip_match = re.search(r'ip\s+([\d\.]+)', body)
             ch_match = re.search(r'channels\s+([^\n]+)', body)
-            swp_match = re.search(r'(?:sweeps|segments|averages)\s+(\d+)', body)
+            swp_match = re.search(r'sweeps\s+(\d+)', body)
             
             p['ip'] = ip_match.group(1) if ip_match else None
             p['sweeps'] = int(swp_match.group(1)) if swp_match else None
