@@ -8,6 +8,7 @@ class LeCroyScope:
     def __init__(self, ip_address):
         self.ip = ip_address
         self.instr = None
+        self.cached_triggers = 1  # Store the calculation to reuse on every pixel
 
     def connect(self):
         if self.instr is None:
@@ -56,11 +57,10 @@ scp.channels={{{ch_str}}};
             raise RuntimeError("Scope not connected. Call connect() first.")
             
         try:
-            # 1. CALCULATE REQUIRED TRIGGERS BASED ON SCRAPED NUMBER OF SEGMENTS
-            # UNIVERSAL LECROY SWEEPS INJECTION
-            triggers_required = 1
-            if sweeps is not None:
-                # Dynamically query the current segment count
+            # =================================================================
+            # SETUP BLOCK: ONLY RUNS ONCE PER EXPERIMENT
+            # =================================================================
+            if is_first_trace and sweeps is not None:
                 self.instr.write("SEQ?")
                 seq_resp = self.instr.read().strip()
                 
@@ -73,29 +73,29 @@ scp.channels={{{ch_str}}};
                 for ch in channels:
                     ch_clean = ch.strip().upper()
                     if ch_clean.startswith('F'):
-                        #print(f" -> Forcing {sweeps} sweeps via VBS on {ch_clean}...")
+                        # Silently brute-force the UI update once
                         self.instr.write(f'VBS "app.Math.{ch_clean}.Operator1.Sweeps={int(sweeps)}" ')
                         self.instr.write(f'VBS "app.Math.{ch_clean}.Operator2.Sweeps={int(sweeps)}" ')
                         self.instr.write(f'VBS "app.Math.{ch_clean}.Math.Average.Sweeps={int(sweeps)}" ')
                 
-                # Dynamically calculate triggers based on active segments
+                # Cache the trigger math so we don't calculate it every pixel
                 if segments > 0:
-                    triggers_required = max(1, int(sweeps // segments))
+                    self.cached_triggers = max(1, int(sweeps // segments))
+                else:
+                    self.cached_triggers = 1
 
-                # Force the VBS UI update with strict double quotes
-                for ch in channels:
-                    ch_clean = ch.strip().upper()
-                    if ch_clean.startswith('F'):
-                        self.instr.write(f"""VBS "app.Math.{ch_clean}.Operator1.Sweeps = {sweeps}" """)
-                
-                # If Sweeps = 5000, we must fire the 1000-segment sequence 5 times.
-                triggers_required = max(1, int(sweeps // 1000))
-
-            # 2. CLEAR SWEEPS ONCE
-            self.instr.write("CLSW")
-            
-            # 3. LOOP ACQUISITION TO REACH TARGET SWEEPS
-            for i in range(triggers_required):
+            # =================================================================
+            # ACQUISITION BLOCK: LEAN AND FAST
+            # =================================================================
+            if sweeps is not None:
+                self.instr.write("CLSW")
+                for _ in range(self.cached_triggers):
+                    self.instr.write("TRMD SINGLE")
+                    self.instr.write("ARM; WAIT; *OPC?")
+                    self.instr.read()
+            else:
+                # Standard single acquisition if sweeps are ignored
+                self.instr.write("CLSW")
                 self.instr.write("TRMD SINGLE")
                 self.instr.write("ARM; WAIT; *OPC?")
                 self.instr.read()
