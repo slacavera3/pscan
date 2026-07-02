@@ -16,35 +16,104 @@ pscan-lab is a cross-platform Python orchestration package designed for hardware
 * Legacy Support: Nominally supports Windows 7 (requires Python 3.8.x maximum).
 * Python Dependencies: numpy, opencv-python, pyserial, python-vxi11, and standard-xdrlib.
 
-### Installation
 
-For Linux deployments, a universal bash script is provided to handle both OS-level hardware drivers (Comedi) and Python package linking. 
+================================================================================
+                      PSCAN GITHUB INSTALLATION CHEATSHEET
+================================================================================
+Target Repository: https://github.com/slacavera3/pscan.git
 
--- Local Lab Installation (Server Direct) --
-If you are operating directly on the lab server where the source code is hosted:
-1. Navigate to the pscan source directory:
-   cd path/to/psource
+Requirements: 
+- Git installed (`git --version`)
+- Python 3 installed (`python --version` or `python3 --version`)
+- Pip installed. If missing:
+    * Linux (Ubuntu/Debian): `sudo apt update && sudo apt install python3-pip`
+    * Windows PowerShell:    `python -m ensurepip --upgrade`
 
-2. Run the installer. Note: The script will invoke sudo internally to install apt packages and link the CLI commands globally. You may be prompted for your password.
-   ./install_pscan.sh
+--------------------------------------------------------------------------------
+1. THE ONE-LINER (RECOMMENDED SYSTEM-WIDE INSTALLATION)
+--------------------------------------------------------------------------------
+This is the absolute fastest way to install pscan globally. You do not need to 
+clone the repository first.
 
--- Remote Installation (Via GitHub) --
-If you are deploying on a new machine:
-1. Clone the repository and navigate to the directory:
-   git clone https://github.com/slacavera3/pscan.git
-   cd pscan
+# LINUX (Ubuntu/Debian): 
+# Automatically handles hardware drivers (libcomedi0) and the python package.
+curl -sSL https://raw.githubusercontent.com/slacavera3/pscan/main/install_pscan.sh | bash
 
-2. Make the installer executable:
-   chmod +x install_pscan.sh
+# WINDOWS POWERSHELL (Run as Administrator):
+pip install git+https://github.com/slacavera3/pscan.git
 
-3. Run the installer:
-   ./install_pscan.sh
+--------------------------------------------------------------------------------
+2. INSTALLING FROM A LOCAL SOURCE (FOR DEVELOPERS)
+--------------------------------------------------------------------------------
+If you are developing or testing local changes, navigate to your source directory 
+and run the smart installer.
 
--- Remote Installation (Via GitHub) on Windows (7)
-If you are deploying on a new machine:
-1. pip install git+https://github.com/slacavera3/pscan.git
+# LINUX (Assuming source is in /filepath/to/psource):
+cd /filepath/to/psource
+./install_pscan.sh
 
-2. If you're deploying on a machine which already has a copy of the repository for some reason: 'pip install -e .' in the root folder).
+# WINDOWS POWERSHELL:
+cd C:\path\to\your\psource
+pip install .
+
+--------------------------------------------------------------------------------
+3. VIRTUAL ENVIRONMENTS (VENV)
+--------------------------------------------------------------------------------
+Use this to isolate pscan from your global Python packages. 
+(Note: Do not use install_pscan.sh here, as 'sudo' bypasses virtual environments).
+
+# LINUX
+mkdir my-pscan-workspace
+cd my-pscan-workspace
+python3 -m venv venv
+source venv/bin/activate
+sudo apt install -y libcomedi0 libcomedi-dev  # Ensure drivers exist globally
+pip install git+https://github.com/slacavera3/pscan.git
+# To exit: deactivate
+
+# WINDOWS POWERSHELL
+mkdir my-pscan-workspace
+cd my-pscan-workspace
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install git+https://github.com/slacavera3/pscan.git
+# To exit: deactivate
+
+--------------------------------------------------------------------------------
+4. UPDATING OR REINSTALLING PSCAN
+--------------------------------------------------------------------------------
+If a new version of pscan is released, run the appropriate command to upgrade.
+
+# Linux Global Update (From GitHub):
+curl -sSL https://raw.githubusercontent.com/slacavera3/pscan/main/install_pscan.sh | bash
+
+# Windows Global Update (From GitHub):
+pip install --upgrade --force-reinstall git+https://github.com/slacavera3/pscan.git
+
+# Local Source Update (Linux Example):
+cd /filepath/to/psource
+git pull
+./install_pscan.sh
+
+--------------------------------------------------------------------------------
+APPENDIX: SYSTEM-WIDE VS. VIRTUAL ENVIRONMENT
+--------------------------------------------------------------------------------
+SYSTEM-WIDE INSTALLATIONS:
+* What it does: Installs the software globally across your OS. The tool is 
+  accessible from anywhere in your terminal without needing setup commands.
+* When to use: Use this for standalone CLI tools that you want to access 
+  universally, just like native commands (e.g., `ls` or `ping`). 
+* The downside: Dependency conflicts. If pscan relies on Version 1.0 of a 
+  library, and another tool requires Version 2.0, one will break.
+
+VENV (VIRTUAL ENVIRONMENT) INSTALLATIONS:
+* What it does: Creates an isolated sandbox directory. 
+* When to use: Use this for actively developing Python code or when a tool 
+  has highly specific dependencies that would break your global setup. 
+* The downside: You have to run the `activate` command every single time 
+  you open a new terminal window before using the tool.
+================================================================================
+
 
 ### Usage
 

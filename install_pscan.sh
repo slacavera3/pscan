@@ -26,12 +26,13 @@ if [ ! -f "pscan/__init__.py" ]; then
 fi
 
 # 3. Standard Global Installation
-echo -e "\n[PIP] Installing Python package globally..."
-
-# Notice the '-e' is completely gone. This copies the files to the system 
-# directory safely without polluting the local user folder with root permissions.
-# sudo pip install . --break-system-packages # old, assumes the package has already been cloned
-sudo pip install git+https://github.com/slacavera3/pscan.git --break-system-packages
+if [ -f "setup.py" ] && [ -d "pscan" ]; then
+    echo -e "\n[PIP] Local repository detected. Installing from local source..."
+    sudo pip3 install . --break-system-packages
+else
+    echo -e "\n[PIP] Remote installation detected. Pulling directly from GitHub..."
+    sudo pip3 install git+https://github.com/slacavera3/pscan.git --break-system-packages
+fi
 
 echo -e "\n[SUCCESS] Installation complete!"
 echo "You can now run 'pscan' or 'pystage' from anywhere in the terminal."
