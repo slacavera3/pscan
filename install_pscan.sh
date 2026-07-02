@@ -30,7 +30,8 @@ echo -e "\n[PIP] Installing Python package globally..."
 
 # Notice the '-e' is completely gone. This copies the files to the system 
 # directory safely without polluting the local user folder with root permissions.
-sudo pip install . --break-system-packages
+# sudo pip install . --break-system-packages # old, assumes the package has already been cloned
+sudo pip install git+https://github.com/slacavera3/pscan.git --break-system-packages
 
 echo -e "\n[SUCCESS] Installation complete!"
 echo "You can now run 'pscan' or 'pystage' from anywhere in the terminal."
