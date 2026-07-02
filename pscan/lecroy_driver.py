@@ -73,7 +73,7 @@ scp.channels={{{ch_str}}};
                 for ch in channels:
                     ch_clean = ch.strip().upper()
                     if ch_clean.startswith('F'):
-                        print(f" -> Forcing {sweeps} sweeps via VBS on {ch_clean}...")
+                        #print(f" -> Forcing {sweeps} sweeps via VBS on {ch_clean}...")
                         self.instr.write(f'VBS "app.Math.{ch_clean}.Operator1.Sweeps={int(sweeps)}" ')
                         self.instr.write(f'VBS "app.Math.{ch_clean}.Operator2.Sweeps={int(sweeps)}" ')
                         self.instr.write(f'VBS "app.Math.{ch_clean}.Math.Average.Sweeps={int(sweeps)}" ')
