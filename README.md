@@ -41,7 +41,7 @@ sudo apt update && sudo apt install -y libcomedi0 libcomedi-dev
 
 # Step 2: Install the Python package directly from GitHub
 # Note: Use sudo to install for all users. The override flag is required for Debian 13.
-sudo pip install --force-reinstall git+https://github.com/slacavera3/pscan.git --break-system-packages
+sudo pip install git+https://github.com/slacavera3/pscan.git --break-system-packages
 
 # WINDOWS POWERSHELL (Run as Administrator):
 # (Windows does not require the Comedi drivers)
@@ -87,14 +87,15 @@ pip install git+https://github.com/slacavera3/pscan.git
 4. UPDATING OR REINSTALLING PSCAN
 --------------------------------------------------------------------------------
 If a new version of pscan is released, run the appropriate command to upgrade.
+Using --no-deps prevents Debian dependency uninstall errors.
 
 # Global Update (Linux & Windows):
-pip install --upgrade --force-reinstall git+https://github.com/slacavera3/pscan.git
+sudo pip install --force-reinstall --no-deps git+https://github.com/slacavera3/pscan.git --break-system-packages
 
 # Local Source Update:
 cd /path/to/your/psource
 git pull
-pip install .
+sudo pip install --force-reinstall --no-deps . --break-system-packages
 
 --------------------------------------------------------------------------------
 APPENDIX: SYSTEM-WIDE VS. VIRTUAL ENVIRONMENT
