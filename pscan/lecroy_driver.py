@@ -3,12 +3,32 @@ import struct
 import numpy as np
 import os
 import re
+import threading
+import queue
 
 class LeCroyScope:
     def __init__(self, ip_address):
         self.ip = ip_address
         self.instr = None
         self.cached_triggers = 1  # Store the calculation to reuse on every pixel
+
+        # Async Writer Setup
+        self.write_queue = queue.Queue()
+        self.writer_thread = threading.Thread(target=self._writer_worker, daemon=True)
+        self.writer_thread.start()
+
+    def _writer_worker(self):
+        """Runs continuously in the background, writing payloads to disk."""
+        while True:
+            payload = self.write_queue.get()
+            if payload is None:  # Poison pill to kill the thread
+                self.write_queue.task_done()
+                break
+                
+            dat_filename, mode, binary_bytes = payload
+            with open(dat_filename, mode) as f:
+                f.write(binary_bytes)
+            self.write_queue.task_done()
 
     def connect(self):
         if self.instr is None:
@@ -21,6 +41,10 @@ class LeCroyScope:
         if self.instr is not None:
             self.instr.close()
             self.instr = None
+            
+        # Safely shut down the background writer
+        self.write_queue.put(None)
+        self.writer_thread.join()
 
     def _write_multi_matlab_metadata(self, base_fn, channels, metas, sum_meta):
         m_filename = f"{base_fn}.m"
@@ -172,8 +196,9 @@ scp.channels={{{ch_str}}};
         if save_for_matlab:
             dat_filename = f"{output_base_name}.dat"
             mode = "wb" if is_first_trace else "ab"
-            with open(dat_filename, mode) as f:
-                f.write(binary_bytes)
+            
+            # Toss the heavy binary payload into the background queue instantly
+            self.write_queue.put((dat_filename, mode, binary_bytes))
                 
             if is_first_trace:
                 fm = meta_list[0]
@@ -185,6 +210,7 @@ scp.channels={{{ch_str}}};
                     'points': fm['points'],
                     'n_traces': tot_traces
                 }
+                # Keep the tiny metadata file synchronous since it only happens once
                 self._write_multi_matlab_metadata(
                     output_base_name, channels, meta_list, summary_meta
                 )
