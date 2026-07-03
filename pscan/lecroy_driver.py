@@ -39,6 +39,7 @@ class LeCroyScope:
 
     def disconnect(self):
         if self.instr is not None:
+            self.instr.write("TRMD AUTO") # Return scope to usable state
             self.instr.close()
             self.instr = None
             
