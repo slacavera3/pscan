@@ -68,8 +68,8 @@ scp.n_traces={sum_meta['n_traces']};
 scp.n_channels={len(channels)};
 scp.format=2;
 scp.dataname='{dat_filename}';
-scp.n_averages=-1;
-scp.multitraces=1;
+scp.n_averages={sweeps if sweeps is not None else -1};
+scp.multitraces={segments};
 scp.channels={{{ch_str}}};
 """
         with open(m_filename, "w") as f:
@@ -213,7 +213,8 @@ scp.channels={{{ch_str}}};
                 }
                 # Keep the tiny metadata file synchronous since it only happens once
                 self._write_multi_matlab_metadata(
-                    output_base_name, channels, meta_list, summary_meta
+                    output_base_name, channels, meta_list, summary_meta,
+                    segments=segments, sweeps=sweeps
                 )
                 
         return True
