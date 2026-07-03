@@ -40,12 +40,12 @@ clone the repository first.
 sudo apt update && sudo apt install -y libcomedi0 libcomedi-dev
 
 # Step 2: Install the Python package directly from GitHub
-# Note: Debian 13 requires the override flag for global pip installations
-pip install git+https://github.com/slacavera3/pscan.git --break-system-packages
+# Note: Use sudo to install for all users. The override flag is required for Debian 13.
+sudo pip install --force-reinstall git+https://github.com/slacavera3/pscan.git --break-system-packages
 
 # WINDOWS POWERSHELL (Run as Administrator):
 # (Windows does not require the Comedi drivers)
-pip install git+https://github.com/slacavera3/pscan.git
+pip install --force-reinstall git+https://github.com/slacavera3/pscan.git
 
 --------------------------------------------------------------------------------
 2. INSTALLING FROM A LOCAL SOURCE (FOR DEVELOPERS)
