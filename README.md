@@ -30,44 +30,43 @@ Requirements:
     * Windows PowerShell:    `python -m ensurepip --upgrade`
 
 --------------------------------------------------------------------------------
-1. THE ONE-LINER (RECOMMENDED SYSTEM-WIDE INSTALLATION)
+1. GLOBAL INSTALLATION (RECOMMENDED)
 --------------------------------------------------------------------------------
 This is the absolute fastest way to install pscan globally. You do not need to 
 clone the repository first.
 
 # LINUX (Ubuntu/Debian): 
-# Automatically handles hardware drivers (libcomedi0) and the python package.
-curl -sSL https://raw.githubusercontent.com/slacavera3/pscan/main/install_pscan.sh | bash
+# Step 1: Install the required hardware drivers system-wide via apt
+sudo apt update && sudo apt install -y libcomedi0 libcomedi-dev
+
+# Step 2: Install the Python package directly from GitHub
+pip install git+https://github.com/slacavera3/pscan.git
 
 # WINDOWS POWERSHELL (Run as Administrator):
+# (Windows does not require the Comedi drivers)
 pip install git+https://github.com/slacavera3/pscan.git
 
 --------------------------------------------------------------------------------
 2. INSTALLING FROM A LOCAL SOURCE (FOR DEVELOPERS)
 --------------------------------------------------------------------------------
 If you are developing or testing local changes, navigate to your source directory 
-and run the smart installer.
+and run the standard pip installer.
 
-# LINUX (Assuming source is in /filepath/to/psource):
-cd /filepath/to/psource
-./install_pscan.sh
-
-# WINDOWS POWERSHELL:
-cd C:\path\to\your\psource
+# LINUX & WINDOWS:
+cd /path/to/your/psource
 pip install .
 
 --------------------------------------------------------------------------------
 3. VIRTUAL ENVIRONMENTS (VENV)
 --------------------------------------------------------------------------------
 Use this to isolate pscan from your global Python packages. 
-(Note: Do not use install_pscan.sh here, as 'sudo' bypasses virtual environments).
 
 # LINUX
+# Ensure C-drivers exist globally first: sudo apt install -y libcomedi0 libcomedi-dev
 mkdir my-pscan-workspace
 cd my-pscan-workspace
 python3 -m venv venv
 source venv/bin/activate
-sudo apt install -y libcomedi0 libcomedi-dev  # Ensure drivers exist globally
 pip install git+https://github.com/slacavera3/pscan.git
 # To exit: deactivate
 
@@ -84,16 +83,13 @@ pip install git+https://github.com/slacavera3/pscan.git
 --------------------------------------------------------------------------------
 If a new version of pscan is released, run the appropriate command to upgrade.
 
-# Linux Global Update (From GitHub):
-curl -sSL https://raw.githubusercontent.com/slacavera3/pscan/main/install_pscan.sh | bash
-
-# Windows Global Update (From GitHub):
+# Global Update (Linux & Windows):
 pip install --upgrade --force-reinstall git+https://github.com/slacavera3/pscan.git
 
-# Local Source Update (Linux Example):
-cd /filepath/to/psource
+# Local Source Update:
+cd /path/to/your/psource
 git pull
-./install_pscan.sh
+pip install .
 
 --------------------------------------------------------------------------------
 APPENDIX: SYSTEM-WIDE VS. VIRTUAL ENVIRONMENT
