@@ -68,9 +68,12 @@ class NIDriver:
         self.libcomedi.comedi_fileno.argtypes = [ctypes.c_void_p]
         self.libcomedi.comedi_fileno.restype = ctypes.c_int
 
-        # Added cancel command to safely clear the buffer if a timeout occurs
         self.libcomedi.comedi_cancel.argtypes = [ctypes.c_void_p, ctypes.c_uint]
         self.libcomedi.comedi_cancel.restype = ctypes.c_int
+
+        # NEW: Binding for the internal software trigger
+        self.libcomedi.comedi_internal_trigger.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+        self.libcomedi.comedi_internal_trigger.restype = ctypes.c_int
 
         self.device_node = device_node
 
@@ -97,7 +100,7 @@ class NIDriver:
             self.libcomedi.comedi_close(dev_ptr)
             return False
 
-        # CRITICAL FIX: Force the hardware to start instantly, ignoring external sync defaults
+        # Request instant start
         cmd.start_src = TRIG_NOW
         cmd.start_arg = 0
         
@@ -106,7 +109,7 @@ class NIDriver:
         cmd.stop_src = TRIG_COUNT
         cmd.stop_arg = n_samples
 
-        # Test twice to allow Comedi to silently negotiate/fix timing rounding errors
+        # Let Comedi negotiate the constraints with the NI hardware
         self.libcomedi.comedi_command_test(dev_ptr, ctypes.byref(cmd))
         self.libcomedi.comedi_command_test(dev_ptr, ctypes.byref(cmd))
 
@@ -115,15 +118,19 @@ class NIDriver:
             self.libcomedi.comedi_close(dev_ptr)
             return False
 
+        # NEW: Fire the trigger if the hardware negotiated TRIG_INT
+        if cmd.start_src == TRIG_INT:
+            self.libcomedi.comedi_internal_trigger(dev_ptr, subdevice, cmd.start_arg)
+        elif cmd.start_src == TRIG_EXT:
+            print("[WARNING] NI Card is waiting for an EXTERNAL hardware pulse to start!")
+
         fd = self.libcomedi.comedi_fileno(dev_ptr)
         bytes_to_read = n_samples * 2
         raw_bytes = b""
 
-        # Calculate a safe timeout: expected data time + 1.5 second safety buffer
         safe_timeout = (n_samples / sample_rate) + 1.5 if sample_rate > 0 else 2.0
 
         while len(raw_bytes) < bytes_to_read:
-            # Use select to wait for the kernel to stream data WITHOUT hanging Python
             ready, _, _ = select.select([fd], [], [], safe_timeout)
             
             if not ready:
