@@ -3,6 +3,7 @@ import ctypes.util
 import struct
 import sys
 import os
+import select
 
 # Comedi Trigger Constants
 TRIG_NONE  = 0x0001
@@ -14,7 +15,6 @@ TRIG_COUNT = 0x0020
 TRIG_EXT   = 0x0040
 TRIG_INT   = 0x0080
 
-# Map the exact Linux Comedi Command C-Struct
 class comedi_cmd_struct(ctypes.Structure):
     _fields_ = [
         ("subdev", ctypes.c_uint),
@@ -47,14 +47,12 @@ class NIDriver:
             print("Error: Could not load libcomedi.")
             sys.exit(1)
 
-        # Standard Init/Teardown
         self.libcomedi.comedi_open.argtypes = [ctypes.c_char_p]
         self.libcomedi.comedi_open.restype = ctypes.c_void_p
         
         self.libcomedi.comedi_close.argtypes = [ctypes.c_void_p]
         self.libcomedi.comedi_close.restype = ctypes.c_int
 
-        # Async Hardware Command Functions
         self.libcomedi.comedi_get_cmd_generic_timed.argtypes = [
             ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(comedi_cmd_struct),
             ctypes.c_uint, ctypes.c_uint
@@ -70,6 +68,10 @@ class NIDriver:
         self.libcomedi.comedi_fileno.argtypes = [ctypes.c_void_p]
         self.libcomedi.comedi_fileno.restype = ctypes.c_int
 
+        # Added cancel command to safely clear the buffer if a timeout occurs
+        self.libcomedi.comedi_cancel.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        self.libcomedi.comedi_cancel.restype = ctypes.c_int
+
         self.device_node = device_node
 
     def acquire_a2d(self, channel, range_val, n_samples, sample_rate, output_filename, is_first_trace=True):
@@ -79,17 +81,14 @@ class NIDriver:
             return False
 
         subdevice = 0 
-        aref_ground = 0 # Matches hardcoded legacy C++ configuration
+        aref_ground = 0
 
-        # Emulate the C CR_PACK macro to build the channel configuration
         pack_val = ((aref_ground & 0x3) << 24) | ((range_val & 0xff) << 16) | (channel & 0xffff)
         chanlist = (ctypes.c_uint * 1)(pack_val)
 
-        # Build the hardware recipe
         cmd = comedi_cmd_struct()
         period_ns = int(1e9 / sample_rate) if sample_rate > 0 else int(1e5)
 
-        # 1. Ask Linux to populate a generic timed command template
         res = self.libcomedi.comedi_get_cmd_generic_timed(
             dev_ptr, subdevice, ctypes.byref(cmd), 1, period_ns
         )
@@ -98,26 +97,41 @@ class NIDriver:
             self.libcomedi.comedi_close(dev_ptr)
             return False
 
-        # 2. Tell the command to stop exactly after n_samples
+        # CRITICAL FIX: Force the hardware to start instantly, ignoring external sync defaults
+        cmd.start_src = TRIG_NOW
+        cmd.start_arg = 0
+        
         cmd.chanlist = ctypes.cast(chanlist, ctypes.POINTER(ctypes.c_uint))
         cmd.chanlist_len = 1
         cmd.stop_src = TRIG_COUNT
         cmd.stop_arg = n_samples
 
-        # 3. Test and push the command to the NI Hardware
+        # Test twice to allow Comedi to silently negotiate/fix timing rounding errors
         self.libcomedi.comedi_command_test(dev_ptr, ctypes.byref(cmd))
+        self.libcomedi.comedi_command_test(dev_ptr, ctypes.byref(cmd))
+
         if self.libcomedi.comedi_command(dev_ptr, ctypes.byref(cmd)) < 0:
             print("Error: NI Hardware rejected the async command.")
             self.libcomedi.comedi_close(dev_ptr)
             return False
 
-        # 4. Read the raw binary stream directly from the Linux file descriptor
         fd = self.libcomedi.comedi_fileno(dev_ptr)
-        bytes_to_read = n_samples * 2  # 16-bit samples = 2 bytes per point
+        bytes_to_read = n_samples * 2
         raw_bytes = b""
 
+        # Calculate a safe timeout: expected data time + 1.5 second safety buffer
+        safe_timeout = (n_samples / sample_rate) + 1.5 if sample_rate > 0 else 2.0
+
         while len(raw_bytes) < bytes_to_read:
-            # os.read blocks naturally until the NI card pushes data into RAM
+            # Use select to wait for the kernel to stream data WITHOUT hanging Python
+            ready, _, _ = select.select([fd], [], [], safe_timeout)
+            
+            if not ready:
+                print(f"\n[ERROR] NI Card timed out! Expected {n_samples} points, got {len(raw_bytes)//2}.")
+                self.libcomedi.comedi_cancel(dev_ptr, subdevice)
+                self.libcomedi.comedi_close(dev_ptr)
+                return False
+                
             chunk = os.read(fd, bytes_to_read - len(raw_bytes))
             if not chunk:
                 break
@@ -125,11 +139,13 @@ class NIDriver:
 
         self.libcomedi.comedi_close(dev_ptr)
 
-        # Unpack the binary chunk into unsigned 16-bit integers
+        if len(raw_bytes) < bytes_to_read:
+            print(f"[ERROR] Incomplete data stream.")
+            return False
+
         actual_samples = len(raw_bytes) // 2
         readings = struct.unpack(f"<{actual_samples}H", raw_bytes)
 
-        # Voltage scaling using standard NI offset binary mapping
         ni_ranges = {0: 10.0, 1: 5.0, 2: 1.0, 3: 0.2}
         v_max = ni_ranges.get(range_val, 10.0)
         
@@ -138,7 +154,6 @@ class NIDriver:
             voltage = ((raw_int / 65535.0) * (2.0 * v_max)) - v_max
             float_readings.append(voltage)
 
-        # Pack data into 32-bit floats ("<f") to feed MATLAB's fread format seamlessly
         binary_format = f"<{len(float_readings)}f"
         packed_data = struct.pack(binary_format, *float_readings)
 
