@@ -133,6 +133,7 @@ scp.channels={{{ch_str}}};
                 data_offset = sum(offs)
 
                 segments = struct.unpack_from(fmt + 'i', trc, 144)[0]
+                hw_sweeps = struct.unpack_from(fmt + 'i', trc, 148)[0]
                 t_pts = struct.unpack_from(fmt + 'i', trc, 116)[0]
                 
                 if t_pts == 0:
@@ -149,7 +150,8 @@ scp.channels={{{ch_str}}};
                 meta_list.append({
                     'v_gain': v_gain, 'v_offset': v_off,
                     'h_interval': h_int, 'h_offset': h_off,
-                    'points': pts_per_seg, 'n_traces': segments
+                    'points': pts_per_seg, 'n_traces': segments,
+                    'hw_sweeps': hw_sweeps
                 })
                 
                 raw_adc = np.frombuffer(
@@ -190,7 +192,7 @@ scp.channels={{{ch_str}}};
                 # Dynamic logging using the safely parsed metadata values
                 self._write_multi_matlab_metadata(
                     output_base_name, channels, meta_list, summary_meta,
-                    segments=fm['n_traces'], sweeps=sweeps
+                    segments=fm['n_traces'], sweeps=fm['hw_sweeps']
                 )
                 
         return True
