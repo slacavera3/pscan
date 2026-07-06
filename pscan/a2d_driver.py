@@ -54,7 +54,7 @@ class NIDriver:
                 readings.append(32768) 
             
             if delay > 0:
-                time.sleep(delay)
+                #time.sleep(delay)
 
         self.libcomedi.comedi_close(dev_ptr)
 
