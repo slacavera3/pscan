@@ -93,7 +93,7 @@ Using --no-deps prevents Debian dependency uninstall errors.
 sudo pip install --force-reinstall --no-deps git+https://github.com/slacavera3/pscan.git --break-system-packages
 
 # Local Source Update:
-cd /path/to/your/psource
+cd /path/to/psource
 git pull
 sudo pip install --force-reinstall --no-deps . --break-system-packages
 

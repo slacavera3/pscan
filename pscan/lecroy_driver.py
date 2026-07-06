@@ -23,7 +23,7 @@ class LeCroyScope:
             self.instr.close()
             self.instr = None
 
-    def _write_multi_matlab_metadata(self, base_fn, channels, metas, sum_meta):
+    def _write_multi_matlab_metadata(self, base_fn, channels, metas, sum_meta, segments, sweeps):
         m_filename = f"{base_fn}.m"
         dat_filename = f"{base_fn}.dat"
         func_name = os.path.basename(base_fn).replace('-', '_')
