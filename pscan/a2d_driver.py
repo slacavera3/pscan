@@ -100,9 +100,13 @@ class NIDriver:
             self.libcomedi.comedi_close(dev_ptr)
             return False
 
-        # Request instant start
+       # Request instant start
         cmd.start_src = TRIG_NOW
         cmd.start_arg = 0
+        
+        # CRITICAL FIX: Force the A2D conversion to happen instantly on every scan tick
+        cmd.convert_src = TRIG_NOW
+        cmd.convert_arg = 0
         
         cmd.chanlist = ctypes.cast(chanlist, ctypes.POINTER(ctypes.c_uint))
         cmd.chanlist_len = 1
@@ -117,12 +121,8 @@ class NIDriver:
             print("Error: NI Hardware rejected the async command.")
             self.libcomedi.comedi_close(dev_ptr)
             return False
-
-        # NEW: Fire the trigger if the hardware negotiated TRIG_INT
-        if cmd.start_src == TRIG_INT:
-            self.libcomedi.comedi_internal_trigger(dev_ptr, subdevice, cmd.start_arg)
-        elif cmd.start_src == TRIG_EXT:
-            print("[WARNING] NI Card is waiting for an EXTERNAL hardware pulse to start!")
+            
+        # (Proceed directly to the fd = self.libcomedi.comedi_fileno block...)
 
         fd = self.libcomedi.comedi_fileno(dev_ptr)
         bytes_to_read = n_samples * 2
