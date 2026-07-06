@@ -186,9 +186,11 @@ scp.channels={{{ch_str}}};
                     'points': fm['points'],
                     'n_traces': tot_traces
                 }
+                
+                # Dynamic logging using the safely parsed metadata values
                 self._write_multi_matlab_metadata(
                     output_base_name, channels, meta_list, summary_meta,
-                    segments=segments, sweeps=sweeps
+                    segments=fm['n_traces'], sweeps=sweeps
                 )
                 
         return True
