@@ -34,14 +34,18 @@ class NIDriver:
         self.libcomedi.comedi_open.argtypes = [ctypes.c_char_p]
         self.libcomedi.comedi_open.restype = ctypes.c_void_p
         self.libcomedi.comedi_close.argtypes = [ctypes.c_void_p]
-        self.libcomedi.comedi_close.restype = ctypes.c_int
         
+        self.libcomedi.comedi_get_cmd_generic_timed.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(comedi_cmd_struct), ctypes.c_uint, ctypes.c_uint
+        ]
+        self.libcomedi.comedi_command_test.argtypes = [ctypes.c_void_p, ctypes.POINTER(comedi_cmd_struct)]
         self.libcomedi.comedi_command.argtypes = [ctypes.c_void_p, ctypes.POINTER(comedi_cmd_struct)]
-        self.libcomedi.comedi_command.restype = ctypes.c_int
         self.libcomedi.comedi_cancel.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        self.libcomedi.comedi_cancel.restype = ctypes.c_int
         self.libcomedi.comedi_fileno.argtypes = [ctypes.c_void_p]
-        self.libcomedi.comedi_fileno.restype = ctypes.c_int
+        
+        # Vital for the kernel buffer flush!
+        self.libcomedi.comedi_poll.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        self.libcomedi.comedi_poll.restype = ctypes.c_int
 
         self.device_node = device_node
 
@@ -55,51 +59,59 @@ class NIDriver:
         fd = self.libcomedi.comedi_fileno(dev_ptr)
         
         # Build Comedi Channel Specifier
-        # (chan) | (range << 16) | (aref_ground << 24)
         chan_spec = channel | (range_val << 16) | (0 << 24)
         chanlist = (ctypes.c_uint * 1)(chan_spec)
 
-        # Convert requested sample rate into hardware timer intervals (nanoseconds)
-        ns_interval = int(1e9 / sample_rate) if sample_rate > 0 else 10000
+        ns_interval = int(1e9 / sample_rate) if sample_rate > 0 else 100000
 
-        # Construct high-speed DMA Command Structure
         cmd = comedi_cmd_struct()
-        cmd.subdev = subdevice
-        cmd.flags = 0
+        
+        # 1. Ask Linux to populate the hidden PCI flags
+        if self.libcomedi.comedi_get_cmd_generic_timed(dev_ptr, subdevice, ctypes.byref(cmd), 1, ns_interval) < 0:
+            print("[ERROR] Failed to get generic timed template.")
+            self.libcomedi.comedi_close(dev_ptr)
+            return False
+
+        # 2. Assign the exact sources comedi_test proved work
         cmd.start_src = TRIG_NOW
         cmd.start_arg = 0
         cmd.scan_begin_src = TRIG_TIMER
         cmd.scan_begin_arg = ns_interval
-        cmd.convert_src = TRIG_NOW
-        cmd.convert_arg = 0
+        cmd.convert_src = TRIG_TIMER  # The card strictly requires the timer here
+        cmd.convert_arg = 800         # Initializing to the known limit
         cmd.scan_end_src = TRIG_COUNT
         cmd.scan_end_arg = 1
         cmd.stop_src = TRIG_COUNT
         cmd.stop_arg = n_samples
-        cmd.chanlist = chanlist
+
+        cmd.chanlist = ctypes.cast(chanlist, ctypes.POINTER(ctypes.c_uint))
         cmd.chanlist_len = 1
 
         # Cancel any leftover triggers on the subdevice before initializing
         self.libcomedi.comedi_cancel(dev_ptr, subdevice)
 
-        # Arm the hardware DMA command
+        # 3. Negotiate the struct with the hardware (CRITICAL)
+        for _ in range(4):
+            self.libcomedi.comedi_command_test(dev_ptr, ctypes.byref(cmd))
+
+        # 4. Execute
         if self.libcomedi.comedi_command(dev_ptr, ctypes.byref(cmd)) < 0:
-            print("DMA command failing or unsupported. Falling back to clean synchronous sync.")
+            print("[ERROR] Hardware rejected the negotiated DMA command.")
             self.libcomedi.comedi_close(dev_ptr)
             return False
 
-        # Read streaming bytes directly via DMA stream file descriptor
         bytes_to_read = n_samples * 2
         raw_bytes = b""
         
-        # High-performance event loop using system select
+        # 5. Fast Read Loop with manual comedi_poll flush
         while len(raw_bytes) < bytes_to_read:
+            # Force the kernel to drop the data payload instantly
+            self.libcomedi.comedi_poll(dev_ptr, subdevice)
+            
             r, _, _ = select.select([fd], [], [], 2.0)
             if not r:
-                print("DMA Stream Timeout: Hardware failed to feed buffer.")
-                self.libcomedi.comedi_cancel(dev_ptr, subdevice)
-                self.libcomedi.comedi_close(dev_ptr)
-                return False
+                print(f"[ERROR] DMA Stream Timeout. Read {len(raw_bytes)}/{bytes_to_read} bytes.")
+                break
                 
             chunk = os.read(fd, bytes_to_read - len(raw_bytes))
             if not chunk: 
