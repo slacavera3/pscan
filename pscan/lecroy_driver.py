@@ -2,13 +2,13 @@ import vxi11
 import struct
 import numpy as np
 import os
-import re
+import math
 
 class LeCroyScope:
     def __init__(self, ip_address):
         self.ip = ip_address
         self.instr = None
-        self.cached_triggers = 1  # Store the calculation to reuse on every pixel
+        self.required_triggers = 1  # How many times to push the "Go" button
 
     def connect(self):
         if self.instr is None:
@@ -19,7 +19,7 @@ class LeCroyScope:
 
     def disconnect(self):
         if self.instr is not None:
-            self.instr.write("TRMD AUTO") # Return scope to usable state
+            self.instr.write("TRMD AUTO") 
             self.instr.close()
             self.instr = None
 
@@ -44,7 +44,7 @@ scp.n_traces={sum_meta['n_traces']};
 scp.n_channels={len(channels)};
 scp.format=2;
 scp.dataname='{dat_filename}';
-scp.n_averages={sweeps if sweeps is not None else -1};
+scp.n_averages={sweeps};
 scp.multitraces={segments};
 scp.channels={{{ch_str}}};
 """
@@ -59,52 +59,41 @@ scp.channels={{{ch_str}}};
             
         try:
             # =================================================================
-            # SETUP BLOCK: ONLY RUNS ONCE PER EXPERIMENT
+            # SETUP BLOCK: QUERY THE HARDWARE TRUTH
             # =================================================================
-            if is_first_trace and sweeps is not None:
-                self.instr.write("SEQ?")
-                seq_resp = self.instr.read().strip()
+            if is_first_trace:
+                # 1. Ask the scope for the "Total Goal" (Summed Sweeps)
+                self.instr.write('VBS? "return=app.Math.F1.Math.Average.Sweeps"')
+                math_sweeps_str = self.instr.read().strip()
                 
-                segments = 1
-                if "ON" in seq_resp.upper():
-                    match = re.search(r'ON,\s*(\d+)', seq_resp.upper())
-                    if match:
-                        segments = int(match.group(1))
+                # 2. Ask the scope for the "Burst Size" (Timebase Segments)
+                self.instr.write('VBS? "return=app.Acquisition.Horizontal.NumSegments"')
+                timebase_segments_str = self.instr.read().strip()
                 
-                for ch in channels:
-                    ch_clean = ch.strip().upper()
-                    if ch_clean.startswith('F'):
-                        # Silently brute-force the UI update once
-                        self.instr.write(f'VBS "app.Math.{ch_clean}.Operator1.Sweeps={int(sweeps)}" ')
-                        self.instr.write(f'VBS "app.Math.{ch_clean}.Operator2.Sweeps={int(sweeps)}" ')
-                        self.instr.write(f'VBS "app.Math.{ch_clean}.Math.Average.Sweeps={int(sweeps)}" ')
-                
-                # Cache the trigger math so we don't calculate it every pixel
-                if segments > 0:
-                    self.cached_triggers = max(1, int(sweeps // segments))
-                else:
-                    self.cached_triggers = 1
+                try:
+                    math_sweeps = int(float(math_sweeps_str))
+                    timebase_segments = int(float(timebase_segments_str))
+                    
+                    # 3. Calculate how many times Python needs to push the "Go" button
+                    self.required_triggers = max(1, math.ceil(math_sweeps / timebase_segments))
+                    print(f"Scope Status: Math requires {math_sweeps} sweeps. Timebase set to {timebase_segments} segments.")
+                    print(f" -> Python will loop {self.required_triggers} time(s) per pixel.")
+                    
+                except ValueError:
+                    print(f"[WARNING] Could not read hardware UI values. Defaulting to 1 trigger.")
+                    self.required_triggers = 1
 
             # =================================================================
-            # ACQUISITION BLOCK: LEAN AND FAST
+            # ACQUISITION BLOCK: LOOP THE BURSTS
             # =================================================================
-            if sweeps is not None:
-                self.instr.write("CLSW")
-                for _ in range(self.cached_triggers):
-                    self.instr.write("TRMD SINGLE")
-                    self.instr.write("ARM; WAIT; *OPC?")
-                    self.instr.read()
-            else:
-                # Standard single acquisition if sweeps are ignored
-                self.instr.write("CLSW")
+            self.instr.write("CLSW")
+            for _ in range(self.required_triggers):
                 self.instr.write("TRMD SINGLE")
                 self.instr.write("ARM; WAIT; *OPC?")
                 self.instr.read()
             
         except Exception as e:
             print(f"\nTrigger Timeout Error: {e}")
-            print(" -> Scope did not finish acquiring in time.")
-            print(" -> Check if your laser/trigger source is firing!")
             return False
 
         meta_list = []
@@ -116,29 +105,21 @@ scp.channels={{{ch_str}}};
                 raw_data = self.instr.read_raw()
                 
                 wd_idx = raw_data.find(b'WAVEDESC')
-                if wd_idx == -1:
-                    print(f"Error: WAVEDESC missing for {channel}.")
-                    return False
+                if wd_idx == -1: return False
                     
                 trc = raw_data[wd_idx:]
                 fmt = '<' if struct.unpack_from('h', trc, 32)[0] == 1 else '>'
                 comm_type = struct.unpack_from(fmt + 'h', trc, 34)[0]
-                
                 dtype = np.dtype(fmt + 'i2') if comm_type == 1 else np.dtype('i1')
 
-                offs = [
-                    struct.unpack_from(fmt + 'i', trc, o)[0] 
-                    for o in [36, 40, 44, 48, 52, 56]
-                ]
+                offs = [struct.unpack_from(fmt + 'i', trc, o)[0] for o in [36, 40, 44, 48, 52, 56]]
                 data_offset = sum(offs)
 
                 segments = struct.unpack_from(fmt + 'i', trc, 144)[0]
                 hw_sweeps = struct.unpack_from(fmt + 'i', trc, 148)[0]
                 t_pts = struct.unpack_from(fmt + 'i', trc, 116)[0]
                 
-                if t_pts == 0:
-                    print(f"\nError: Scope returned 0 points for {channel}.")
-                    return False
+                if t_pts == 0: return False
                 
                 pts_per_seg = t_pts // segments if segments > 0 else t_pts
 
@@ -154,44 +135,32 @@ scp.channels={{{ch_str}}};
                     'hw_sweeps': hw_sweeps
                 })
                 
-                raw_adc = np.frombuffer(
-                    trc, dtype=dtype, offset=data_offset, count=t_pts
-                )
-                raw_adc = raw_adc.astype(np.int16)
-                raw_adc = raw_adc.reshape(segments, pts_per_seg)
+                raw_adc = np.frombuffer(trc, dtype=dtype, offset=data_offset, count=t_pts)
+                raw_adc = raw_adc.astype(np.int16).reshape(segments, pts_per_seg)
                 adc_data_list.append(raw_adc)
 
             except Exception as e:
                 print(f"Error acquiring {channel}: {e}")
                 return False
         
-        if not adc_data_list:
-            return False
+        if not adc_data_list: return False
 
         stacked = np.stack(adc_data_list, axis=1)
         flat_matrix = stacked.reshape(-1, pts_per_seg)
-        binary_bytes = flat_matrix.tobytes()
         
         if save_for_matlab:
-            dat_filename = f"{output_base_name}.dat"
             mode = "wb" if is_first_trace else "ab"
-            with open(dat_filename, mode) as f:
-                f.write(binary_bytes)
+            with open(f"{output_base_name}.dat", mode) as f:
+                f.write(flat_matrix.tobytes())
                 
             if is_first_trace:
                 fm = meta_list[0]
                 tot_traces = total_loops * fm['n_traces'] * len(channels)
                 
-                summary_meta = {
-                    'h_interval': fm['h_interval'],
-                    'h_offset': fm['h_offset'],
-                    'points': fm['points'],
-                    'n_traces': tot_traces
-                }
-                
-                # Dynamic logging using the safely parsed metadata values
                 self._write_multi_matlab_metadata(
-                    output_base_name, channels, meta_list, summary_meta,
+                    output_base_name, channels, meta_list, 
+                    {'h_interval': fm['h_interval'], 'h_offset': fm['h_offset'], 
+                     'points': fm['points'], 'n_traces': tot_traces},
                     segments=fm['n_traces'], sweeps=fm['hw_sweeps']
                 )
                 
