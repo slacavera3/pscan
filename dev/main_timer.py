@@ -6,7 +6,7 @@ import cv2
 import shutil
 import numpy as np
 
-# Cross-platform module imports
+# Imports the clean, stable drivers from your updated system installation
 from pscan.config_parser import (
     parse_flat_con_file, categorize_pipeline, 
     compile_pipeline_list, compile_stage_parameters
@@ -15,7 +15,6 @@ from pscan.lecroy_driver import LeCroyScope
 from pscan.a2d_driver import NIDriver
 from pscan.stage_driver import ThorlabsStage
 
-# OS-Specific Andor Import
 try:
     if os.name == 'nt':
         from pscan.ixon_driver import IXonCamera
@@ -27,15 +26,15 @@ except ImportError:
 
 def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename, 
                           total_a2d_blocks, global_total_traces, 
-                          call_state, silent_acq=False, timer_mode=False):
+                          call_state, silent_acq=False):
     is_first = (call_state['current_trace_idx'] == 0)
     
     for step_idx, action in enumerate(pipeline):
         act_type = action['type']
         p = action['params']
         
-        if timer_mode: 
-            t_mod_start = time.perf_counter()
+        # Micro-timer starts here
+        t_mod_start = time.perf_counter()
         
         if act_type == 'script':
             if not silent_acq: 
@@ -50,10 +49,7 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
             
         elif act_type == 'webcam':
             idx = call_state['current_trace_idx']
-            img_filename = (
-                f"{base_filename}_count{global_total_traces}_"
-                f"webcam_trace{idx}.jpg"
-            )
+            img_filename = f"{base_filename}_count{global_total_traces}_webcam_trace{idx}.jpg"
             if not silent_acq:
                 print(f" -> Grabbing USB frame -> {img_filename}...")
             
@@ -70,16 +66,12 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
             scope.acquire_multi_channel(
                 channels=p['channels'], output_base_name=output_name,
                 save_for_matlab=True, is_first_trace=is_first, 
-                total_loops=global_total_traces,
-                sweeps=p.get('sweeps')  
+                total_loops=global_total_traces, sweeps=p.get('sweeps')  
             )
             
         elif act_type == 'a2d':
             idx_num = p['legacy_index']
-            output_name = (
-                f"{base_filename}_count{global_total_traces}_"
-                f"a2d{idx_num}_{total_a2d_blocks}f.d"
-            )
+            output_name = f"{base_filename}_count{global_total_traces}_a2d{idx_num}_{total_a2d_blocks}f.d"
             ni_daq.acquire_a2d(
                 channel=p['channel'], range_val=p['range'], 
                 n_samples=p['n_samples'], sample_rate=p['sample_rate'], 
@@ -89,19 +81,13 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
         elif act_type == 'ixon' and ixon:
             if not call_state.get('ixon_configured'):
                 ixon.setup(
-                    exposure=p['exposure'],
-                    em_gain=p['em_gain'],
-                    kinetic_cycle=p['kinetic_cycle'],
-                    shutter_open=p['shutter_open']
+                    exposure=p['exposure'], em_gain=p['em_gain'],
+                    kinetic_cycle=p['kinetic_cycle'], shutter_open=p['shutter_open']
                 )
                 call_state['ixon_configured'] = True
 
             idx = call_state['current_trace_idx']
-            img_filename = (
-                f"{base_filename}_count{global_total_traces}_"
-                f"ixon_trace{idx}.npy"
-            )
-            
+            img_filename = f"{base_filename}_count{global_total_traces}_ixon_trace{idx}.npy"
             if not silent_acq:
                 print(f" -> Acquiring iXon frame -> {img_filename}...")
                 
@@ -109,24 +95,20 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
             if frame_data is not None:
                 np.save(img_filename, frame_data)
                 
-        if timer_mode and silent_acq:
+        # Micro-timer ends and prints here
+        if silent_acq:
             t_mod_end = time.perf_counter()
             print(f"      [Timer] {act_type.upper()} module : {t_mod_end - t_mod_start:.4f}s")
 
 def main():
-    name_was_changed = False  # IT LIVES HERE NOW. NO MORE GHOST ERRORS.
-    args = sys.argv[1:]
-    timer_mode = False
-    
-    if '--timer' in args:
-        timer_mode = True
-        args.remove('--timer')
+    # The missing variable is back where it belongs
+    name_was_changed = False
 
-    if len(args) < 1:
-        print("Usage: pscan [--timer] <path_to_config.con>")
+    if len(sys.argv) < 2:
+        print("Usage: python3 main_timer.py <path_to_config.con>")
         sys.exit(1)
 
-    con_filepath = args[0]
+    con_filepath = sys.argv[1]
     if not os.path.exists(con_filepath):
         print(f"Error: File '{con_filepath}' not found.")
         sys.exit(1)
@@ -188,9 +170,6 @@ def main():
     if scope:
         print(f"\nOpening session to LeCroy at {scope_ip}...")
         scope.connect()
-    if total_a2d_blocks > 0:
-        print("Connecting to NI A2D card...")
-        ni_daq.connect()
     if stage:
         stage.connect()
     if ixon_in_pipeline and ANDOR_AVAILABLE:
@@ -203,92 +182,78 @@ def main():
     
     call_state = {'current_trace_idx': 0, 'ixon_configured': False}
     
-    try:
-        if setup_pipeline:
-            print("\nExecuting Pre-Scan Initialization Commands...")
-            run_pipeline_sequence(
-                setup_pipeline, scope, ni_daq, ixon, base_filename, 
-                total_a2d_blocks, global_total_traces, call_state, 
-                timer_mode=timer_mode
-            )
+    if setup_pipeline:
+        print("\nExecuting Pre-Scan Initialization Commands...")
+        run_pipeline_sequence(
+            setup_pipeline, scope, ni_daq, ixon, base_filename, 
+            total_a2d_blocks, global_total_traces, call_state
+        )
 
-        print("\nExecuting Data Acquisition Sequence...")
-        
-        if scope_ip:
-            scope_act = next((act for act in acquisition_pipeline if act['type'] == 'scope'), None)
-            if scope_act and scope_act['params'].get('sweeps'):
-                print(f" -> Scope Hardware Target: {scope_act['params']['sweeps']} Averages\n")
+    print("\nExecuting Data Acquisition Sequence...")
+    
+    if scope_ip:
+        scope_act = next((act for act in acquisition_pipeline if act['type'] == 'scope'), None)
+        if scope_act and scope_act['params'].get('sweeps'):
+            print(f" -> Scope Hardware Target: {scope_act['params']['sweeps']} Averages\n")
+            
+    master_trace_idx = 0
+    
+    for x_val in axis_0_pos:
+        if x_val is not None and stage_params.get(0):
+            stage.move_absolute('x', x_val, counts_per_mm)
+            
+        for y_val in axis_1_pos:
+            if y_val is not None and stage_params.get(1):
+                stage.move_absolute('y', y_val, counts_per_mm)
                 
-        master_trace_idx = 0
-        
-        for x_val in axis_0_pos:
-            if x_val is not None and stage_params.get(0):
-                stage.move_absolute('x', x_val, counts_per_mm)
+            if x_val is not None or y_val is not None:
+                settle_time = 1.5 if master_trace_idx == 0 else 0.2
+                time.sleep(settle_time)
                 
-            for y_val in axis_1_pos:
-                if y_val is not None and stage_params.get(1):
-                    stage.move_absolute('y', y_val, counts_per_mm)
-                    
-                if x_val is not None or y_val is not None:
-                    settle_time = 1.5 if master_trace_idx == 0 else 0.2
-                    time.sleep(settle_time)
-                    
-                for c_val in range(count_val):
-                    if timer_mode:
-                        t_trace_start = time.perf_counter()
-                    
-                    call_state['current_trace_idx'] = master_trace_idx
-                    current_num = master_trace_idx + 1
-                    
-                    x_str = f"{x_val:7.4f} mm" if x_val is not None else "Static"
-                    y_str = f"{y_val:7.4f} mm" if y_val is not None else "Static"
-                    
-                    print(
-                        f" -> Position: X = {x_str}, Y = {y_str} "
-                        f"| Trace {current_num}/{global_total_traces}..."
-                    )
-                    
-                    run_pipeline_sequence(
-                        acquisition_pipeline, scope, ni_daq, ixon, base_filename, 
-                        total_a2d_blocks, global_total_traces, call_state, 
-                        silent_acq=True, timer_mode=timer_mode
-                    )
-                    
-                    if timer_mode:
-                        t_trace_end = time.perf_counter()
-                        print(f"      [Timer] Total trace time: {t_trace_end - t_trace_start:.4f}s\n")
-                    
-                    master_trace_idx += 1
+            for c_val in range(count_val):
+                t_trace_start = time.perf_counter()
                 
-            if 1 in stage_params and stage_params[1]['restore']:
-                y_start = stage_params[1]['start_pos']
-                stage.move_absolute('y', y_start, counts_per_mm)
+                call_state['current_trace_idx'] = master_trace_idx
+                current_num = master_trace_idx + 1
+                
+                x_str = f"{x_val:7.4f} mm" if x_val is not None else "Static"
+                y_str = f"{y_val:7.4f} mm" if y_val is not None else "Static"
+                
+                print(
+                    f" -> Position: X = {x_str}, Y = {y_str} "
+                    f"| Trace {current_num}/{global_total_traces}..."
+                )
+                
+                run_pipeline_sequence(
+                    acquisition_pipeline, scope, ni_daq, ixon, base_filename, 
+                    total_a2d_blocks, global_total_traces, call_state, silent_acq=True
+                )
+                
+                t_trace_end = time.perf_counter()
+                print(f"      [Timer] Total trace time: {t_trace_end - t_trace_start:.4f}s\n")
+                
+                master_trace_idx += 1
+            
+        if 1 in stage_params and stage_params[1]['restore']:
+            y_start = stage_params[1]['start_pos']
+            stage.move_absolute('y', y_start, counts_per_mm)
 
-        if 0 in stage_params and stage_params[0]['restore']:
-            x_start = stage_params[0]['start_pos']
-            stage.move_absolute('x', x_start, counts_per_mm)
+    if 0 in stage_params and stage_params[0]['restore']:
+        x_start = stage_params[0]['start_pos']
+        stage.move_absolute('x', x_start, counts_per_mm)
 
-        if teardown_pipeline:
-            print("\nExecuting Post-Scan Teardown Commands...")
-            run_pipeline_sequence(
-                teardown_pipeline, scope, ni_daq, ixon, base_filename, 
-                total_a2d_blocks, global_total_traces, call_state, 
-                timer_mode=timer_mode
-            )
+    if teardown_pipeline:
+        print("\nExecuting Post-Scan Teardown Commands...")
+        run_pipeline_sequence(
+            teardown_pipeline, scope, ni_daq, ixon, base_filename, 
+            total_a2d_blocks, global_total_traces, call_state
+        )
 
-    except KeyboardInterrupt:
-        print("\n\n[WARNING] Sequence Aborted by User (Ctrl+C)!")
-    except Exception as e:
-        print(f"\n\n[ERROR] Sequence Failed: {e}")
-        
-    finally:
-        print("\nExecuting Hardware Disconnects & Saving Files...")
-        if scope: scope.disconnect()
-        if stage: stage.disconnect()
-        if ixon: ixon.shutdown()
-        if total_a2d_blocks > 0: ni_daq.disconnect()
-        
-        print("Sequence Complete!")
+    if scope: scope.disconnect()
+    if stage: stage.disconnect()
+    if ixon: ixon.shutdown()
+    
+    print("\nSequence Complete!")
 
 if __name__ == "__main__":
     main()

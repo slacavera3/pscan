@@ -62,12 +62,12 @@ scp.channels={{{ch_str}}};
             
         try:
             # =================================================================
-            # SETUP BLOCK: SCPI TRUTH EXTRACTION AND OVERRIDE
+            # SETUP BLOCK: PURE SCPI TRUTH EXTRACTION
             # =================================================================
             if is_first_trace:
                 self.instr.write("CHDR SHORT")
                 
-                # 1. Get the Hardcoded Timebase Segments (Burst Size)
+                # 1. SCPI Timebase Segments (Burst Size)
                 self.instr.write("SEQ?")
                 seq_resp = self.instr.read().strip()
                 timebase_segments = 1
@@ -76,7 +76,7 @@ scp.channels={{{ch_str}}};
                     if match:
                         timebase_segments = int(match.group(1))
 
-                # 2. Get the current Math Sweeps directly from SCPI
+                # 2. SCPI Math Sweeps (Assuming F1 is the math channel)
                 self.instr.write("F1:DEF?")
                 scpi_resp = self.instr.read().strip()
                 
@@ -85,11 +85,10 @@ scp.channels={{{ch_str}}};
                 if match:
                     current_hw_sweeps = int(match.group(1))
                 
-                # 3. Determine the Target Sweeps (IGNORING parser -1 defaults)
+                # 3. Determine Target Sweeps
                 if sweeps is not None and int(sweeps) > 0:
-                    # Confile is King
+                    # Confile dictates sweeps
                     self.active_sweeps_target = int(sweeps)
-                    print(f"Scope Status: Confile overrides and dictates {self.active_sweeps_target} total sweeps.")
                     
                     if current_hw_sweeps != self.active_sweeps_target:
                         new_scpi_cmd = re.sub(r'(SWEEPS\s*,\s*)\d+', f'\\g<1>{self.active_sweeps_target}', scpi_resp, flags=re.IGNORECASE)
@@ -98,19 +97,22 @@ scp.channels={{{ch_str}}};
                         self.instr.write(new_scpi_cmd)
                         time.sleep(0.5) 
                 else:
-                    # Scope UI is King (Catches None and -1)
+                    # Hardware dictates sweeps
                     self.active_sweeps_target = current_hw_sweeps
-                    print(f"Scope Status: Reading UI. Scope dictates {self.active_sweeps_target} total sweeps.")
 
                 self.instr.write("CHDR OFF")
 
-                # 4. Calculate Loops
+                # 4. Calculate required arming loops
                 self.required_triggers = max(1, math.ceil(self.active_sweeps_target / timebase_segments))
-                print(f" -> Timebase burst size is {timebase_segments} segments.")
-                print(f" -> Python will loop {self.required_triggers} time(s) per pixel.")
+                #print(f" -> Burst size: {timebase_segments} | Required trigger loops: {self.required_triggers}")
+                
+                # Warning if network lag is going to be brutal
+                if timebase_segments == 1 and self.active_sweeps_target > 1:
+                    print(f"\n[WARNING] Scope Sequence mode is OFF (or set to 1 segment)!")
+                    print(f" -> Python must trigger the scope {self.required_triggers} times over the network. This will be incredibly slow!")
 
             # =================================================================
-            # ACQUISITION BLOCK: LOOP THE BURSTS
+            # ACQUISITION BLOCK
             # =================================================================
             self.instr.write("CLSW")
             for _ in range(self.required_triggers):

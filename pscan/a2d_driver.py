@@ -4,6 +4,9 @@ import struct
 import sys
 import os
 import select
+import numpy as np
+import threading
+import queue
 
 # Comedi Trigger Constants
 TRIG_NOW   = 0x0002
@@ -42,43 +45,81 @@ class NIDriver:
         self.libcomedi.comedi_command.argtypes = [ctypes.c_void_p, ctypes.POINTER(comedi_cmd_struct)]
         self.libcomedi.comedi_cancel.argtypes = [ctypes.c_void_p, ctypes.c_uint]
         self.libcomedi.comedi_fileno.argtypes = [ctypes.c_void_p]
-        
-        # Vital for the kernel buffer flush!
         self.libcomedi.comedi_poll.argtypes = [ctypes.c_void_p, ctypes.c_uint]
         self.libcomedi.comedi_poll.restype = ctypes.c_int
 
         self.device_node = device_node
+        self.dev_ptr = None
+        self.fd = None
+        
+        # Async Writer Thread Setup
+        self.write_queue = queue.Queue()
+        self.writer_thread = threading.Thread(target=self._async_writer, daemon=True)
+        self.writer_thread.start()
+
+    def _async_writer(self):
+        """Background thread that safely drains the disk write queue."""
+        while True:
+            task = self.write_queue.get()
+            if task is None:  # Poison pill to gracefully shutdown
+                self.write_queue.task_done()
+                break
+            
+            filename, mode, data = task
+            try:
+                with open(filename, mode) as f:
+                    f.write(data)
+            except Exception as e:
+                print(f"\n[ERROR] Async Write Failed for {filename}: {e}")
+            finally:
+                self.write_queue.task_done()
+
+    def connect(self):
+        if self.dev_ptr is None:
+            self.dev_ptr = self.libcomedi.comedi_open(self.device_node)
+            if not self.dev_ptr:
+                raise RuntimeError(f"Failed to open NI card at {self.device_node.decode()}")
+            
+            self.fd = self.libcomedi.comedi_fileno(self.dev_ptr)
+            
+            # Immediately clear any lingering commands from a previously aborted run
+            self.libcomedi.comedi_cancel(self.dev_ptr, 0)
+
+    def disconnect(self):
+        # 1. Flush the writer queue safely (wait for all pending disk writes to finish)
+        self.write_queue.put(None)
+        if self.writer_thread.is_alive():
+            self.writer_thread.join(timeout=3.0)
+
+        # 2. Cleanup hardware
+        if self.dev_ptr:
+            self.libcomedi.comedi_cancel(self.dev_ptr, 0)
+            self.libcomedi.comedi_close(self.dev_ptr)
+            self.dev_ptr = None
+            self.fd = None
 
     def acquire_a2d(self, channel, range_val, n_samples, sample_rate, output_filename, is_first_trace=True):
-        dev_ptr = self.libcomedi.comedi_open(self.device_node)
-        if not dev_ptr:
-            print(f"Failed to open NI card at {self.device_node.decode()}")
+        if not self.dev_ptr:
+            print("[ERROR] A2D Driver not connected. Call connect() first.")
             return False
 
         subdevice = 0
-        fd = self.libcomedi.comedi_fileno(dev_ptr)
-        
-        # Build Comedi Channel Specifier
         chan_spec = channel | (range_val << 16) | (0 << 24)
         chanlist = (ctypes.c_uint * 1)(chan_spec)
-
         ns_interval = int(1e9 / sample_rate) if sample_rate > 0 else 100000
 
         cmd = comedi_cmd_struct()
         
-        # 1. Ask Linux to populate the hidden PCI flags
-        if self.libcomedi.comedi_get_cmd_generic_timed(dev_ptr, subdevice, ctypes.byref(cmd), 1, ns_interval) < 0:
+        if self.libcomedi.comedi_get_cmd_generic_timed(self.dev_ptr, subdevice, ctypes.byref(cmd), 1, ns_interval) < 0:
             print("[ERROR] Failed to get generic timed template.")
-            self.libcomedi.comedi_close(dev_ptr)
             return False
 
-        # 2. Assign the exact sources comedi_test proved work
         cmd.start_src = TRIG_NOW
         cmd.start_arg = 0
         cmd.scan_begin_src = TRIG_TIMER
         cmd.scan_begin_arg = ns_interval
-        cmd.convert_src = TRIG_TIMER  # The card strictly requires the timer here
-        cmd.convert_arg = 800         # Initializing to the known limit
+        cmd.convert_src = TRIG_TIMER  
+        cmd.convert_arg = 800         
         cmd.scan_end_src = TRIG_COUNT
         cmd.scan_end_arg = 1
         cmd.stop_src = TRIG_COUNT
@@ -87,57 +128,54 @@ class NIDriver:
         cmd.chanlist = ctypes.cast(chanlist, ctypes.POINTER(ctypes.c_uint))
         cmd.chanlist_len = 1
 
-        # Cancel any leftover triggers on the subdevice before initializing
-        self.libcomedi.comedi_cancel(dev_ptr, subdevice)
+        self.libcomedi.comedi_cancel(self.dev_ptr, subdevice)
 
-        # 3. Negotiate the struct with the hardware (CRITICAL)
         for _ in range(4):
-            self.libcomedi.comedi_command_test(dev_ptr, ctypes.byref(cmd))
+            self.libcomedi.comedi_command_test(self.dev_ptr, ctypes.byref(cmd))
 
-        # 4. Execute
-        if self.libcomedi.comedi_command(dev_ptr, ctypes.byref(cmd)) < 0:
+        if self.libcomedi.comedi_command(self.dev_ptr, ctypes.byref(cmd)) < 0:
             print("[ERROR] Hardware rejected the negotiated DMA command.")
-            self.libcomedi.comedi_close(dev_ptr)
             return False
 
         bytes_to_read = n_samples * 2
         raw_bytes = b""
         
-        # 5. Fast Read Loop with manual comedi_poll flush
-        while len(raw_bytes) < bytes_to_read:
-            # Force the kernel to drop the data payload instantly
-            self.libcomedi.comedi_poll(dev_ptr, subdevice)
-            
-            r, _, _ = select.select([fd], [], [], 2.0)
-            if not r:
-                print(f"[ERROR] DMA Stream Timeout. Read {len(raw_bytes)}/{bytes_to_read} bytes.")
-                break
+        try:
+            while len(raw_bytes) < bytes_to_read:
+                r, _, _ = select.select([self.fd], [], [], 2.0)
                 
-            chunk = os.read(fd, bytes_to_read - len(raw_bytes))
-            if not chunk: 
-                break
-            raw_bytes += chunk
+                if not r:
+                    self.libcomedi.comedi_poll(self.dev_ptr, subdevice)
+                    r_retry, _, _ = select.select([self.fd], [], [], 0.5)
+                    if not r_retry:
+                        print(f"[ERROR] DMA Stream Timeout. Read {len(raw_bytes)}/{bytes_to_read} bytes.")
+                        break
+                    
+                chunk = os.read(self.fd, bytes_to_read - len(raw_bytes))
+                if not chunk: 
+                    break
+                raw_bytes += chunk
+                
+        except KeyboardInterrupt:
+            print("\n[WARNING] Keyboard Interrupt detected! Cancelling NI DMA stream...")
+            raise  # Re-raise so main.py can catch it and shutdown the stage/scope too
 
-        # Clean shutdown of active triggers
-        self.libcomedi.comedi_cancel(dev_ptr, subdevice)
-        self.libcomedi.comedi_close(dev_ptr)
+        finally:
+            # This guarantees the hardware state is scrubbed clean, regardless of errors or success
+            self.libcomedi.comedi_cancel(self.dev_ptr, subdevice)
 
         if len(raw_bytes) < bytes_to_read:
             return False
 
-        # Unpack raw 16-bit offset-binary values from the hardware stream
-        actual_samples = len(raw_bytes) // 2
-        readings = struct.unpack(f"<{actual_samples}H", raw_bytes)
-
-        # Scale voltage values
+        # Math Vectorization
+        raw_array = np.frombuffer(raw_bytes, dtype=np.uint16)
         ni_ranges = {0: 10.0, 1: 5.0, 2: 1.0, 3: 0.2}
         v_max = ni_ranges.get(range_val, 10.0)
-        
-        float_readings = [((r / 65535.0) * (2.0 * v_max)) - v_max for r in readings]
-        packed_data = struct.pack(f"<{len(float_readings)}f", *float_readings)
+        float_array = ((raw_array / 65535.0) * (2.0 * v_max)) - v_max
+        packed_data = float_array.astype(np.float32).tobytes()
 
+        # Hand off disk I/O to the background thread instantly
         mode = "wb" if is_first_trace else "ab"
-        with open(output_filename, mode) as f:
-            f.write(packed_data)
+        self.write_queue.put((output_filename, mode, packed_data))
 
         return True
