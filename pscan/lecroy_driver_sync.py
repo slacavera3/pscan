@@ -5,8 +5,6 @@ import os
 import math
 import re
 import time
-import threading
-import queue
 
 class LeCroyScope:
     def __init__(self, ip_address):
@@ -14,28 +12,6 @@ class LeCroyScope:
         self.instr = None
         self.required_triggers = 1  
         self.active_sweeps_target = 1000  
-        
-        # Async Writer Thread Setup
-        self.write_queue = queue.Queue()
-        self.writer_thread = threading.Thread(target=self._async_writer, daemon=True)
-        self.writer_thread.start()
-
-    def _async_writer(self):
-        """Background thread that safely drains the disk write queue."""
-        while True:
-            task = self.write_queue.get()
-            if task is None:  # Poison pill to gracefully shutdown
-                self.write_queue.task_done()
-                break
-            
-            filename, mode, data = task
-            try:
-                with open(filename, mode) as f:
-                    f.write(data)
-            except Exception as e:
-                print(f"\n[ERROR] Scope Async Write Failed for {filename}: {e}")
-            finally:
-                self.write_queue.task_done()
 
     def connect(self):
         if self.instr is None:
@@ -45,12 +21,6 @@ class LeCroyScope:
             self.instr.write("CFMT DEF9,WORD,BIN")
 
     def disconnect(self):
-        # 1. Flush the writer queue safely (wait for all pending disk writes to finish)
-        self.write_queue.put(None)
-        if self.writer_thread.is_alive():
-            self.writer_thread.join(timeout=3.0)
-
-        # 2. Cleanup hardware
         if self.instr is not None:
             self.instr.write("TRMD AUTO") 
             self.instr.close()
@@ -134,6 +104,7 @@ scp.channels={{{ch_str}}};
 
                 # 4. Calculate required arming loops
                 self.required_triggers = max(1, math.ceil(self.active_sweeps_target / timebase_segments))
+                #print(f" -> Burst size: {timebase_segments} | Required trigger loops: {self.required_triggers}")
                 
                 # Warning if network lag is going to be brutal
                 if timebase_segments == 1 and self.active_sweeps_target > 1:
@@ -202,29 +173,20 @@ scp.channels={{{ch_str}}};
 
         stacked = np.stack(adc_data_list, axis=1)
         flat_matrix = stacked.reshape(-1, pts_per_seg)
-        binary_bytes = flat_matrix.tobytes()
         
         if save_for_matlab:
-            dat_filename = f"{output_base_name}.dat"
             mode = "wb" if is_first_trace else "ab"
-            
-            # Toss the heavy binary payload into the background queue instantly
-            self.write_queue.put((dat_filename, mode, binary_bytes))
+            with open(f"{output_base_name}.dat", mode) as f:
+                f.write(flat_matrix.tobytes())
                 
             if is_first_trace:
                 fm = meta_list[0]
                 tot_traces = total_loops * fm['n_traces'] * len(channels)
                 
-                summary_meta = {
-                    'h_interval': fm['h_interval'],
-                    'h_offset': fm['h_offset'],
-                    'points': fm['points'],
-                    'n_traces': tot_traces
-                }
-                
-                # Keep the tiny metadata file synchronous since it only happens once
                 self._write_multi_matlab_metadata(
-                    output_base_name, channels, meta_list, summary_meta,
+                    output_base_name, channels, meta_list, 
+                    {'h_interval': fm['h_interval'], 'h_offset': fm['h_offset'], 
+                     'points': fm['points'], 'n_traces': tot_traces},
                     segments=fm['n_traces'], sweeps=self.active_sweeps_target
                 )
                 

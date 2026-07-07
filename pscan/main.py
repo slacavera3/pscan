@@ -51,7 +51,7 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
         elif act_type == 'webcam':
             idx = call_state['current_trace_idx']
             img_filename = (
-                f"{base_filename}_count{global_total_traces}_"
+                f"{base_filename}_"
                 f"webcam_trace{idx}.jpg"
             )
             if not silent_acq:
@@ -66,7 +66,7 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
                 cam.release()
                 
         elif act_type == 'scope' and scope:
-            output_name = f"{base_filename}_count{global_total_traces}_scope0"
+            output_name = f"{base_filename}_scope0"
             scope.acquire_multi_channel(
                 channels=p['channels'], output_base_name=output_name,
                 save_for_matlab=True, is_first_trace=is_first, 
@@ -77,7 +77,7 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
         elif act_type == 'a2d':
             idx_num = p['legacy_index']
             output_name = (
-                f"{base_filename}_count{global_total_traces}_"
+                f"{base_filename}_"
                 f"a2d{idx_num}_{total_a2d_blocks}f.d"
             )
             ni_daq.acquire_a2d(
@@ -98,7 +98,7 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
 
             idx = call_state['current_trace_idx']
             img_filename = (
-                f"{base_filename}_count{global_total_traces}_"
+                f"{base_filename}_"
                 f"ixon_trace{idx}.npy"
             )
             
@@ -155,8 +155,8 @@ def main():
     counts_per_mm = 34304.0 
 
     while True:
-        scope_target = f"{base_filename}_count{global_total_traces}_scope0.dat"
-        a2d_target = f"{base_filename}_count{global_total_traces}_a2d1_{total_a2d_blocks}f.d"
+        scope_target = f"{base_filename}_scope0.dat"
+        a2d_target = f"{base_filename}_a2d1_{total_a2d_blocks}f.d"
         
         scope_exists = scope_ip and os.path.exists(scope_target)
         a2d_exists = total_a2d_blocks > 0 and os.path.exists(a2d_target)

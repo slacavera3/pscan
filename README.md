@@ -86,16 +86,23 @@ pip install git+https://github.com/slacavera3/pscan.git
 --------------------------------------------------------------------------------
 4. UPDATING OR REINSTALLING PSCAN
 --------------------------------------------------------------------------------
-If a new version of pscan is released, run the appropriate command to upgrade.
-Using --no-deps prevents Debian dependency uninstall errors.
+If a new version of pscan is released, or if you have modified the local source 
+code, use the provided bash script to upgrade your system installation. 
 
-# Global Update (Linux & Windows):
-sudo pip install --force-reinstall --no-deps git+https://github.com/slacavera3/pscan.git --break-system-packages
+Because modern Debian/Ubuntu systems block global pip modifications (PEP 668) 
+and Python aggressively caches local user installations, standard pip commands 
+will often fail or silently load old "ghost" versions of the drivers. The 
+`update_pscan.sh` script brute-forces the removal of all cached files and OS 
+locks before performing a clean rebuild.
 
-# Local Source Update:
+# Local Source Update (Linux - Recommended):
 cd /path/to/psource
-git pull
-sudo pip install --force-reinstall --no-deps . --break-system-packages
+git pull  # (Only if pulling updates from GitHub)
+bash update_pscan.sh
+
+# Global Update (Windows or non-Debian environments):
+# Using --no-cache-dir is critical to ensure changes are actually applied
+pip install --force-reinstall --no-deps --no-cache-dir git+https://github.com/slacavera3/pscan.git
 
 --------------------------------------------------------------------------------
 APPENDIX: SYSTEM-WIDE VS. VIRTUAL ENVIRONMENT
