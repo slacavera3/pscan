@@ -10,8 +10,8 @@ class LeCroyScope:
     def __init__(self, ip_address):
         self.ip = ip_address
         self.instr = None
-        self.required_triggers = 1  # How many times to push the "Go" button
-        self.active_sweeps_target = 1000  # Tracks the final decided sweeps
+        self.required_triggers = 1  
+        self.active_sweeps_target = 1000  
 
     def connect(self):
         if self.instr is None:
@@ -65,7 +65,6 @@ scp.channels={{{ch_str}}};
             # SETUP BLOCK: SCPI TRUTH EXTRACTION AND OVERRIDE
             # =================================================================
             if is_first_trace:
-                # Turn headers ON temporarily so we can grab the SCPI strings
                 self.instr.write("CHDR SHORT")
                 
                 # 1. Get the Hardcoded Timebase Segments (Burst Size)
@@ -86,25 +85,23 @@ scp.channels={{{ch_str}}};
                 if match:
                     current_hw_sweeps = int(match.group(1))
                 
-                # 3. Determine the Target Sweeps and Override if necessary
-                if sweeps is not None:
+                # 3. Determine the Target Sweeps (IGNORING parser -1 defaults)
+                if sweeps is not None and int(sweeps) > 0:
                     # Confile is King
                     self.active_sweeps_target = int(sweeps)
                     print(f"Scope Status: Confile overrides and dictates {self.active_sweeps_target} total sweeps.")
                     
-                    # Update hardware if it doesn't match the confile
                     if current_hw_sweeps != self.active_sweeps_target:
                         new_scpi_cmd = re.sub(r'(SWEEPS\s*,\s*)\d+', f'\\g<1>{self.active_sweeps_target}', scpi_resp, flags=re.IGNORECASE)
                         if not new_scpi_cmd.upper().startswith("F1:DEF"):
                             new_scpi_cmd = f"F1:DEF {new_scpi_cmd}"
                         self.instr.write(new_scpi_cmd)
-                        time.sleep(0.5) # Give the processor time to apply the change
+                        time.sleep(0.5) 
                 else:
-                    # Scope UI is King
+                    # Scope UI is King (Catches None and -1)
                     self.active_sweeps_target = current_hw_sweeps
                     print(f"Scope Status: Reading UI. Scope dictates {self.active_sweeps_target} total sweeps.")
 
-                # Turn headers OFF again so binary waveform downloads don't break
                 self.instr.write("CHDR OFF")
 
                 # 4. Calculate Loops
