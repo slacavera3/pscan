@@ -3,12 +3,15 @@ import struct
 import numpy as np
 import os
 import math
+import re
+import time
 
 class LeCroyScope:
     def __init__(self, ip_address):
         self.ip = ip_address
         self.instr = None
         self.required_triggers = 1  # How many times to push the "Go" button
+        self.active_sweeps_target = 1000  # Tracks the final decided sweeps
 
     def connect(self):
         if self.instr is None:
@@ -59,29 +62,55 @@ scp.channels={{{ch_str}}};
             
         try:
             # =================================================================
-            # SETUP BLOCK: QUERY THE HARDWARE TRUTH
+            # SETUP BLOCK: SCPI TRUTH EXTRACTION AND OVERRIDE
             # =================================================================
             if is_first_trace:
-                # 1. Ask the scope for the "Total Goal" (Summed Sweeps)
-                self.instr.write('VBS? "return=app.Math.F1.Math.Average.Sweeps"')
-                math_sweeps_str = self.instr.read().strip()
+                # Turn headers ON temporarily so we can grab the SCPI strings
+                self.instr.write("CHDR SHORT")
                 
-                # 2. Ask the scope for the "Burst Size" (Timebase Segments)
-                self.instr.write('VBS? "return=app.Acquisition.Horizontal.NumSegments"')
-                timebase_segments_str = self.instr.read().strip()
+                # 1. Get the Hardcoded Timebase Segments (Burst Size)
+                self.instr.write("SEQ?")
+                seq_resp = self.instr.read().strip()
+                timebase_segments = 1
+                if "ON" in seq_resp.upper():
+                    match = re.search(r'ON,\s*(\d+)', seq_resp.upper())
+                    if match:
+                        timebase_segments = int(match.group(1))
+
+                # 2. Get the current Math Sweeps directly from SCPI
+                self.instr.write("F1:DEF?")
+                scpi_resp = self.instr.read().strip()
                 
-                try:
-                    math_sweeps = int(float(math_sweeps_str))
-                    timebase_segments = int(float(timebase_segments_str))
+                current_hw_sweeps = 1000
+                match = re.search(r'SWEEPS\s*,\s*(\d+)', scpi_resp, re.IGNORECASE)
+                if match:
+                    current_hw_sweeps = int(match.group(1))
+                
+                # 3. Determine the Target Sweeps and Override if necessary
+                if sweeps is not None:
+                    # Confile is King
+                    self.active_sweeps_target = int(sweeps)
+                    print(f"Scope Status: Confile overrides and dictates {self.active_sweeps_target} total sweeps.")
                     
-                    # 3. Calculate how many times Python needs to push the "Go" button
-                    self.required_triggers = max(1, math.ceil(math_sweeps / timebase_segments))
-                    print(f"Scope Status: Math requires {math_sweeps} sweeps. Timebase set to {timebase_segments} segments.")
-                    print(f" -> Python will loop {self.required_triggers} time(s) per pixel.")
-                    
-                except ValueError:
-                    print(f"[WARNING] Could not read hardware UI values. Defaulting to 1 trigger.")
-                    self.required_triggers = 1
+                    # Update hardware if it doesn't match the confile
+                    if current_hw_sweeps != self.active_sweeps_target:
+                        new_scpi_cmd = re.sub(r'(SWEEPS\s*,\s*)\d+', f'\\g<1>{self.active_sweeps_target}', scpi_resp, flags=re.IGNORECASE)
+                        if not new_scpi_cmd.upper().startswith("F1:DEF"):
+                            new_scpi_cmd = f"F1:DEF {new_scpi_cmd}"
+                        self.instr.write(new_scpi_cmd)
+                        time.sleep(0.5) # Give the processor time to apply the change
+                else:
+                    # Scope UI is King
+                    self.active_sweeps_target = current_hw_sweeps
+                    print(f"Scope Status: Reading UI. Scope dictates {self.active_sweeps_target} total sweeps.")
+
+                # Turn headers OFF again so binary waveform downloads don't break
+                self.instr.write("CHDR OFF")
+
+                # 4. Calculate Loops
+                self.required_triggers = max(1, math.ceil(self.active_sweeps_target / timebase_segments))
+                print(f" -> Timebase burst size is {timebase_segments} segments.")
+                print(f" -> Python will loop {self.required_triggers} time(s) per pixel.")
 
             # =================================================================
             # ACQUISITION BLOCK: LOOP THE BURSTS
@@ -116,7 +145,6 @@ scp.channels={{{ch_str}}};
                 data_offset = sum(offs)
 
                 segments = struct.unpack_from(fmt + 'i', trc, 144)[0]
-                hw_sweeps = struct.unpack_from(fmt + 'i', trc, 148)[0]
                 t_pts = struct.unpack_from(fmt + 'i', trc, 116)[0]
                 
                 if t_pts == 0: return False
@@ -131,8 +159,7 @@ scp.channels={{{ch_str}}};
                 meta_list.append({
                     'v_gain': v_gain, 'v_offset': v_off,
                     'h_interval': h_int, 'h_offset': h_off,
-                    'points': pts_per_seg, 'n_traces': segments,
-                    'hw_sweeps': hw_sweeps
+                    'points': pts_per_seg, 'n_traces': segments
                 })
                 
                 raw_adc = np.frombuffer(trc, dtype=dtype, offset=data_offset, count=t_pts)
@@ -161,7 +188,7 @@ scp.channels={{{ch_str}}};
                     output_base_name, channels, meta_list, 
                     {'h_interval': fm['h_interval'], 'h_offset': fm['h_offset'], 
                      'points': fm['points'], 'n_traces': tot_traces},
-                    segments=fm['n_traces'], sweeps=fm['hw_sweeps']
+                    segments=fm['n_traces'], sweeps=self.active_sweeps_target
                 )
                 
         return True
