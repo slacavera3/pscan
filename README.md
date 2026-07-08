@@ -1,22 +1,3 @@
-# pscan-lab
-
-Automated Multi-Sensor Acquisition & Thorlabs Stage Control
-
-pscan-lab is a cross-platform Python orchestration package designed for hardware-synchronized data acquisition. 
-
-### Supported Hardware
-* Thorlabs Controllers: BBD202 and BBD302 Brushless DC Motor Controllers.
-* Thorlabs Stages: MLS203 Fast XY Scanning Stages (driver utilizes 34304.0 encoder counts/mm scaling).
-* Oscilloscopes: LeCroy Oscilloscopes (via ethernet/VXI-11).
-* Data Acquisition: National Instruments A2D cards (via Linux Comedi).
-* Imaging: Standard USB Webcams (via OpenCV/V4L2/DirectShow).
-
-### System Requirements
-* Primary OS: Debian 13 (Linux). This package is optimized and tested for Debian 13. If you require deployment on other Linux distributions, please reach out to Sal.
-* Legacy Support: Nominally supports Windows 7 (requires Python 3.8.x maximum).
-* Python Dependencies: numpy, opencv-python, pyserial, python-vxi11, and standard-xdrlib.
-
-
 ================================================================================
                       PSCAN GITHUB INSTALLATION CHEATSHEET
 ================================================================================
@@ -30,36 +11,42 @@ Requirements:
     * Windows PowerShell:    `python -m ensurepip --upgrade`
 
 --------------------------------------------------------------------------------
-1. GLOBAL INSTALLATION (RECOMMENDED)
+1. GLOBAL INSTALLATION & UPDATING (LINUX - RECOMMENDED)
 --------------------------------------------------------------------------------
-This is the absolute fastest way to install pscan globally. You do not need to 
-clone the repository first.
+For Debian, Ubuntu, and most Linux distributions, the provided `install.sh` 
+script completely automates the entire setup. It automatically installs required 
+`apt` C-drivers, detects your OS's PEP 668 restrictions, and securely scrubs 
+old "ghost" dependencies before building the new package.
 
-# LINUX (Ubuntu/Debian): 
-# Step 1: Install the required hardware drivers system-wide via apt
-sudo apt update && sudo apt install -y libcomedi0 libcomedi-dev
+# Step 1: Download the source code
+git clone https://github.com/slacavera3/pscan.git
+cd pscan
 
-# Step 2: Install the Python package directly from GitHub
-# Note: Use sudo to install for all users. The override flag is required for Debian 13.
-sudo pip install git+https://github.com/slacavera3/pscan.git --break-system-packages
+# Step 2: Run the automated installer
+bash install.sh
 
-# WINDOWS POWERSHELL (Run as Administrator):
-# (Windows does not require the Comedi drivers)
-pip install --force-reinstall git+https://github.com/slacavera3/pscan.git
+# TO UPDATE LATER:
+# Simply navigate back to the folder, pull the latest code, and re-run:
+cd /path/to/pscan
+git pull
+bash install.sh
 
 --------------------------------------------------------------------------------
-2. INSTALLING FROM A LOCAL SOURCE (FOR DEVELOPERS)
+2. GLOBAL INSTALLATION & UPDATING (WINDOWS)
 --------------------------------------------------------------------------------
-If you are developing or testing local changes, navigate to your source directory 
-and run the standard pip installer.
+Windows does not require the Linux Comedi C-drivers and cannot run the bash 
+script natively. Execute these commands from an Administrator PowerShell.
 
-# LINUX (Debian 13 Global Override):
-cd /path/to/your/psource
-pip install . --break-system-packages
+# Fresh Install directly from GitHub:
+pip install git+https://github.com/slacavera3/pscan.git
 
-# WINDOWS POWERSHELL:
-cd C:\path\to\your\psource
+# Local Developer Install (if you cloned the code):
+cd C:\path\to\psource
 pip install .
+
+# TO UPDATE LATER:
+# Using --no-cache-dir is critical to ensure changes are actually applied!
+pip install --force-reinstall --no-deps --no-cache-dir git+https://github.com/slacavera3/pscan.git
 
 --------------------------------------------------------------------------------
 3. VIRTUAL ENVIRONMENTS (VENV)
@@ -82,27 +69,6 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install git+https://github.com/slacavera3/pscan.git
 # To exit: deactivate
-
---------------------------------------------------------------------------------
-4. UPDATING OR REINSTALLING PSCAN
---------------------------------------------------------------------------------
-If a new version of pscan is released, or if you have modified the local source 
-code, use the provided bash script to upgrade your system installation. 
-
-Because modern Debian/Ubuntu systems block global pip modifications (PEP 668) 
-and Python aggressively caches local user installations, standard pip commands 
-will often fail or silently load old "ghost" versions of the drivers. The 
-`update_pscan.sh` script brute-forces the removal of all cached files and OS 
-locks before performing a clean rebuild.
-
-# Local Source Update (Linux - Recommended):
-cd /path/to/psource
-git pull  # (Only if pulling updates from GitHub)
-bash update_pscan.sh
-
-# Global Update (Windows or non-Debian environments):
-# Using --no-cache-dir is critical to ensure changes are actually applied
-pip install --force-reinstall --no-deps --no-cache-dir git+https://github.com/slacavera3/pscan.git
 
 --------------------------------------------------------------------------------
 APPENDIX: SYSTEM-WIDE VS. VIRTUAL ENVIRONMENT
