@@ -154,11 +154,12 @@ n_samples 100
 end
 
 ## 7. LECROY OSCILLOSCOPE ACQUISITION
-## 'segments' is REQUIRED for dynamic trace allocation.
+## 'sweeps' sets the maths averaging (optional) (accepts multiple values for multi-ch)
+## if no 'sweeps' line confile then default to hardware
 action scope
 ip 192.168.1.100
 channels F1, F2
-segments 1000
+segments 1000, 100
 end
 
 ## 8. EXTERNAL SYSTEM SCRIPT
