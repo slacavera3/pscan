@@ -94,10 +94,12 @@ def compile_pipeline_list(raw_pipeline, a2d_counter):
         if t == 'scope':
             ip_match = re.search(r'ip\s+([\d\.]+)', body)
             ch_match = re.search(r'channels\s+([^\n]+)', body)
-            swp_match = re.search(r'sweeps\s+(\d+)', body)
+            # CHANGED: Grabs the entire line to preserve commas
+            swp_match = re.search(r'sweeps\s+([^\n]+)', body)
             
             p['ip'] = ip_match.group(1) if ip_match else None
-            p['sweeps'] = int(swp_match.group(1)) if swp_match else None
+            # CHANGED: Keeps it as a string so the scope driver can split it
+            p['sweeps'] = swp_match.group(1).strip() if swp_match else None
             
             if ch_match:
                 p['channels'] = [

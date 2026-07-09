@@ -106,29 +106,49 @@ scp.channels={{{ch_str}}};
                     if match:
                         timebase_segments = int(match.group(1))
 
-                # 2. SCPI Math Sweeps (Assuming F1 is the math channel)
-                self.instr.write("F1:DEF?")
-                scpi_resp = self.instr.read().strip()
+                # 2. Parse Conf file sweeps into a list (handles "1000" or "1000, 100")
+                target_sweeps_list = []
+                if sweeps is not None:
+                    # Convert to string to safely split commas, then cast to ints
+                    target_sweeps_list = [int(s.strip()) for s in str(sweeps).split(',') if s.strip().isdigit()]
+
+                # 3. Dynamic SCPI Math Sweeps parsing
+                math_channels = [ch for ch in channels if ch.upper().startswith('F')]
+                final_sweep_targets = []
                 
-                current_hw_sweeps = 1000
-                match = re.search(r'SWEEPS\s*,\s*(\d+)', scpi_resp, re.IGNORECASE)
-                if match:
-                    current_hw_sweeps = int(match.group(1))
-                
-                # 3. Determine Target Sweeps
-                if sweeps is not None and int(sweeps) > 0:
-                    # Confile dictates sweeps
-                    self.active_sweeps_target = int(sweeps)
-                    
-                    if current_hw_sweeps != self.active_sweeps_target:
-                        new_scpi_cmd = re.sub(r'(SWEEPS\s*,\s*)\d+', f'\\g<1>{self.active_sweeps_target}', scpi_resp, flags=re.IGNORECASE)
-                        if not new_scpi_cmd.upper().startswith("F1:DEF"):
-                            new_scpi_cmd = f"F1:DEF {new_scpi_cmd}"
-                        self.instr.write(new_scpi_cmd)
-                        time.sleep(0.5) 
+                if math_channels:
+                    for i, m_ch in enumerate(math_channels):
+                        self.instr.write(f"{m_ch}:DEF?")
+                        scpi_resp = self.instr.read().strip()
+                        
+                        current_hw_sweeps = 1000
+                        match = re.search(r'SWEEPS\s*,\s*(\d+)', scpi_resp, re.IGNORECASE)
+                        if match:
+                            current_hw_sweeps = int(match.group(1))
+                        
+                        # Apply targeted sweeps if provided for this specific index in the confile
+                        if i < len(target_sweeps_list) and target_sweeps_list[i] > 0:
+                            ch_target = target_sweeps_list[i]
+                            if current_hw_sweeps != ch_target:
+                                new_scpi_cmd = re.sub(r'(SWEEPS\s*,\s*)\d+', f'\\g<1>{ch_target}', scpi_resp, flags=re.IGNORECASE)
+                                if not new_scpi_cmd.upper().startswith(f"{m_ch}:DEF"):
+                                    new_scpi_cmd = f"{m_ch}:DEF {new_scpi_cmd}"
+                                self.instr.write(new_scpi_cmd)
+                                time.sleep(0.1) # Brief pause so the scope CPU doesn't choke
+                        else:
+                            # Revert to hardware setting for remaining channels
+                            ch_target = current_hw_sweeps
+                            
+                        final_sweep_targets.append(ch_target)
+                        
+                    # The scope must be triggered enough times to satisfy the channel asking for the MOST sweeps
+                    self.active_sweeps_target = max(final_sweep_targets)
                 else:
-                    # Hardware dictates sweeps
-                    self.active_sweeps_target = current_hw_sweeps
+                    # Fallback if only physical channels (C1, C2) are requested
+                    if target_sweeps_list and target_sweeps_list[0] > 0:
+                        self.active_sweeps_target = target_sweeps_list[0]
+                    else:
+                        self.active_sweeps_target = 1000
 
                 self.instr.write("CHDR OFF")
 
@@ -191,11 +211,8 @@ scp.channels={{{ch_str}}};
                 })
                 
                 raw_adc = np.frombuffer(trc, dtype=dtype, offset=data_offset, count=t_pts)
-                print(raw_adc.shape) # Sal
                 raw_adc = raw_adc.astype(np.int16).reshape(segments, pts_per_seg)
-                print(raw_adc.shape) # Sal
                 adc_data_list.append(raw_adc)
-                print(adc_data_list.shape) # Sal
 
             except Exception as e:
                 print(f"Error acquiring {channel}: {e}")
@@ -204,9 +221,7 @@ scp.channels={{{ch_str}}};
         if not adc_data_list: return False
 
         stacked = np.stack(adc_data_list, axis=1)
-        print(stacked.shape) # Sal
         flat_matrix = stacked.reshape(-1, pts_per_seg)
-        print(flat_matrix.shape) # Sal
         binary_bytes = flat_matrix.tobytes()
         
         if save_for_matlab:
