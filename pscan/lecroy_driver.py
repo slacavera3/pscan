@@ -191,8 +191,11 @@ scp.channels={{{ch_str}}};
                 })
                 
                 raw_adc = np.frombuffer(trc, dtype=dtype, offset=data_offset, count=t_pts)
+                print(raw_adc.shape) # Sal
                 raw_adc = raw_adc.astype(np.int16).reshape(segments, pts_per_seg)
+                print(raw_adc.shape) # Sal
                 adc_data_list.append(raw_adc)
+                print(adc_data_list.shape) # Sal
 
             except Exception as e:
                 print(f"Error acquiring {channel}: {e}")
@@ -201,7 +204,9 @@ scp.channels={{{ch_str}}};
         if not adc_data_list: return False
 
         stacked = np.stack(adc_data_list, axis=1)
+        print(stacked.shape) # Sal
         flat_matrix = stacked.reshape(-1, pts_per_seg)
+        print(flat_matrix.shape) # Sal
         binary_bytes = flat_matrix.tobytes()
         
         if save_for_matlab:

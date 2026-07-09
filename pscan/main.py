@@ -181,7 +181,7 @@ def main():
         shutil.copy(con_filepath, f"{base_filename}.con")
 
     scope = LeCroyScope(scope_ip) if scope_ip else None
-    ni_daq = NIDriver()
+    ni_daq = NIDriver() if total_a2d_blocks > 0 else None
     stage = ThorlabsStage() if stage_params else None
     ixon = None
 
