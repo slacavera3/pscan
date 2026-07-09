@@ -65,6 +65,12 @@ class LeCroyScope:
         voff_str = ",".join([f"{m['v_offset']:e}" for m in metas])
         ch_str = ",".join([f"'{ch}'" for ch in channels])
         
+        # Safely parse the sweeps into a comma-separated string for the MATLAB array
+        if isinstance(sweeps, list):
+            sweeps_str = ",".join(map(str, sweeps))
+        else:
+            sweeps_str = str(sweeps)
+        
         m_content = f"""% scope metadata file version 1.0 June 2026
 function scp={func_name}()
 scp.version=1.0;
@@ -77,7 +83,7 @@ scp.n_traces={sum_meta['n_traces']};
 scp.n_channels={len(channels)};
 scp.format=2;
 scp.dataname='{dat_filename}';
-scp.n_averages={sweeps};
+scp.n_averages=[{sweeps_str}];
 scp.multitraces={segments};
 scp.channels={{{ch_str}}};
 """
@@ -113,44 +119,39 @@ scp.channels={{{ch_str}}};
                     target_sweeps_list = [int(s.strip()) for s in str(sweeps).split(',') if s.strip().isdigit()]
 
                 # 3. Dynamic SCPI Math Sweeps parsing
-                math_channels = [ch for ch in channels if ch.upper().startswith('F')]
-                final_sweep_targets = []
+                self.channel_sweeps = []
                 
-                if math_channels:
-                    for i, m_ch in enumerate(math_channels):
-                        self.instr.write(f"{m_ch}:DEF?")
+                for i, ch in enumerate(channels):
+                    is_math = ch.upper().startswith('F')
+                    ch_target = 1000 # fallback default
+                    
+                    if is_math:
+                        self.instr.write(f"{ch}:DEF?")
                         scpi_resp = self.instr.read().strip()
-                        
-                        current_hw_sweeps = 1000
                         match = re.search(r'SWEEPS\s*,\s*(\d+)', scpi_resp, re.IGNORECASE)
                         if match:
-                            current_hw_sweeps = int(match.group(1))
-                        
-                        # Apply targeted sweeps if provided for this specific index in the confile
+                            ch_target = int(match.group(1))
+                            
+                        if i < len(target_sweeps_list) and target_sweeps_list[i] > 0:
+                            req_target = target_sweeps_list[i]
+                            if ch_target != req_target:
+                                ch_target = req_target
+                                new_scpi_cmd = re.sub(r'(SWEEPS\s*,\s*)\d+', f'\\g<1>{ch_target}', scpi_resp, flags=re.IGNORECASE)
+                                if not new_scpi_cmd.upper().startswith(f"{ch}:DEF"):
+                                    new_scpi_cmd = f"{ch}:DEF {new_scpi_cmd}"
+                                self.instr.write(new_scpi_cmd)
+                                time.sleep(0.1)
+                    else:
+                        # Physical channels (C1, C2) don't have SCPI sweep functions
                         if i < len(target_sweeps_list) and target_sweeps_list[i] > 0:
                             ch_target = target_sweeps_list[i]
-                            if current_hw_sweeps != ch_target:
-                                new_scpi_cmd = re.sub(r'(SWEEPS\s*,\s*)\d+', f'\\g<1>{ch_target}', scpi_resp, flags=re.IGNORECASE)
-                                if not new_scpi_cmd.upper().startswith(f"{m_ch}:DEF"):
-                                    new_scpi_cmd = f"{m_ch}:DEF {new_scpi_cmd}"
-                                self.instr.write(new_scpi_cmd)
-                                time.sleep(0.1) # Brief pause so the scope CPU doesn't choke
                         else:
-                            # Revert to hardware setting for remaining channels
-                            ch_target = current_hw_sweeps
+                            ch_target = 1 
                             
-                        final_sweep_targets.append(ch_target)
-                        
-                    # The scope must be triggered enough times to satisfy the channel asking for the MOST sweeps
-                    self.active_sweeps_target = max(final_sweep_targets)
-                else:
-                    # Fallback if only physical channels (C1, C2) are requested
-                    if target_sweeps_list and target_sweeps_list[0] > 0:
-                        self.active_sweeps_target = target_sweeps_list[0]
-                    else:
-                        self.active_sweeps_target = 1000
-
-                self.instr.write("CHDR OFF")
+                    self.channel_sweeps.append(ch_target)
+                    
+                # Set the trigger loop count based on the channel that takes the longest
+                self.active_sweeps_target = max(self.channel_sweeps) if self.channel_sweeps else 1000
 
                 # 4. Calculate required arming loops
                 self.required_triggers = max(1, math.ceil(self.active_sweeps_target / timebase_segments))
@@ -242,10 +243,10 @@ scp.channels={{{ch_str}}};
                     'n_traces': tot_traces
                 }
                 
-                # Keep the tiny metadata file synchronous since it only happens once
+                # CHANGED: Now passes the list of sweeps to the writer!
                 self._write_multi_matlab_metadata(
                     output_base_name, channels, meta_list, summary_meta,
-                    segments=fm['n_traces'], sweeps=self.active_sweeps_target
+                    segments=fm['n_traces'], sweeps=self.channel_sweeps
                 )
                 
         return True
