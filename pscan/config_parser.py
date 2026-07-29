@@ -53,8 +53,8 @@ def parse_flat_con_file(filepath):
     return all_blocks
 
 def categorize_pipeline(all_blocks):
-    # Added 'ixon' to the list of core acquisition types
-    core_types = ['apt_stage', 'count', 'scope', 'a2d', 'webcam', 'delay', 'ixon']
+    # Added 'ixon' and 'tucsen' to the list of core acquisition types
+    core_types = ['apt_stage', 'count', 'scope', 'a2d', 'webcam', 'delay', 'ixon', 'tucsen']
     core_indices = [
         i for i, b in enumerate(all_blocks) if b['type'] in core_types
     ]
@@ -137,14 +137,25 @@ def compile_pipeline_list(raw_pipeline, a2d_counter):
             
         elif t == 'ixon':
             exp_m = re.search(r'exposure\s+([\d\.]+)', body)
-            gain_m = re.search(r'em_gain\s+(\d+)', body)
+            gain_m = re.search(r'gain\s+(\d+)', body)
             cyc_m = re.search(r'kinetic_cycle\s+([\d\.]+)', body)
             shut_m = re.search(r'shutter_open\s+(\w+)', body)
 
             p['exposure'] = float(exp_m.group(1)) if exp_m else 0.1
-            p['em_gain'] = int(gain_m.group(1)) if gain_m else 72
+            p['gain'] = int(gain_m.group(1)) if gain_m else 72
             p['kinetic_cycle'] = float(cyc_m.group(1)) if cyc_m else 0.5
             p['shutter_open'] = shut_m.group(1).lower() == 'true' if shut_m else True
+
+        elif t == 'tucsen':
+            exp_m = re.search(r'exposure\s+([\d\.]+)', body)
+            gain_m = re.search(r'gain_mode\s+(\w+)', body)
+            depth_m = re.search(r'bit_depth\s+(\d+)', body)
+            master_m = re.search(r'is_master\s+(\w+)', body)
+
+            p['exposure'] = float(exp_m.group(1)) if exp_m else 0.1
+            p['gain_mode'] = gain_m.group(1).lower() if gain_m else "high"
+            p['bit_depth'] = int(depth_m.group(1)) if depth_m else 16
+            p['is_master'] = master_m.group(1).lower() == 'true' if master_m else True
             
         compiled.append({'type': t, 'params': p})
     return compiled

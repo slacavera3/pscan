@@ -5,6 +5,7 @@ import subprocess
 import cv2
 import shutil
 import numpy as np
+from pscan.tucsen_driver import TucsenCamera
 
 # Cross-platform module imports
 from pscan.config_parser import (
@@ -25,7 +26,7 @@ try:
 except ImportError:
     ANDOR_AVAILABLE = False
 
-def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename, 
+def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
                           total_a2d_blocks, global_total_traces, 
                           call_state, silent_acq=False, timer_mode=False):
     is_first = (call_state['current_trace_idx'] == 0)
@@ -90,7 +91,7 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
             if not call_state.get('ixon_configured'):
                 ixon.setup(
                     exposure=p['exposure'],
-                    em_gain=p['em_gain'],
+                    gain=p['gain'],
                     kinetic_cycle=p['kinetic_cycle'],
                     shutter_open=p['shutter_open']
                 )
@@ -106,6 +107,26 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, base_filename,
                 print(f" -> Acquiring iXon frame -> {img_filename}...")
                 
             frame_data = ixon.acquire()
+            if frame_data is not None:
+                np.save(img_filename, frame_data)
+
+        elif act_type == 'tucsen' and tucsen:
+            if not call_state.get('tucsen_configured'):
+                tucsen.setup(
+                    exposure=p['exposure'],
+                    gain=p['gain'],
+                    kinetic_cycle=p['kinetic_cycle'],
+                    shutter_open=p['shutter_open']
+                )
+                call_state['tucsen_configured'] = True
+
+            idx = call_state['current_trace_idx']
+            img_filename = f"{base_filename}_tucsen_trace{idx}.npy"
+            
+            if not silent_acq:
+                print(f" -> Acquiring Tucsen frame -> {img_filename}...")
+                
+            frame_data = tucsen.acquire()
             if frame_data is not None:
                 np.save(img_filename, frame_data)
                 
@@ -184,7 +205,13 @@ def main():
     ni_daq = NIDriver() if total_a2d_blocks > 0 else None
     stage = ThorlabsStage() if stage_params else None
     ixon = None
+    tucsen_in_pipeline = any(act['type'] == 'tucsen' for act in acquisition_pipeline + setup_pipeline + teardown_pipeline)
+    tucsen = None
 
+    if tucsen_in_pipeline:
+        print("\nConnecting to Tucsen Camera...")
+        tucsen = TucsenCamera()
+        tucsen.connect()
     if scope:
         print(f"\nOpening session to LeCroy at {scope_ip}...")
         scope.connect()
@@ -207,7 +234,7 @@ def main():
         if setup_pipeline:
             print("\nExecuting Pre-Scan Initialization Commands...")
             run_pipeline_sequence(
-                setup_pipeline, scope, ni_daq, ixon, base_filename, 
+                setup_pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
                 total_a2d_blocks, global_total_traces, call_state, 
                 timer_mode=timer_mode
             )
@@ -286,6 +313,7 @@ def main():
         if scope: scope.disconnect()
         if stage: stage.disconnect()
         if ixon: ixon.shutdown()
+        if tucsen: tucsen.shutdown()
         if total_a2d_blocks > 0: ni_daq.disconnect()
         
         print("Sequence Complete!")
