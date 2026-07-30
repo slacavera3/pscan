@@ -1,0 +1,22 @@
+1.install libudev-dev
+
+sudo apt-get install libudev1
+sudo apt-get install libudev-dev
+
+2.install sdk
+
+tar -xzvf TUCamSample_v1.0.xx.0_ubuntu22.04.tar.gz
+chmod 777 ./sdk/lib/install.sh
+sudo ./sdk/lib/install.sh
+
+3.use demo
+
+TUCamSample compile by Qt
+define macro TUCAM_TARGETOS_IS_LINUX
+
+4.the files build on Ununtu 22.04, if you have different system, please rebuild the SamplePro code
+
+chmod 777 ./TUCamSample.sh
+sudo ./TUCamSample.sh
+
+5.the api same as on windows os

@@ -6,6 +6,31 @@ import cv2
 import shutil
 import numpy as np
 from pscan.tucsen_driver import TucsenCamera
+import numpy as np
+import queue
+import threading
+
+# Create a thread-safe, capped memory queue. 
+# maxsize=50 safely caps volatile RAM usage at ~400 MB.
+write_queue = queue.Queue(maxsize=50)
+
+def disk_writer_worker():
+    while True:
+        item = write_queue.get()
+        if item is None:  # Poison pill to shut down
+            break
+        filename, data = item
+
+        with open(filename, 'wb') as f:
+            # memoryview() passes a zero-copy point.
+            # Python's native f.write strictly drops the GIL!
+            f.write(memoryview(data))
+
+        write_queue.task_done()
+
+# Start the dedicated background I/O thread
+writer_thread = threading.Thread(target=disk_writer_worker, daemon=True)
+writer_thread.start()
 
 # Cross-platform module imports
 from pscan.config_parser import (
@@ -114,21 +139,23 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, tucsen, base_filename,
             if not call_state.get('tucsen_configured'):
                 tucsen.setup(
                     exposure=p['exposure'],
-                    gain=p['gain'],
-                    kinetic_cycle=p['kinetic_cycle'],
-                    shutter_open=p['shutter_open']
+                    gain_mode=p['gain_mode'],
+                    bit_depth=p['bit_depth'],
+                    is_master=p['is_master']
                 )
                 call_state['tucsen_configured'] = True
 
             idx = call_state['current_trace_idx']
-            img_filename = f"{base_filename}_tucsen_trace{idx}.npy"
+            # Drop .npy and use raw binary .bin
+            img_filename = f"{base_filename}_tucsen_trace{idx}.bin"
             
             if not silent_acq:
                 print(f" -> Acquiring Tucsen frame -> {img_filename}...")
                 
             frame_data = tucsen.acquire()
             if frame_data is not None:
-                np.save(img_filename, frame_data)
+                # Pass the memory reference to the queue (instantaneous, no pickling)
+                write_queue.put((img_filename, frame_data))
                 
         if timer_mode and silent_acq:
             t_mod_end = time.perf_counter()
@@ -276,7 +303,7 @@ def main():
                     )
                     
                     run_pipeline_sequence(
-                        acquisition_pipeline, scope, ni_daq, ixon, base_filename, 
+                        acquisition_pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
                         total_a2d_blocks, global_total_traces, call_state, 
                         silent_acq=True, timer_mode=timer_mode
                     )
@@ -298,7 +325,7 @@ def main():
         if teardown_pipeline:
             print("\nExecuting Post-Scan Teardown Commands...")
             run_pipeline_sequence(
-                teardown_pipeline, scope, ni_daq, ixon, base_filename, 
+                teardown_pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
                 total_a2d_blocks, global_total_traces, call_state, 
                 timer_mode=timer_mode
             )
@@ -315,6 +342,10 @@ def main():
         if ixon: ixon.shutdown()
         if tucsen: tucsen.shutdown()
         if total_a2d_blocks > 0: ni_daq.disconnect()
+
+        print("Waiting for background disk writes to finish...")
+        write_queue.put(None) # Send the poison pill
+        writer_thread.join() # Block exit until the queue is completely flushed
         
         print("Sequence Complete!")
 

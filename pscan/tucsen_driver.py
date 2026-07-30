@@ -49,6 +49,8 @@ class TucsenCamera:
         self.tucam = ctypes.CDLL(lib_path)
         self.h_cam = None
         self.is_initialized = False
+        self.is_capturing = False # NEW
+        self.frame = TUCAM_FRAME() # NEW
         self.trigger_mode = TUCCM_SEQUENCE
         
         # --- Explicitly define C++ argument types to prevent segmentation faults ---
@@ -64,12 +66,35 @@ class TucsenCamera:
 
     def connect(self):
         print("Initializing Tucsen Dhyana 95 V2...")
-        init_api = TUCAM_INIT(0, None)
-        if self.tucam.TUCAM_Api_Init(ctypes.byref(init_api)) != 1 or init_api.uiCamCount == 0:
+        
+        # --- Suppress noisy C-level stdout/stderr ---
+        import sys
+        fd_out, fd_err = sys.stdout.fileno(), sys.stderr.fileno()
+        saved_out, saved_err = os.dup(fd_out), os.dup(fd_err)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        
+        os.dup2(devnull, fd_out)
+        os.dup2(devnull, fd_err)
+        
+        try:
+            init_api = TUCAM_INIT(0, None)
+            res_init = self.tucam.TUCAM_Api_Init(ctypes.byref(init_api))
+            
+            open_cam = TUCAM_OPEN(0, None)
+            res_open = self.tucam.TUCAM_Dev_Open(ctypes.byref(open_cam))
+        finally:
+            # Restore normal terminal output
+            os.dup2(saved_out, fd_out)
+            os.dup2(saved_err, fd_err)
+            os.close(devnull)
+            os.close(saved_out)
+            os.close(saved_err)
+        # ---------------------------------------------
+
+        if res_init != 1 or init_api.uiCamCount == 0:
             raise RuntimeError("Failed to initialize Tucsen API or no cameras found.")
             
-        open_cam = TUCAM_OPEN(0, None)
-        if self.tucam.TUCAM_Dev_Open(ctypes.byref(open_cam)) != 1:
+        if res_open != 1:
             raise RuntimeError("Found Tucsen camera but failed to open it.")
             
         self.h_cam = open_cam.hIdxTUCam
@@ -82,58 +107,96 @@ class TucsenCamera:
             
         print(f"Configuring Tucsen: Exp={exposure}s, GainMode={gain_mode}, BitDepth={bit_depth}-bit")
         
-        # 1. Map string to exact Enum (Your Fix)
         gain_enum = TUGAIN_HDR
         if gain_mode.lower() == "high":
             gain_enum = TUGAIN_HIGH
         elif gain_mode.lower() == "low":
             gain_enum = TUGAIN_LOW
 
-        # 2. Assign Camera State Logic
         self.trigger_mode = TUCCM_SEQUENCE if is_master else TUCCM_TRIGGER_STANDARD
 
-        # 3. Apply settings to hardware via API
-        # Set Bit Depth (Capability)
         self.tucam.TUCAM_Capa_SetValue(self.h_cam, TUIDC_BITOFDEPTH, bit_depth)
-        
-        # Set Gain Mode (Property)
         self.tucam.TUCAM_Prop_SetValue(self.h_cam, TUIDP_GLOBALGAIN, float(gain_enum), 0)
         
-        # Set Exposure Time (Property) 
-        # Note: Depending on firmware, Tucsen APIs often expect exposure in milliseconds. 
-        # If your exposure behaves unexpectedly, you may need to pass `float(exposure * 1000.0)`.
-        self.tucam.TUCAM_Prop_SetValue(self.h_cam, TUIDP_EXPOSURETM, float(exposure), 0)
+        # FIX: Convert seconds to milliseconds for the SDK
+        exp_ms = float(exposure * 1000.0)
+        self.tucam.TUCAM_Prop_SetValue(self.h_cam, TUIDP_EXPOSURETM, exp_ms, 0)
+
+        # Start the stream ONCE, but suppress the "4 frames!" output
+        if not self.is_capturing:
+            import sys
+            fd_out, fd_err = sys.stdout.fileno(), sys.stderr.fileno()
+            saved_out, saved_err = os.dup(fd_out), os.dup(fd_err)
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            
+            os.dup2(devnull, fd_out)
+            os.dup2(devnull, fd_err)
+            
+            try:
+                self.frame.pBuffer = None
+                self.frame.ucFormatGet = TUFRM_FMT_USUAl
+                self.frame.uiRsdSize = 1
+                
+                self.tucam.TUCAM_Buf_Alloc(self.h_cam, ctypes.byref(self.frame))
+                self.tucam.TUCAM_Cap_Start(self.h_cam, self.trigger_mode) 
+                self.is_capturing = True
+
+                # Catch the delayed async C++ teardown logs
+                time.sleep(0.1)
+            finally:
+                os.dup2(saved_out, fd_out)
+                os.dup2(saved_err, fd_err)
+                os.close(devnull)
+                os.close(saved_out)
+                os.close(saved_err)
 
     def acquire(self):
-        if not self.is_initialized:
+        if not self.is_initialized or not self.is_capturing:
             return None
 
-        frame = TUCAM_FRAME()
-        frame.pBuffer = None
-        frame.ucFormatGet = TUFRM_FMT_USUAl
-        frame.uiRsdSize = 1 
-        
-        self.tucam.TUCAM_Buf_Alloc(self.h_cam, ctypes.byref(frame))
-        self.tucam.TUCAM_Cap_Start(self.h_cam, self.trigger_mode) 
-        
-        ret = self.tucam.TUCAM_Buf_WaitForFrame(self.h_cam, ctypes.byref(frame), 2000)
+        # FAST PATH: Just wait for the next frame from the already-running stream
+        ret = self.tucam.TUCAM_Buf_WaitForFrame(self.h_cam, ctypes.byref(self.frame), 2000)
         
         image_copy = None
-        if ret == 1 and frame.pBuffer:
-            buffer_ptr = ctypes.cast(frame.pBuffer, ctypes.POINTER(ctypes.c_uint16))
-            image_array = np.ctypeslib.as_array(buffer_ptr, shape=(frame.usHeight, frame.usWidth))
+        if ret == 1 and self.frame.pBuffer:
+            buffer_ptr = ctypes.cast(self.frame.pBuffer, ctypes.POINTER(ctypes.c_uint16))
+            image_array = np.ctypeslib.as_array(buffer_ptr, shape=(self.frame.usHeight, self.frame.usWidth))
             image_copy = image_array.copy() 
         else:
             print("[ERROR] Tucsen frame retrieval timed out.")
 
-        self.tucam.TUCAM_Cap_Stop(self.h_cam)
-        self.tucam.TUCAM_Buf_Release(self.h_cam)
+        # NO MORE STOPPING OR RELEASING HERE
         
         return image_copy
 
     def shutdown(self):
         if self.is_initialized:
             print("Shutting down Tucsen camera...")
-            self.tucam.TUCAM_Dev_Close(self.h_cam)
-            self.tucam.TUCAM_Api_Uninit()
-            self.is_initialized = False
+            
+            # Suppress the teardown thread logs
+            import sys
+            fd_out, fd_err = sys.stdout.fileno(), sys.stderr.fileno()
+            saved_out, saved_err = os.dup(fd_out), os.dup(fd_err)
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            
+            os.dup2(devnull, fd_out)
+            os.dup2(devnull, fd_err)
+            
+            try:
+                if getattr(self, 'is_capturing', False):
+                    self.tucam.TUCAM_Cap_Stop(self.h_cam)
+                    self.tucam.TUCAM_Buf_Release(self.h_cam)
+                    self.is_capturing = False
+                    
+                self.tucam.TUCAM_Dev_Close(self.h_cam)
+                self.tucam.TUCAM_Api_Uninit()
+                self.is_initialized = False
+
+                # Catch the delayed async C++ teardown logs
+                time.sleep(0.1)
+            finally:
+                os.dup2(saved_out, fd_out)
+                os.dup2(saved_err, fd_err)
+                os.close(devnull)
+                os.close(saved_out)
+                os.close(saved_err)
