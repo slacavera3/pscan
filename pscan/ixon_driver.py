@@ -37,11 +37,11 @@ class IXonCamera:
         self.is_initialized = True
         print("iXon initialized successfully.")
 
-    def setup(self, exposure=0.1, em_gain=72, kinetic_cycle=0.5, shutter_open=True):
+    def setup(self, exposure=0.1, em_gain=1, shutter_open=True):
         if not self.is_initialized:
             return
 
-        print(f"Configuring iXon: Exp={exposure}s, EM={em_gain}, Cycle={kinetic_cycle}s")
+        print(f"Configuring iXon: Exp={exposure}s, EM={em_gain}")
         self.cam.SetAcquisitionMode(self.codes.Acquisition_Mode.SINGLE_SCAN)
         self.cam.SetReadMode(self.codes.Read_Mode.IMAGE)
         self.cam.SetTriggerMode(self.codes.Trigger_Mode.INTERNAL)
