@@ -174,8 +174,7 @@ end
 ## NOT TTL DRIVEN YET, WILL BE MUCH FASTER
 action ixon
 exposure 0.1
-em_gain 72
-kinetic_cycle 0.5
+gain 72
 shutter_open True
 end
 
