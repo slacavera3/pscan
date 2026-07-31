@@ -51,7 +51,7 @@ class IXonCamera:
         self.cam.SetShutter(1, shutter_mode, 50, 50)
         
         self.cam.SetExposureTime(exposure)
-        self.cam.SetKineticCycleTime(kinetic_cycle)
+        #self.cam.SetKineticCycleTime(kinetic_cycle) ]# redundant with the stage settle time in main.py
         self.cam.SetOutputAmplifier(0) 
         self.cam.SetEMCCDGain(em_gain)
         
@@ -68,15 +68,13 @@ class IXonCamera:
 
         self.cam.StartAcquisition()
         
-        # Poll hardware until data is ready
-        status = self.cam.GetStatus()
-        while status == self.errors.Error_Codes.DRV_ACQUIRING:
-            time.sleep(0.005)
-            status = self.cam.GetStatus()
+        # Replace the manual polling loop with the native C-level wait
+        self.cam.WaitForAcquisition()
 
         ret, arr = self.cam.GetOldestImage16(self.image_size)
         if ret == self.errors.Error_Codes.DRV_SUCCESS:
-            return np.array(arr).reshape((self.height, self.width))
+            # Ensure we return a strict uint16 array for the memoryview writer
+            return np.array(arr, dtype=np.uint16).reshape((self.height, self.width))
         else:
             print(f"[ERROR] iXon retrieval failed with code: {ret}")
             return None

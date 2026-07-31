@@ -117,15 +117,16 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, tucsen, base_filename,
                 ixon.setup(
                     exposure=p['exposure'],
                     gain=p['gain'],
-                    kinetic_cycle=p['kinetic_cycle'],
+                    #kinetic_cycle=p['kinetic_cycle'],# removing bc redundant with stage settle time
                     shutter_open=p['shutter_open']
                 )
                 call_state['ixon_configured'] = True
 
             idx = call_state['current_trace_idx']
+            # Change from .npy to .bin
             img_filename = (
                 f"{base_filename}_"
-                f"ixon_trace{idx}.npy"
+                f"ixon_trace{idx}.bin"
             )
             
             if not silent_acq:
@@ -133,7 +134,8 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, tucsen, base_filename,
                 
             frame_data = ixon.acquire()
             if frame_data is not None:
-                np.save(img_filename, frame_data)
+                # Ditch np.save() and pass to the zero-copy background queue
+                write_queue.put((img_filename, frame_data))
 
         elif act_type == 'tucsen' and tucsen:
             if not call_state.get('tucsen_configured'):
@@ -284,6 +286,8 @@ def main():
                     stage.move_absolute('y', y_val, counts_per_mm)
                     
                 if x_val is not None or y_val is not None:
+                    # Dynamically pull settle_time from the confile, default to 0.2s
+                    user_settle = stage_params.get(0, {}).get('settle_time', 0.2)
                     settle_time = 1.5 if master_trace_idx == 0 else 0.2
                     time.sleep(settle_time)
                     
