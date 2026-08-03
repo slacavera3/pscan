@@ -142,8 +142,8 @@ def compile_pipeline_list(raw_pipeline, a2d_counter):
             shut_m = re.search(r'shutter_open\s+(\w+)', body)
 
             p['exposure'] = float(exp_m.group(1)) if exp_m else 0.1
-            p['gain'] = int(gain_m.group(1)) if gain_m else 72
-            p['kinetic_cycle'] = float(cyc_m.group(1)) if cyc_m else 0.5
+            p['em_gain'] = int(gain_m.group(1)) if gain_m else 1
+            #p['kinetic_cycle'] = float(cyc_m.group(1)) if cyc_m else 0.5
             p['shutter_open'] = shut_m.group(1).lower() == 'true' if shut_m else True
 
         elif t == 'tucsen':
