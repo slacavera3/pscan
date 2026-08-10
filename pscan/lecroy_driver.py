@@ -44,6 +44,10 @@ class LeCroyScope:
             self.instr.write("CHDR OFF")
             self.instr.write("CFMT DEF9,WORD,BIN")
 
+            # THE FIX: Force the scope to send all points (NP=0) 
+            # with zero sparsing (SP=0) starting at index 0 (FP=0)
+            self.instr.write("WFSU SP,0,NP,0,FP,0,SN,0")
+
     def disconnect(self):
         # 1. Flush the writer queue safely (wait for all pending disk writes to finish)
         self.write_queue.put(None)

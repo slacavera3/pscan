@@ -37,11 +37,29 @@ class IXonCamera:
         self.is_initialized = True
         print("iXon initialized successfully.")
 
-    def setup(self, exposure=0.1, em_gain=1, shutter_open=True):
+    def setup(self, exposure=0.1, em_gain=1, shutter_open=True, target_temp=None):
         if not self.is_initialized:
             return
 
-        print(f"Configuring iXon: Exp={exposure}s, EM={em_gain}")
+        # Handle TEC Cooling if specified in the confile
+        if target_temp is not None:
+            print(f"\nConfiguring iXon TEC Cooling to {target_temp}°C...")
+            self.cam.SetTemperature(target_temp)
+            self.cam.CoolerON()
+            
+            print("Waiting for temperature to stabilize (this may take a few minutes)...")
+            while True:
+                ret, current_temp = self.cam.GetTemperature()
+                
+                # In the Andor SDK, 20036 is the standard DRV_TEMP_STABILIZED code
+                if ret == 20036 or ret == getattr(self.errors.Error_Codes, 'DRV_TEMP_STABILIZED', -1):
+                    print(f" -> iXon temperature stabilized at {current_temp}°C.")
+                    break
+                
+                print(f" -> Cooling... Current temp: {current_temp}°C (Target: {target_temp}°C)")
+                time.sleep(3.0)
+
+        print(f"\nConfiguring iXon: Exp={exposure}s, EM={em_gain}")
         self.cam.SetAcquisitionMode(self.codes.Acquisition_Mode.SINGLE_SCAN)
         self.cam.SetReadMode(self.codes.Read_Mode.IMAGE)
         self.cam.SetTriggerMode(self.codes.Trigger_Mode.INTERNAL)
@@ -51,7 +69,6 @@ class IXonCamera:
         self.cam.SetShutter(1, shutter_mode, 50, 50)
         
         self.cam.SetExposureTime(exposure)
-        #self.cam.SetKineticCycleTime(kinetic_cycle) ]# redundant with the stage settle time in main.py
         self.cam.SetOutputAmplifier(0) 
         self.cam.SetEMCCDGain(em_gain)
         
@@ -67,13 +84,10 @@ class IXonCamera:
             return None
 
         self.cam.StartAcquisition()
-        
-        # Replace the manual polling loop with the native C-level wait
         self.cam.WaitForAcquisition()
 
         ret, arr = self.cam.GetOldestImage16(self.image_size)
         if ret == self.errors.Error_Codes.DRV_SUCCESS:
-            # Ensure we return a strict uint16 array for the memoryview writer
             return np.array(arr, dtype=np.uint16).reshape((self.height, self.width))
         else:
             print(f"[ERROR] iXon retrieval failed with code: {ret}")
@@ -83,5 +97,6 @@ class IXonCamera:
         if self.is_initialized:
             print("Closing iXon shutter and shutting down...")
             self.cam.SetShutter(1, 2, 50, 50) # Force close
+            self.cam.CoolerOFF() # Safely turn off TEC cooler
             self.cam.ShutDown()
             self.is_initialized = False

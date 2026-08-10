@@ -54,7 +54,7 @@ def parse_flat_con_file(filepath):
 
 def categorize_pipeline(all_blocks):
     # Added 'ixon' and 'tucsen' to the list of core acquisition types
-    core_types = ['apt_stage', 'count', 'scope', 'a2d', 'webcam', 'delay', 'ixon', 'tucsen']
+    core_types = ['apt_stage', 'd2a_phidget', 'count', 'scope', 'a2d', 'webcam', 'delay', 'ixon', 'tucsen']
     core_indices = [
         i for i, b in enumerate(all_blocks) if b['type'] in core_types
     ]
@@ -66,8 +66,8 @@ def categorize_pipeline(all_blocks):
     count_val = 1
     
     for i, block in enumerate(all_blocks):
-        if block['type'] == 'apt_stage':
-            stages.append(block['body'])
+        if block['type'] in ['apt_stage', 'd2a_phidget']:
+            stages.append(block)
             continue
         if block['type'] == 'count':
             m = re.search(r'count\s+(\d+)', block['body'])
@@ -140,11 +140,13 @@ def compile_pipeline_list(raw_pipeline, a2d_counter):
             gain_m = re.search(r'gain\s+(\d+)', body)
             cyc_m = re.search(r'kinetic_cycle\s+([\d\.]+)', body)
             shut_m = re.search(r'shutter_open\s+(\w+)', body)
+            temp_m = re.search(r'temperature\s+([\-\d\.]+)', body) # include negative sign if sub-zero
 
             p['exposure'] = float(exp_m.group(1)) if exp_m else 0.1
             p['em_gain'] = int(gain_m.group(1)) if gain_m else 1
             #p['kinetic_cycle'] = float(cyc_m.group(1)) if cyc_m else 0.5
             p['shutter_open'] = shut_m.group(1).lower() == 'true' if shut_m else True
+            p['temperature'] = int(temp_m.group(1)) if temp_m else None
 
         elif t == 'tucsen':
             exp_m = re.search(r'exposure\s+([\d\.]+)', body)
@@ -160,24 +162,54 @@ def compile_pipeline_list(raw_pipeline, a2d_counter):
         compiled.append({'type': t, 'params': p})
     return compiled
 
-def compile_stage_parameters(stage_strings):
+def compile_stage_parameters(stages):
     stage_params = {}
-    for body in stage_strings:
-        axis_match = re.search(r'axis\s+(\d+)', body)
-        scan_match = re.search(
-            r'scan\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)', body
-        )
+    for block in stages:
+        body = block['body']
         
-        if axis_match and scan_match:
-            ax = int(axis_match.group(1))
-            start = float(scan_match.group(1))
-            stop = float(scan_match.group(2))
-            step = float(scan_match.group(3))
+        if block['type'] == 'apt_stage':
+            axis_match = re.search(r'axis\s+(\d+)', body)
+            scan_match = re.search(
+                r'scan\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)', body
+            )
             
-            stage_params[ax] = {
-                'positions': generate_positions(start, stop, step),
-                'restore': 'restore' in body,
-                'save': 'save' in body,
-                'start_pos': start
-            }
+            if axis_match and scan_match:
+                ax = int(axis_match.group(1))
+                start = float(scan_match.group(1))
+                stop = float(scan_match.group(2))
+                step = float(scan_match.group(3))
+                
+                stage_params[ax] = {
+                    'type': 'apt_stage', # Tagged for main.py routing
+                    'positions': generate_positions(start, stop, step),
+                    'restore': 'restore' in body,
+                    'save': 'save' in body,
+                    'start_pos': start
+                }
+                
+        elif block['type'] == 'd2a_phidget':
+            scan_match = re.search(
+                r'scan\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)', body
+            )
+            pos_match = re.search(r'position\s+([\d\.\-]+)', body)
+            
+            if scan_match:
+                start = float(scan_match.group(1))
+                stop = float(scan_match.group(2))
+                step = float(scan_match.group(3))
+                
+                # Using 99 as a virtual axis ID for the piezo
+                stage_params[99] = {
+                    'type': 'piezo', # Tagged for main.py routing
+                    'positions': generate_positions(start, stop, step),
+                    'start_pos': start
+                }
+            elif pos_match:
+                target = float(pos_match.group(1))
+                stage_params[99] = {
+                    'type': 'piezo',
+                    'positions': [target],
+                    'start_pos': target
+                }
+                
     return stage_params

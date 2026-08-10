@@ -9,6 +9,7 @@ from pscan.tucsen_driver import TucsenCamera
 import numpy as np
 import queue
 import threading
+from pscan.d2aphidget_driver import D2APhidgetDriver
 
 # Create a thread-safe, capped memory queue. 
 # maxsize=50 safely caps volatile RAM usage at ~400 MB.
@@ -119,6 +120,7 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, tucsen, base_filename,
                     em_gain=p['em_gain'],
                     #kinetic_cycle=p['kinetic_cycle'],# removing bc redundant with stage settle time
                     shutter_open=p['shutter_open']
+                    target_temp=p['temperature']
                 )
                 call_state['ixon_configured'] = True
 
@@ -193,11 +195,14 @@ def main():
     acquisition_pipeline = compile_pipeline_list(r_acq, a2d_global_counter)
     teardown_pipeline = compile_pipeline_list(r_tear, a2d_global_counter)
     
+    # Extract positions, defaulting to a single 'None' step if not in the config
     axis_0_pos = stage_params.get(0, {}).get('positions', [None]) 
     axis_1_pos = stage_params.get(1, {}).get('positions', [None]) 
+    axis_99_pos = stage_params.get(99, {}).get('positions', [None]) # Added Piezo axis
     
     total_a2d_blocks = sum(1 for act in acquisition_pipeline if act['type'] == 'a2d')
-    global_total_traces = len(axis_0_pos) * len(axis_1_pos) * count_val
+    # Updated total traces to include the Z-axis multiplier
+    global_total_traces = len(axis_0_pos) * len(axis_1_pos) * len(axis_99_pos) * count_val
     
     scope_ip = next((act['params']['ip'] for act in acquisition_pipeline if act['type'] == 'scope'), None)
     ixon_in_pipeline = any(act['type'] == 'ixon' for act in acquisition_pipeline + setup_pipeline + teardown_pipeline)
@@ -230,9 +235,12 @@ def main():
     if name_was_changed:
         shutil.copy(con_filepath, f"{base_filename}.con")
 
+    # Hardware Initializations
     scope = LeCroyScope(scope_ip) if scope_ip else None
     ni_daq = NIDriver() if total_a2d_blocks > 0 else None
-    stage = ThorlabsStage() if stage_params else None
+    stage = ThorlabsStage() if (0 in stage_params or 1 in stage_params) else None
+    piezo = D2APhidgetDriver() if 99 in stage_params else None # Added Piezo driver
+    
     ixon = None
     tucsen_in_pipeline = any(act['type'] == 'tucsen' for act in acquisition_pipeline + setup_pipeline + teardown_pipeline)
     tucsen = None
@@ -254,7 +262,7 @@ def main():
         ixon = IXonCamera()
         ixon.connect()
 
-    print(f"\nGrid: {len(axis_0_pos)} X steps x {len(axis_1_pos)} Y steps.")
+    print(f"\nGrid: {len(axis_0_pos)} X steps x {len(axis_1_pos)} Y steps x {len(axis_99_pos)} Z steps.")
     print(f"Total Traces Target: {global_total_traces}")
     
     call_state = {'current_trace_idx': 0, 'ixon_configured': False}
@@ -277,52 +285,57 @@ def main():
                 
         master_trace_idx = 0
         
+        # Modified Loop Hierarchy: X -> Y -> Z -> Count
         for x_val in axis_0_pos:
-            if x_val is not None and stage_params.get(0):
+            if x_val is not None and stage_params.get(0, {}).get('type') == 'apt_stage':
                 stage.move_absolute('x', x_val, counts_per_mm)
                 
             for y_val in axis_1_pos:
-                if y_val is not None and stage_params.get(1):
+                if y_val is not None and stage_params.get(1, {}).get('type') == 'apt_stage':
                     stage.move_absolute('y', y_val, counts_per_mm)
                     
-                if x_val is not None or y_val is not None:
-                    # Dynamically pull settle_time from the confile, default to 0.2s
-                    user_settle = stage_params.get(0, {}).get('settle_time', 0.2)
-                    settle_time = 1.5 if master_trace_idx == 0 else 0.2
-                    time.sleep(settle_time)
-                    
-                for c_val in range(count_val):
-                    if timer_mode:
-                        t_trace_start = time.perf_counter()
-                    
-                    call_state['current_trace_idx'] = master_trace_idx
-                    current_num = master_trace_idx + 1
-                    
-                    x_str = f"{x_val:7.4f} mm" if x_val is not None else "Static"
-                    y_str = f"{y_val:7.4f} mm" if y_val is not None else "Static"
-                    
-                    print(
-                        f" -> Position: X = {x_str}, Y = {y_str} "
-                        f"| Trace {current_num}/{global_total_traces}..."
-                    )
-                    
-                    run_pipeline_sequence(
-                        acquisition_pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
-                        total_a2d_blocks, global_total_traces, call_state, 
-                        silent_acq=True, timer_mode=timer_mode
-                    )
-                    
-                    if timer_mode:
-                        t_trace_end = time.perf_counter()
-                        print(f"      [Timer] Total trace time: {t_trace_end - t_trace_start:.4f}s\n")
-                    
-                    master_trace_idx += 1
+                for z_val in axis_99_pos:
+                    if z_val is not None and piezo:
+                        piezo.set_position_um(z_val)
+                        
+                    # Settle time logic moved to the innermost spatial loop
+                    if x_val is not None or y_val is not None or z_val is not None:
+                        settle_time = 1.5 if master_trace_idx == 0 else 0.2
+                        time.sleep(settle_time)
+                        
+                    for c_val in range(count_val):
+                        if timer_mode:
+                            t_trace_start = time.perf_counter()
+                        
+                        call_state['current_trace_idx'] = master_trace_idx
+                        current_num = master_trace_idx + 1
+                        
+                        x_str = f"{x_val:7.4f} mm" if x_val is not None else "Static"
+                        y_str = f"{y_val:7.4f} mm" if y_val is not None else "Static"
+                        z_str = f"{z_val:7.2f} um" if z_val is not None else "Static"
+                        
+                        print(
+                            f" -> Pos: X={x_str}, Y={y_str}, Z={z_str} "
+                            f"| Trace {current_num}/{global_total_traces}..."
+                        )
+                        
+                        run_pipeline_sequence(
+                            acquisition_pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
+                            total_a2d_blocks, global_total_traces, call_state, 
+                            silent_acq=True, timer_mode=timer_mode
+                        )
+                        
+                        if timer_mode:
+                            t_trace_end = time.perf_counter()
+                            print(f"      [Timer] Total trace time: {t_trace_end - t_trace_start:.4f}s\n")
+                        
+                        master_trace_idx += 1
                 
-            if 1 in stage_params and stage_params[1]['restore']:
+            if 1 in stage_params and stage_params[1].get('restore'):
                 y_start = stage_params[1]['start_pos']
                 stage.move_absolute('y', y_start, counts_per_mm)
 
-        if 0 in stage_params and stage_params[0]['restore']:
+        if 0 in stage_params and stage_params[0].get('restore'):
             x_start = stage_params[0]['start_pos']
             stage.move_absolute('x', x_start, counts_per_mm)
 
@@ -343,15 +356,13 @@ def main():
         print("\nExecuting Hardware Disconnects & Saving Files...")
         if scope: scope.disconnect()
         if stage: stage.disconnect()
+        if piezo: piezo.close() # Safely close the piezo connection
         if ixon: ixon.shutdown()
         if tucsen: tucsen.shutdown()
         if total_a2d_blocks > 0: ni_daq.disconnect()
 
         print("Waiting for background disk writes to finish...")
-        write_queue.put(None) # Send the poison pill
-        writer_thread.join() # Block exit until the queue is completely flushed
+        write_queue.put(None) 
+        writer_thread.join() 
         
         print("Sequence Complete!")
-
-if __name__ == "__main__":
-    main()

@@ -176,6 +176,7 @@ action ixon
 exposure 0.1
 em_gain 72
 shutter_open True
+temperature -80
 end
 
 ### Disclaimer & License

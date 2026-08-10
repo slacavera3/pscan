@@ -7,7 +7,45 @@ echo "======================================================="
 # --- 1. Install System Dependencies ---
 echo -e "\n[1/6] Checking OS-level C-drivers (Comedi)..."
 sudo apt update
-sudo apt install -y libcomedi0 libcomedi-dev
+sudo apt install -y curl libcomedi0 libcomedi-dev
+
+# --- 1.5 Setup Phidgets OS Drivers (Legacy C Library) ---
+echo -e "\n[1.5/6] Setting up Phidget21 C Library from local tarball..."
+
+echo " -> Checking for existing libphidget21 installation..."
+# Safely check the file paths directly rather than relying on ldconfig in the user PATH
+if [ -f "/usr/local/lib/libphidget21.so" ] || [ -f "/usr/lib/libphidget21.so" ]; then
+    echo " -> libphidget21.so is already installed. Skipping compilation."
+else
+    echo " -> libphidget21.so not found. Beginning extraction and compilation..."
+    TAR_PATH="./libs/libphidget_2.1.9.20190409.tar.gz"
+
+    if [ -f "$TAR_PATH" ]; then
+        echo " -> Extracting $TAR_PATH..."
+        tar -zxf "$TAR_PATH" -C ./libs/
+        
+        # Navigate into the extracted directory
+        cd ./libs/libphidget-2.1.9.20190409 || { echo " -> [ERROR] Failed to navigate into extracted Phidget directory."; exit 1; }
+        
+        echo " -> Configuring and compiling (with JNI disabled)..."
+        ./configure --disable-jni
+        make
+        
+        echo " -> Installing to system and updating dynamic linker bindings..."
+        sudo make install
+        # Force the absolute path to ldconfig so it correctly links the new library
+        sudo /sbin/ldconfig 
+        
+        # Clean up the extracted source folder to keep the repo tidy
+        cd ../../
+        rm -rf ./libs/libphidget-2.1.9.20190409
+        echo " -> libphidget21.so installed successfully."
+    else
+        echo " -> [ERROR] Tarball not found at $TAR_PATH!"
+        echo " -> Please ensure libphidget_2.1.9.20190409.tar.gz is placed in the ./libs/ directory."
+        exit 1
+    fi
+fi
 
 # --- 2. Setup Tucsen SDK Drivers ---
 echo -e "\n[2/6] Setting up Tucsen Dhyana SDK..."
@@ -62,5 +100,5 @@ echo -e "\n[6/6] Compiling and installing pscan..."
 sudo pip install --force-reinstall --no-deps --no-cache-dir . $FLAG
 
 echo -e "\n======================================================="
-echo " DONE! You can now run 'pscan' or 'pystage' from anywhere."
+echo " DONE! You can now run 'pscan' | 'pystage' | 'pypiezo' from anywhere."
 echo "======================================================="

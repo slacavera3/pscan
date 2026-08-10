@@ -18,6 +18,7 @@ setup(
         'numpy>=1.19',
         'python-vxi11>=0.9',
         'standard-xdrlib'
+        # Phidget22 removed: using ctypes + libphidget21.so instead
     ],
     entry_points={
         'console_scripts': [
@@ -25,6 +26,8 @@ setup(
             'pscan=pscan.main:main',
             # Links the terminal command 'pystage' to main() in control_stages.py
             'pystage=pscan.control_stages:main',
+            # Links the terminal command 'pypiezo' to main() in control_piezo.py
+            'pypiezo=pscan.control_piezo:main',
         ],
     },
 )
