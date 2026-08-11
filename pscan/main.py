@@ -119,7 +119,7 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, tucsen, base_filename,
                     exposure=p['exposure'],
                     em_gain=p['em_gain'],
                     #kinetic_cycle=p['kinetic_cycle'],# removing bc redundant with stage settle time
-                    shutter_open=p['shutter_open']
+                    shutter_open=p['shutter_open'],
                     target_temp=p['temperature']
                 )
                 call_state['ixon_configured'] = True
