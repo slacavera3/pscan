@@ -13,6 +13,23 @@ TRIG_NOW   = 0x0002
 TRIG_TIMER = 0x0010
 TRIG_COUNT = 0x0020
 
+# Used only when the card cannot report its own calibration. These were the
+# hardcoded values the conversion used unconditionally, which is wrong for
+# any card whose resolution or range list differs - a 12-bit card packing
+# samples into 16 bits read 16x low.
+FALLBACK_MAXDATA = 65535
+FALLBACK_RANGES = {0: 10.0, 1: 5.0, 2: 1.0, 3: 0.2}
+
+
+class comedi_range(ctypes.Structure):
+    """What comedi_get_range() points at."""
+    _fields_ = [
+        ("min", ctypes.c_double),
+        ("max", ctypes.c_double),
+        ("unit", ctypes.c_uint),
+    ]
+
+
 class comedi_cmd_struct(ctypes.Structure):
     _fields_ = [
         ("subdev", ctypes.c_uint), ("flags", ctypes.c_uint),
@@ -30,9 +47,10 @@ class NIDriver:
         lib_path = ctypes.util.find_library('comedi') or '/usr/lib/x86_64-linux-gnu/libcomedi.so.0'
         try:
             self.libcomedi = ctypes.CDLL(lib_path)
-        except OSError:
-            print("Error: Could not load libcomedi.")
-            sys.exit(1)
+        except OSError as e:
+            # Raise rather than sys.exit, so main()'s teardown still runs for
+            # anything already connected.
+            raise RuntimeError("Could not load libcomedi.") from e
 
         self.libcomedi.comedi_open.argtypes = [ctypes.c_char_p]
         self.libcomedi.comedi_open.restype = ctypes.c_void_p
@@ -48,10 +66,22 @@ class NIDriver:
         self.libcomedi.comedi_poll.argtypes = [ctypes.c_void_p, ctypes.c_uint]
         self.libcomedi.comedi_poll.restype = ctypes.c_int
 
+        # Calibration queries, so the volts conversion comes from the card
+        # rather than from constants in this file.
+        self.libcomedi.comedi_get_maxdata.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint
+        ]
+        self.libcomedi.comedi_get_maxdata.restype = ctypes.c_uint
+        self.libcomedi.comedi_get_range.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint
+        ]
+        self.libcomedi.comedi_get_range.restype = ctypes.POINTER(comedi_range)
+
         self.device_node = device_node
         self.dev_ptr = None
         self.fd = None
-        
+        self._warned = set()
+
         # Async Writer Thread Setup
         self.write_queue = queue.Queue()
         self.writer_thread = threading.Thread(target=self._async_writer, daemon=True)
@@ -97,6 +127,79 @@ class NIDriver:
             self.libcomedi.comedi_close(self.dev_ptr)
             self.dev_ptr = None
             self.fd = None
+
+    def _warn_once(self, key, message):
+        """Print a calibration warning once rather than once per trace."""
+        if key not in self._warned:
+            self._warned.add(key)
+            print(f"\n[WARNING] A2D: {message}")
+
+    def _calibration(self, subdevice, channel, range_val):
+        """Ask the card for its full-scale count and the range's voltages.
+
+        Returns (maxdata, v_min, v_max). Falls back to the old hardcoded
+        constants, with a warning, if either query is unavailable - so a card
+        that does not support them still works exactly as before.
+        """
+        maxdata = None
+        try:
+            value = self.libcomedi.comedi_get_maxdata(
+                self.dev_ptr, subdevice, channel
+            )
+            if value > 0:
+                maxdata = float(value)
+        except Exception:
+            pass
+
+        v_min = v_max = None
+        try:
+            rng = self.libcomedi.comedi_get_range(
+                self.dev_ptr, subdevice, channel, range_val
+            )
+            if rng:
+                v_min, v_max = float(rng.contents.min), float(rng.contents.max)
+        except Exception:
+            pass
+
+        if maxdata is None:
+            maxdata = float(FALLBACK_MAXDATA)
+            self._warn_once(
+                'maxdata',
+                f"could not read maxdata from the card; assuming "
+                f"{FALLBACK_MAXDATA} counts at full scale. Voltages will be "
+                f"wrong if this card is not 16-bit."
+            )
+
+        if v_min is None or v_max is None or v_max <= v_min:
+            v_max = FALLBACK_RANGES.get(range_val, 10.0)
+            v_min = -v_max
+            self._warn_once(
+                'range',
+                f"could not read range {range_val} from the card; assuming "
+                f"{v_min:g}..{v_max:g} V."
+            )
+
+        return maxdata, v_min, v_max
+
+    def _to_volts(self, raw_array, maxdata, v_min, v_max):
+        """comedi_to_phys()'s conversion, vectorised over a whole trace.
+
+        Interpolating between the range's own min and max also gets unipolar
+        ranges right; the old code assumed every range was symmetric about
+        zero.
+        """
+        return v_min + (raw_array / maxdata) * (v_max - v_min)
+
+    def write_placeholder_trace(self, output_filename, n_samples):
+        """Append a NaN-filled block so a failed trace does not shift the file.
+
+        Skipping a failed acquisition would leave the .d file one block short
+        and misalign every later trace against its coordinate. NaN is used
+        rather than zero so a padded block is obvious in MATLAB.
+        """
+        blank = np.full(n_samples, np.nan, dtype=np.float32)
+        self.write_queue.put((output_filename, "ab", blank.tobytes()))
+        return True
 
     def acquire_a2d(self, channel, range_val, n_samples, sample_rate, output_filename, is_first_trace=True):
         if not self.dev_ptr:
@@ -167,11 +270,12 @@ class NIDriver:
         if len(raw_bytes) < bytes_to_read:
             return False
 
-        # Math Vectorization
+        # Math Vectorization, using the card's own calibration. This is
+        # comedi_to_phys()'s conversion, which also gets unipolar ranges
+        # right - the old symmetric +/-v_max assumption did not.
+        maxdata, v_min, v_max = self._calibration(subdevice, channel, range_val)
         raw_array = np.frombuffer(raw_bytes, dtype=np.uint16)
-        ni_ranges = {0: 10.0, 1: 5.0, 2: 1.0, 3: 0.2}
-        v_max = ni_ranges.get(range_val, 10.0)
-        float_array = ((raw_array / 65535.0) * (2.0 * v_max)) - v_max
+        float_array = self._to_volts(raw_array, maxdata, v_min, v_max)
         packed_data = float_array.astype(np.float32).tobytes()
 
         # Hand off disk I/O to the background thread instantly

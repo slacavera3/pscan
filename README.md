@@ -104,11 +104,38 @@ Controls: Use Arrow Keys to jog, 'J' to adjust step size (mm), '1' or '2' to tog
 To run a fully automated acquisition grid, pass your configuration .con file to the orchestrator:
    pscan path/to/your_config.con
 
+Flags:
+   --dry-run   Validate the config and print exactly what would happen - when
+               each action runs, the full coordinate grid, the total trace
+               count and every output file (flagging any that already exist) -
+               then exit WITHOUT opening any hardware. Run this before any
+               long scan.
+   --timer     Print per-module and per-trace timings during the run.
+
+### WHEN EACH ACTION RUNS (read this before writing a .con file)
+
+Blocks are split into three pipelines, and the split is positional, not
+declared. A block runs:
+
+   * at SETUP (once, before anything moves)  if NO core block precedes it
+   * at TEARDOWN (once, after the scan)      if NO core block follows it
+   * PER COORDINATE (once per grid point)    otherwise
+
+Core blocks are: apt_stage, d2a_phidget, count, scope, a2d, webcam, delay,
+ixon, tucsen. In practice only 'action script' is ever non-core, so whether
+your script runs once or thousands of times depends on where it sits
+relative to the core blocks around it.
+
+This catches people out, so check it with `pscan --dry-run`, which prints the
+three pipelines explicitly. Note that in the template below the script block
+sits between 'a2d'/'scope' and 'ixon', so it runs at EVERY coordinate. To run
+a script once at startup, put it above every core block.
+
 ### Configuration File (.con) Template
 
-The orchestrator reads flat .con files. Below is a comprehensive template showing every possible unnested action block. 
+The orchestrator reads flat .con files. Below is a comprehensive template showing every possible unnested action block. Unknown action types, unknown keys, out-of-range axes and missing required lines are all rejected before any hardware opens, so a typo fails loudly instead of silently falling back to a default.
 
-CRITICAL NOTE FOR LECROY SCOPES: The 'action scope' block must explicitly declare 'segments' (or 'sweeps' / 'averages') so the driver knows exactly how many trigger pulses to wait for before timing out.
+CRITICAL NOTE FOR LECROY SCOPES: The 'action scope' block should declare 'sweeps' so the driver knows exactly how many trigger pulses to wait for before timing out. 'segments' and 'averages' are accepted as aliases, but prefer 'sweeps' - until recently only 'sweeps' was actually parsed, so older config files written with 'segments' were silently falling back to whatever the scope was already set to.
 
 ## ==========================================
 ## pscan Configuration Template
@@ -121,10 +148,15 @@ count 1
 end
 
 ## 2. X-AXIS HARDWARE 
-## scan: <start_mm> <stop_mm> <step_mm>
+## scan: <start_mm> <stop_mm> <step_mm>   (axis must be 0 for X or 1 for Y)
+## 'limits <min_mm> <max_mm>' is optional but strongly recommended: every
+## generated position is checked against it before the stage is even opened,
+## so a mistyped coordinate is caught instead of driven into. Omitting it
+## only warns.
 action apt_stage
 axis 0
 scan 53.555 53.565 0.005
+limits 50.000 57.000
 end
 
 ## 3. Y-AXIS HARDWARE
@@ -132,6 +164,7 @@ end
 action apt_stage
 axis 1
 scan 37.000 37.010 0.005
+limits 35.000 40.000
 restore
 end
 
@@ -155,11 +188,16 @@ end
 
 ## 7. LECROY OSCILLOSCOPE ACQUISITION
 ## 'sweeps' sets the maths averaging (optional) (accepts multiple values for multi-ch)
-## if no 'sweeps' line confile then default to hardware
+## if no 'sweeps' line in the confile then default to hardware
+## Channels are Waverunner trace names: C1-style inputs, F1-style maths,
+## M1-style memories, Z1-style zooms, or TA..TD.
+## Do not mix maths (F*) with raw (C*) channels while Sequence mode is on: an
+## average collapses every segment into one, so the channel shapes disagree
+## and the trace is refused. Use separate scope blocks instead.
 action scope
 ip 192.168.1.100
 channels F1, F2
-segments 1000, 100
+sweeps 1000, 100
 end
 
 ## 8. EXTERNAL SYSTEM SCRIPT
@@ -172,6 +210,15 @@ end
 ## The camera block executes at every coordinate.
 ## If shutter_open is True, the shutter stays open for the entire run.
 ## NOT TTL DRIVEN YET, WILL BE MUCH FASTER
+##
+## Camera setup (including the TEC cooldown, which can take minutes) happens
+## BEFORE the stage moves, so the sample is not parked at the first
+## coordinate while the sensor cools.
+##
+## Frames are written one raw .bin file per trace, which carries no header.
+## The geometry needed to reload them goes into <base>_ixon.m (or
+## <base>_tucsen.m) at the end of the run: height, width, dtype,
+## bytes_per_pixel and the number of frames actually captured.
 action ixon
 exposure 0.1
 em_gain 72

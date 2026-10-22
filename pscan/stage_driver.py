@@ -5,6 +5,19 @@ import time
 import os
 import sys
 
+# Inbound APT message IDs.
+MSG_GET_POSCOUNTER = 0x0412
+MSG_MOVE_COMPLETED = 0x0464
+MSG_MOVE_STOPPED   = 0x0466
+
+# Outbound.
+MSG_MOVE_STOP = 0x0465
+
+# Param2 of MOVE_STOP selects the stop mode.
+STOP_IMMEDIATE = 0x01
+STOP_PROFILED  = 0x02
+
+
 class ThorlabsStage:
     DEST_MOTHERBOARD = 0x50
     DEST_CH1 = 0x21  # X-Axis
@@ -29,7 +42,9 @@ class ThorlabsStage:
             
         print(f"Connecting to Thorlabs Stage on {self.port}...")
         try:
-            self.ser = serial.Serial(self.port, 115200, timeout=1)
+            # Short read timeout: position polling during a move wants to come
+            # back promptly rather than block for a second on a quiet port.
+            self.ser = serial.Serial(self.port, 115200, timeout=0.05)
             self.ser.dtr = True
             self.ser.rts = True
             time.sleep(0.1)
@@ -44,8 +59,10 @@ class ThorlabsStage:
             time.sleep(0.5)
             print("Thorlabs stage controller initialized successfully.")
         except Exception as e:
-            print(f"Error binding to Thorlabs Stage: {e}")
-            sys.exit(1)
+            # Raise rather than sys.exit: exiting here skipped main()'s
+            # teardown entirely, so anything already connected - a streaming
+            # camera, an open iXon shutter - was left as it was.
+            raise RuntimeError(f"Error binding to Thorlabs Stage: {e}") from e
 
     def disconnect(self):
         if self.ser and self.ser.is_open:
@@ -84,29 +101,135 @@ class ThorlabsStage:
         # CRITICAL: Execute ping!
         self.ser.write(struct.pack('<HBBBB', 0x0448, 0x01, 0x00, dest, self.SOURCE_PC))
 
-    def get_position(self, axis, counts_per_mm):
+    def _read_exactly(self, n, timeout_s):
+        """Read exactly n bytes, or return None if they do not arrive in time."""
+        deadline = time.monotonic() + timeout_s
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.ser.read(n - len(buf))
+            if chunk:
+                buf.extend(chunk)
+            elif time.monotonic() >= deadline:
+                return None
+        return bytes(buf)
+
+    def _read_packet(self, timeout_s=0.5):
+        """Read one framed APT packet as (msg_id, payload), or None on timeout.
+
+        APT headers are always 6 bytes. If bit 7 of the destination byte is
+        set, the header is the long form and bytes 2-3 hold the length of the
+        data that follows; otherwise the packet is header-only. Framing
+        properly matters because the controller emits MOVE_COMPLETED (20
+        bytes) unsolicited, and a fixed-size 12-byte read would slice straight
+        through it and silently fail to parse the position reply.
+        """
+        header = self._read_exactly(6, timeout_s)
+        if header is None:
+            return None
+
+        msg_id = struct.unpack_from('<H', header, 0)[0]
+        payload = b''
+        if header[4] & 0x80:
+            length = struct.unpack_from('<H', header, 2)[0]
+            if length:
+                payload = self._read_exactly(length, timeout_s)
+                if payload is None:
+                    return None
+        return msg_id, payload
+
+    def get_position(self, axis, counts_per_mm, timeout_s=0.5):
         dest = self._get_dest_channel(axis)
         self.ser.reset_input_buffer()
         self.ser.write(struct.pack('<HBBBB', 0x0411, 0x01, 0x00, dest, self.SOURCE_PC))
-        
-        timeout = time.time() + 0.5
-        while time.time() < timeout:
-            if self.ser.in_waiting >= 12:
-                data = self.ser.read(12)
-                if data[0:2] == b'\x12\x04':
-                    _, _, _, _, _, _, pos = struct.unpack('<HBBBBHl', data)
-                    return pos / counts_per_mm
-        return None
 
-    def wait_to_settle(self, axis, target_mm, counts_per_mm, tolerance_mm=0.001, timeout_sec=2.0):
-        start = time.time()
-        while time.time() - start < timeout_sec:
-            current_pos = self.get_position(axis, counts_per_mm)
-            if current_pos is not None:
-                error = abs(current_pos - target_mm)
-                if error <= tolerance_mm:
-                    time.sleep(0.02)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+
+            packet = self._read_packet(timeout_s=remaining)
+            if packet is None:
+                return None
+
+            msg_id, payload = packet
+            # An unsolicited MOVE_COMPLETED can land ahead of our reply, so
+            # keep reading until the packet we asked for shows up.
+            if msg_id == MSG_GET_POSCOUNTER and len(payload) >= 6:
+                _, counts = struct.unpack_from('<Hl', payload, 0)
+                return counts / counts_per_mm
+
+    def stop(self, axis, profiled=True, timeout_s=2.0):
+        """Halt a move in progress and wait for the controller to confirm.
+
+        A profiled stop decelerates through the configured ramp instead of
+        cutting drive dead, which is kinder to a lead screw carrying a
+        sample. Returns True only if MOVE_STOPPED came back.
+        """
+        if self.ser is None or not self.ser.is_open:
+            return False
+
+        dest = self._get_dest_channel(axis)
+        stop_mode = STOP_PROFILED if profiled else STOP_IMMEDIATE
+        self.ser.write(struct.pack(
+            '<HBBBB', MSG_MOVE_STOP, 0x01, stop_mode, dest, self.SOURCE_PC
+        ))
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+
+            packet = self._read_packet(timeout_s=remaining)
+            if packet is None:
+                return False
+            if packet[0] == MSG_MOVE_STOPPED:
+                return True
+
+    def stop_all(self, profiled=True):
+        """Stop every axis, reporting but not raising on individual failures.
+
+        Called from main()'s teardown so an aborted run does not leave the
+        stage travelling to its target with no software control. A second
+        Ctrl+C still gets through, since KeyboardInterrupt is not an
+        Exception.
+        """
+        for axis in ('x', 'y'):
+            try:
+                if not self.stop(axis, profiled=profiled):
+                    print(f"[WARNING] Stage {axis.upper()} did not confirm the stop.")
+            except Exception as e:
+                print(f"[WARNING] Could not stop stage {axis.upper()}: {e}")
+
+    def wait_for_move(self, axis, target_mm, counts_per_mm,
+                      tolerance_mm=0.001, timeout_s=15.0, dwell_s=0.02):
+        """Block until axis reaches target_mm, then dwell for mechanical ringdown.
+
+        The encoder is the authority here rather than MOVE_COMPLETED, so this
+        works on controllers that do not emit an end-of-move message. The
+        timeout only costs time when a move genuinely fails to arrive, so it
+        can be generous enough to cover the longest move in a scan - typically
+        the fast axis travelling back to the start of the next row.
+
+        Returns False on timeout, leaving the stage wherever it actually is.
+        """
+        deadline = time.monotonic() + timeout_s
+        last_pos = None
+
+        while time.monotonic() < deadline:
+            pos = self.get_position(axis, counts_per_mm)
+            if pos is not None:
+                last_pos = pos
+                if abs(pos - target_mm) <= tolerance_mm:
+                    time.sleep(dwell_s)
                     return True
-            time.sleep(0.005)
-        print(f"[WARNING] Stage {axis.upper()} timed out before fully settling!")
+            time.sleep(0.002)
+
+        seen = f"{last_pos:.5f} mm" if last_pos is not None else "no reply"
+        print(
+            f"\n[WARNING] Stage {str(axis).upper()} did not reach "
+            f"{target_mm:.5f} mm within {timeout_s:.1f}s (last read: {seen}). "
+            f"This point may have been acquired off-position."
+        )
         return False

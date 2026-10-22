@@ -150,23 +150,46 @@ class TucsenCamera:
                 os.close(saved_out)
                 os.close(saved_err)
 
+    def _frame_to_array(self):
+        """Copy the current frame out of the SDK's buffer.
+
+        Honours ucElemBytes for the sample width and uiWidthStep for the row
+        stride. The previous version always read uint16 from tightly packed
+        rows, so 'bit_depth 8' in the config produced garbage, and any row
+        padding the SDK added would have been folded into the image.
+        """
+        height = self.frame.usHeight
+        width = self.frame.usWidth
+        elem = self.frame.ucElemBytes or 2
+        dtype = np.uint8 if elem == 1 else np.uint16
+
+        # uiWidthStep is the byte distance between row starts, which can
+        # exceed width * elem when rows are padded.
+        stride = self.frame.uiWidthStep or (width * elem)
+
+        raw = ctypes.cast(self.frame.pBuffer, ctypes.POINTER(ctypes.c_ubyte))
+        flat = np.ctypeslib.as_array(raw, shape=(height * stride,))
+
+        # Slice each row's real pixels out of its padded row, then copy: the
+        # result must not alias the SDK buffer, which is reused next frame.
+        rows = np.ascontiguousarray(flat.reshape(height, stride)[:, :width * elem])
+        return rows.view(dtype).copy()
+
     def acquire(self):
         if not self.is_initialized or not self.is_capturing:
             return None
 
         # FAST PATH: Just wait for the next frame from the already-running stream
         ret = self.tucam.TUCAM_Buf_WaitForFrame(self.h_cam, ctypes.byref(self.frame), 2000)
-        
+
         image_copy = None
         if ret == 1 and self.frame.pBuffer:
-            buffer_ptr = ctypes.cast(self.frame.pBuffer, ctypes.POINTER(ctypes.c_uint16))
-            image_array = np.ctypeslib.as_array(buffer_ptr, shape=(self.frame.usHeight, self.frame.usWidth))
-            image_copy = image_array.copy() 
+            image_copy = self._frame_to_array()
         else:
             print("[ERROR] Tucsen frame retrieval timed out.")
 
         # NO MORE STOPPING OR RELEASING HERE
-        
+
         return image_copy
 
     def shutdown(self):

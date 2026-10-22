@@ -28,6 +28,8 @@ setup(
             'pystage=pscan.control_stages:main',
             # Links the terminal command 'pypiezo' to main() in control_piezo.py
             'pypiezo=pscan.control_piezo:main',
+            # Links the terminal command 'flyscan' to main() in flyscan/cli.py
+            'flyscan=flyscan.cli:main',
         ],
     },
 )

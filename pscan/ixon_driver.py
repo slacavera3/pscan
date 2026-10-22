@@ -17,6 +17,21 @@ except ImportError:
     ANDOR_AVAILABLE = False
     print("[SYSTEM] pyAndorSDK2 not found. iXon driver disabled on this OS.")
 
+# Bounded TEC cooldown. This loop used to be unbounded, so an unreachable
+# target - a cooler that bottoms out above the requested temperature, or poor
+# airflow on a warm day - would spin here forever with the shutter open.
+COOLDOWN_TIMEOUT_S = 600.0
+COOLDOWN_POLL_S = 3.0
+
+# Give up early once the temperature stops falling: a plateau means the TEC is
+# already at its limit, so waiting out the full timeout achieves nothing. The
+# window is generous because the approach to target genuinely slows down near
+# the end, and mistaking that for a plateau would abandon cooling a degree or
+# two short. Widen it if a healthy cooldown ever trips the warning.
+COOLDOWN_PLATEAU_S = 180.0
+COOLDOWN_PLATEAU_DELTA_C = 0.5
+
+
 class IXonCamera:
     def __init__(self, dll_path=r"c:\Program Files\Micro-Manager-2.0gamma\Andor SDK\Python\pyAndorSDK2\pyAndorSDK2\libs\Windows\64"):
         if not ANDOR_AVAILABLE:
@@ -48,16 +63,47 @@ class IXonCamera:
             self.cam.CoolerON()
             
             print("Waiting for temperature to stabilize (this may take a few minutes)...")
-            while True:
+            deadline = time.monotonic() + COOLDOWN_TIMEOUT_S
+            stabilized = False
+            last_temp = None
+            best_temp = None
+            best_time = time.monotonic()
+
+            while time.monotonic() < deadline:
                 ret, current_temp = self.cam.GetTemperature()
-                
+                last_temp = current_temp
+
                 # In the Andor SDK, 20036 is the standard DRV_TEMP_STABILIZED code
                 if ret == 20036 or ret == getattr(self.errors.Error_Codes, 'DRV_TEMP_STABILIZED', -1):
                     print(f" -> iXon temperature stabilized at {current_temp}°C.")
+                    stabilized = True
                     break
-                
+
+                if current_temp is not None:
+                    now = time.monotonic()
+                    if best_temp is None or current_temp <= best_temp - COOLDOWN_PLATEAU_DELTA_C:
+                        best_temp = current_temp
+                        best_time = now
+                    elif now - best_time >= COOLDOWN_PLATEAU_S:
+                        print(
+                            f" -> Temperature has held near {current_temp}°C for "
+                            f"{COOLDOWN_PLATEAU_S:.0f}s without stabilizing; "
+                            f"the cooler looks to be at its limit."
+                        )
+                        break
+
                 print(f" -> Cooling... Current temp: {current_temp}°C (Target: {target_temp}°C)")
-                time.sleep(3.0)
+                time.sleep(COOLDOWN_POLL_S)
+
+            if not stabilized:
+                # A warm sensor is a data-quality problem, not a reason to lose
+                # the run, so carry on and say so loudly.
+                print(
+                    f"\n[WARNING] iXon did not stabilize at {target_temp}°C "
+                    f"(last read {last_temp}°C). Continuing anyway - dark "
+                    f"current will be higher than intended, so treat absolute "
+                    f"intensities with care."
+                )
 
         print(f"\nConfiguring iXon: Exp={exposure}s, EM={em_gain}")
         self.cam.SetAcquisitionMode(self.codes.Acquisition_Mode.SINGLE_SCAN)
