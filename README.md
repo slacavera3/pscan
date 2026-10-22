@@ -60,6 +60,16 @@ bash install-dev.sh
 This gives you four commands that shadow nothing:
   pscan-dev | pystage-dev | pypiezo-dev | flyscan-dev
 
+You do NOT need to activate a virtualenv to use them. The venv exists to keep
+this build's `pscan` package away from the stable one's; its scripts hard-code
+their own interpreter, so the commands just work.
+
+If they come back "command not found", ~/.local/bin is not on your PATH:
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+  source ~/.bashrc
+Debian and Ubuntu add that directory for you, but only if it already exists
+when you log in - so the first install, which creates it, needs this once.
+
 The shared system drivers (Comedi, libphidget21, libTUCam) are NOT installed
 by install-dev.sh. Both builds load the same .so files, so run the normal
 `bash install.sh` once from your stable checkout to put them in place;

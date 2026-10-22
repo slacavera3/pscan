@@ -95,16 +95,41 @@ for cmd in "${COMMANDS[@]}"; do
     echo " -> $cmd"
 done
 
-echo -e "\n======================================================="
-echo " DONE! Run 'pscan-dev' | 'pystage-dev' | 'pypiezo-dev' | 'flyscan-dev'."
-echo " The stable 'pscan' command is untouched."
-echo "======================================================="
-
+# The PATH verdict decides what the closing banner is allowed to claim. An
+# earlier version announced DONE and listed the commands, then warned about
+# PATH underneath - so the install read as successful and the one thing left
+# to do scrolled past as a footnote. Nothing here says the commands are
+# runnable until they actually are.
 case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *)
-        echo -e "\n[WARNING] $BIN_DIR is not on your PATH, so the commands above"
-        echo "will not be found yet. Add this to ~/.bashrc and open a new shell:"
-        echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-        ;;
+    *":$BIN_DIR:"*) PATH_OK=1 ;;
+    *) PATH_OK=0 ;;
 esac
+
+if [ "$PATH_OK" -eq 1 ]; then
+    echo -e "\n======================================================="
+    echo " DONE! Run 'pscan-dev' | 'pystage-dev' | 'pypiezo-dev' | 'flyscan-dev'."
+    echo " The stable 'pscan' command is untouched."
+    echo "======================================================="
+else
+    echo -e "\n======================================================="
+    echo " ALMOST DONE - ONE STEP LEFT"
+    echo "======================================================="
+    echo " The build installed correctly, but $BIN_DIR"
+    echo " is not on your PATH, so the -dev commands will not be found yet:"
+    echo ""
+    echo "   echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
+    echo "   source ~/.bashrc"
+    echo ""
+    # Debian and Ubuntu put ~/.local/bin on PATH from ~/.profile, but only
+    # when the directory already exists as the login shell starts. If this
+    # script created it a moment ago, that test failed at the last login and
+    # will keep failing until the next one - which looks exactly like a
+    # broken install.
+    echo " (Debian/Ubuntu add this directory automatically, but only if it"
+    echo "  exists at login - a newly created one needs the line above, or"
+    echo "  a log out and back in.)"
+    echo ""
+    echo " Until then the commands still work by full path, e.g."
+    echo "   $VENV_DIR/bin/pscan-dev"
+    echo "======================================================="
+fi
