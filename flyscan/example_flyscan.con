@@ -1,0 +1,121 @@
+## =========================================================================
+## flyscan configuration template
+##
+## Same syntax as a pscan .con file, so pscan's own actions work here. Unlike
+## pscan, position in the file does NOT decide when a block runs: anything
+## before 'action apt_fly' is setup, anything after it is teardown. There is
+## no per-coordinate pipeline for a block to fall into.
+##
+## Run with:  flyscan --dry-run example_flyscan.con
+## =========================================================================
+
+## -------------------------------------------------------------------------
+## SETUP - runs once, before anything moves
+## -------------------------------------------------------------------------
+action script
+script echo "fly scan starting"
+end
+
+## -------------------------------------------------------------------------
+## FOCUS
+##
+## Over a field wider than ~100 um, sample tilt alone usually exceeds the
+## depth of focus (roughly lambda / 2*NA^2 - about 310 nm at 400 nm, NA 0.8),
+## and signal strength follows focus quality. So focus is measured at a grid
+## of points before the scan, fitted to a surface, and then applied once per
+## line - which is all the Phidget analog output needs to keep up with.
+##
+## coarse <start_um> <stop_um> <step_um>   the first, wide sweep
+## fine_span / fine_step                   optional second pass about the peak
+## grid <nx> <ny>                          focus measurement points
+## surface  plane | quadratic              plane needs 3 points, quadratic 6
+## metric   copeak | dc                    what counts as "in focus"
+## every_lines <n>                         re-measure during the scan; 0 = never
+## -------------------------------------------------------------------------
+action autofocus
+coarse 0 100 10
+fine_span 10
+fine_step 1
+grid 3 3
+surface plane
+metric copeak
+every_lines 20
+limits 0 100
+end
+
+## -------------------------------------------------------------------------
+## FAST AXIS - swept at constant velocity, one ASOPS sweep per pixel
+##
+## VELOCITY IS THE DIAL. One ASOPS sweep covers velocity/sweep_rate, and that
+## is the native sample spacing; how many fit in the line is the scope's
+## segment count. There is no 'pixels' key - specifying both would
+## over-determine it.
+##
+## scan <start_mm> <stop_mm>    two values, not three
+## velocity <mm_per_s>          the one knob that sets sampling and time
+## bin <nm>                     OUTPUT pixel size, for post-processing only.
+##                              Averages bin/native_pitch copeaks together,
+##                              for sqrt(that) times the SNR.
+## runup <mm>                   constant-velocity lead-in, outside the scan
+## acceleration <mm_per_s2>     optional, to check the run-up is long enough
+## spot <um>                    optical resolution, for the smear check
+## limits <min_mm> <max_mm>     must cover the travel INCLUDING the run-up
+## unidirectional               bare flag; omit for a bidirectional raster
+##
+## At 10 kHz, 5 mm/s gives 0.5 um per sweep - half a 1 um spot, which is the
+## ceiling. Above it each copeak smears over more than half a resolution
+## element and binning cannot recover it. The MLSA02 would do 250 mm/s; at
+## 5 mm/s you are using 2% of it.
+## -------------------------------------------------------------------------
+action apt_fly
+axis 0
+scan 53.500 53.600
+velocity 5.0
+bin 1000
+runup 0.050
+acceleration 9810
+spot 1.0
+limits 53.400 53.700
+end
+
+## -------------------------------------------------------------------------
+## SLOW AXIS - an ordinary pscan apt_stage block, stepped once per line
+## -------------------------------------------------------------------------
+action apt_stage
+axis 1
+scan 37.000 37.100 0.001
+limits 36.900 37.200
+end
+
+## -------------------------------------------------------------------------
+## SCOPE - one Sequence-mode acquisition per line
+##
+## channels / roles / sparsing correspond one to one.
+##   ac       the Brillouin signal, kept at full rate
+##   dc       probe DC, denominator of dR/R - one value per copeak
+##   trigger  BBD303 position-trigger pulses; measured position beats inferred
+##   spare    anything else
+##
+## Sparsing the trigger channel is bounded by the TTL pulse WIDTH: sparse
+## harder than the pulse is wide and pulses are missed entirely.
+##
+## segment_window is how much of each 12.5 ns delay window to keep, in lab
+## seconds. Half the window is 50 us, which at 10 MS/s is 500 points.
+## -------------------------------------------------------------------------
+action scope_line
+ip 192.168.74.2
+channels C1, C2, C3
+roles ac, dc, trigger
+sparsing 1, 100, 20
+sample_rate 10000000
+segment_window 50e-6
+sweep_rate 10000
+transfer_rate 4.0
+end
+
+## -------------------------------------------------------------------------
+## TEARDOWN - runs once, after the scan
+## -------------------------------------------------------------------------
+action script
+script echo "fly scan finished"
+end

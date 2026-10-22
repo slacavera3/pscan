@@ -6,6 +6,9 @@ __pycache__/
 *.d
 *.jpg
 *.con
+# Real run configs stay out of the repo, but the worked example is
+# documentation and has to travel with the code.
+!flyscan/example_flyscan.con
 build/
 dist/
 *.egg-info/
