@@ -32,6 +32,48 @@ git pull
 bash install.sh
 
 --------------------------------------------------------------------------------
+1b. EXPERIMENTAL BUILD, ALONGSIDE THE STABLE ONE (LINUX)
+--------------------------------------------------------------------------------
+This branch is the experimental build. It installs as `pscan-dev` and can sit
+on the same machine as a normal `pscan` install without either disturbing the
+other.
+
+Why it needs its own installer: both builds ship a top-level `pscan` Python
+package, so they cannot share a site-packages directory - whichever was
+installed second would own the files, and uninstalling either would break the
+other. `install-dev.sh` therefore puts this build in its own virtualenv under
+~/.local/share/pscan-dev and links only the -dev commands into ~/.local/bin.
+
+# Step 1: Clone somewhere SEPARATE from your stable pscan checkout
+git clone https://github.com/slacavera3/pscan.git pscan-dev
+cd pscan-dev
+git checkout test/working-snapshot
+
+# Step 2: Run the dev installer (no sudo, nothing installed system-wide)
+bash install-dev.sh
+
+# TO UPDATE LATER:
+cd /path/to/pscan-dev
+git pull
+bash install-dev.sh
+
+This gives you four commands that shadow nothing:
+  pscan-dev | pystage-dev | pypiezo-dev | flyscan-dev
+
+The shared system drivers (Comedi, libphidget21, libTUCam) are NOT installed
+by install-dev.sh. Both builds load the same .so files, so run the normal
+`bash install.sh` once from your stable checkout to put them in place;
+install-dev.sh only checks for them and warns.
+
+# TO REMOVE THE EXPERIMENTAL BUILD:
+rm -f ~/.local/bin/{pscan-dev,pystage-dev,pypiezo-dev,flyscan-dev}
+rm -rf ~/.local/share/pscan-dev
+
+WARNING: do not run `pip install .` on this branch outside the venv. That
+would drop its `pscan` package on top of your stable install's and leave you
+with a mixture of the two.
+
+--------------------------------------------------------------------------------
 2. GLOBAL INSTALLATION & UPDATING (WINDOWS)
 --------------------------------------------------------------------------------
 Windows does not require the Linux Comedi C-drivers and cannot run the bash 
