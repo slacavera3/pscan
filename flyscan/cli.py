@@ -11,6 +11,7 @@ import time
 
 from flyscan.config import parse_fly_config, FlyConfigError
 from flyscan.raster import DEFAULT_SLOW_STEP_S, RasterScan, build_writer
+from flyscan.stage import DEFAULT_TRAVEL_VELOCITY_MM_S
 
 
 def _duration(seconds):
@@ -249,10 +250,22 @@ def run_scan(config, args):
     scan_started = False
     try:
         print("\nConnecting to stage...")
-        stage = FlyStage()
+        stage = FlyStage(calibration=calibration,
+                         travel_velocity_mm_s=args.travel_velocity)
         stage.connect()
         if calibration is not None:
             _apply_velocity(stage, plan, calibration)
+            print(f"  travel velocity {args.travel_velocity} mm/s for "
+                  f"getting to each line")
+        elif plan.velocity_mm_s < 1.0:
+            print(
+                f"\n[WARNING] Without a calibration the {plan.velocity_mm_s} "
+                f"mm/s fly velocity also applies to\n"
+                f"          positioning moves. Getting to the start of a "
+                f"line could take\n"
+                f"          minutes, and the scan will proceed from wherever "
+                f"the stage got to."
+            )
 
         print(f"Connecting to scope at {config.scope_ip}...")
         scope = FlyScope(config.scope_ip, transfer_mb_s=config.transfer_mb_s)
@@ -341,6 +354,14 @@ def main(argv=None):
              "FlyStage.calibrate_velocity_scale(). Without it the stage "
              "velocity is NOT commanded and the scan assumes the fast axis "
              "is already running at the configured speed.",
+    )
+    parser.add_argument(
+        '--travel-velocity', type=float,
+        default=DEFAULT_TRAVEL_VELOCITY_MM_S,
+        help=f"mm/s used to reach the start of each line, as opposed to "
+             f"flying it (default {DEFAULT_TRAVEL_VELOCITY_MM_S}). Needs "
+             f"--velocity-cal; without one the fly velocity applies to "
+             f"every move.",
     )
     parser.add_argument(
         '--overwrite', action='store_true',

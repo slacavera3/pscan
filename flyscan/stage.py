@@ -43,6 +43,15 @@ PROFILE_POLL_INTERVAL_S = 0.002
 # exclude the acceleration and deceleration ramps.
 PROFILE_TRIM_FRACTION = 0.2
 
+# Velocity used to GET to the start of a line, as opposed to flying it.
+# Deliberately modest - the MLSA02 would do 250 mm/s, but nothing here is
+# worth hurrying for.
+DEFAULT_TRAVEL_VELOCITY_MM_S = 5.0
+
+# Floor on how long to allow a positioning move, before the distance it
+# actually has to cover is added on.
+POSITION_TIMEOUT_FLOOR_S = 5.0
+
 
 class VelocityCalibration:
     """Measured mapping between raw APT velocity units and mm/s.
@@ -95,7 +104,43 @@ class VelocityCalibration:
 
 
 class FlyStage(ThorlabsStage):
-    """A ThorlabsStage that can also fly a line at constant velocity."""
+    """A ThorlabsStage that can also fly a line at constant velocity.
+
+    Holds a VelocityCalibration so it can switch between a fast TRAVEL
+    velocity for getting to the start of a line and the slow FLY velocity
+    for the line itself. Without that split the fly velocity applies to
+    every move on the axis, and at 0.02 mm/s a 5 mm reposition takes four
+    minutes - longer than any sensible timeout, so the scan proceeds from
+    wherever the stage happened to get to.
+    """
+
+    def __init__(self, port=None, calibration=None,
+                 travel_velocity_mm_s=DEFAULT_TRAVEL_VELOCITY_MM_S):
+        super().__init__(port)
+        self.calibration = calibration
+        self.travel_velocity_mm_s = travel_velocity_mm_s
+
+    @property
+    def can_set_velocity(self):
+        return (self.calibration is not None
+                and self.calibration.is_calibrated)
+
+    def set_velocity_mm_s(self, axis, mm_per_s):
+        """Set this axis's velocity in mm/s. False if uncalibrated."""
+        if not self.can_set_velocity:
+            return False
+
+        current = self.get_velocity_params_raw(axis)
+        if current is None:
+            return False
+
+        self.set_velocity_params_raw(
+            axis, max_velocity=self.calibration.raw_velocity(mm_per_s),
+            acceleration=current['acceleration'],
+            min_velocity=current['min_velocity'],
+        )
+        time.sleep(0.05)
+        return True
 
     # ------------------------------------------------- velocity parameters
 
@@ -188,23 +233,40 @@ class FlyStage(ThorlabsStage):
     # ----------------------------------------------------------- flying
 
     def prepare_line(self, axis, start_mm, stop_mm, runup_mm, counts_per_mm,
-                     tolerance_mm=0.001, timeout_s=15.0, dwell_s=0.02):
-        """Move to the launch point and preload the end of the fly move.
+                     tolerance_mm=0.001, timeout_s=None, dwell_s=0.02,
+                     fly_velocity_mm_s=None):
+        """Move to the launch point at travel speed, then arm for the fly.
 
-        Returns the launch and target positions. The run-up deliberately
-        takes the stage outside the nominal scan range so that it is already
-        at constant velocity when the first pixel is acquired, so any soft
-        limit has to cover the extended travel, not just start..stop.
+        The velocity is switched twice: fast to get there, then the fly
+        velocity just before the move is preloaded. Returns the launch and
+        target positions, and whether the launch point was actually
+        reached - a caller that ignores 'at_launch' will happily acquire a
+        line from wherever the stage got to.
+
+        The run-up deliberately takes the stage outside the nominal scan
+        range so it is already at constant velocity when the first pixel is
+        acquired, so any soft limit has to cover the extended travel.
         """
         direction = 1.0 if stop_mm >= start_mm else -1.0
         launch_mm = start_mm - direction * runup_mm
         target_mm = stop_mm + direction * runup_mm
+
+        travelling = self.set_velocity_mm_s(axis, self.travel_velocity_mm_s)
+
+        if timeout_s is None:
+            timeout_s = self._position_timeout(
+                axis, launch_mm, counts_per_mm,
+                self.travel_velocity_mm_s if travelling else fly_velocity_mm_s,
+            )
 
         self.move_absolute(axis, launch_mm, counts_per_mm)
         reached = self.wait_for_move(
             axis, launch_mm, counts_per_mm,
             tolerance_mm=tolerance_mm, timeout_s=timeout_s, dwell_s=dwell_s,
         )
+
+        if fly_velocity_mm_s is not None:
+            self.set_velocity_mm_s(axis, fly_velocity_mm_s)
         self.preload_target(axis, target_mm, counts_per_mm)
 
         return {
@@ -212,7 +274,25 @@ class FlyStage(ThorlabsStage):
             'target_mm': target_mm,
             'direction': direction,
             'at_launch': reached,
+            'travel_velocity_set': travelling,
         }
+
+    def _position_timeout(self, axis, target_mm, counts_per_mm, velocity_mm_s):
+        """Long enough to actually cover the distance, with margin.
+
+        A fixed timeout is the wrong shape here: the distance to the launch
+        point depends on where the previous line left the stage, and at a
+        slow velocity even a few mm takes minutes.
+        """
+        if not velocity_mm_s or velocity_mm_s <= 0:
+            return POSITION_TIMEOUT_FLOOR_S
+
+        here = self.get_position(axis, counts_per_mm)
+        if here is None:
+            return POSITION_TIMEOUT_FLOOR_S
+
+        travel_s = abs(target_mm - here) / velocity_mm_s
+        return POSITION_TIMEOUT_FLOOR_S + 3.0 * travel_s
 
     def fly_line(self, axis, plan, scope, channels, sparsing=None,
                  after_capture=None):

@@ -456,11 +456,24 @@ class RasterScan:
 
         line_plan = self.stage.prepare_line(
             plan.fast_axis, fast_start, fast_stop, plan.runup_mm,
-            plan.counts_per_mm,
+            plan.counts_per_mm, fly_velocity_mm_s=plan.velocity_mm_s,
         )
 
         next_slow = (plan.slow_position_mm(index + 1)
                      if index + 1 < plan.lines else None)
+
+        # Flying from the wrong place produces a clean-looking line of the
+        # wrong part of the sample, which is worse than no line at all.
+        if not line_plan.get('at_launch', True):
+            self._record_failure(
+                index,
+                RuntimeError(
+                    f"stage never reached the launch point "
+                    f"{line_plan['launch_mm']:.4f} mm, so this line would "
+                    f"have been acquired somewhere else entirely"
+                ),
+            )
+            return next_slow
 
         def step_slow_axis():
             if next_slow is not None:
@@ -551,12 +564,28 @@ class RasterScan:
                 f"Stopping rather than rastering a field of gaps."
             )
 
+    def _restore_velocity(self):
+        """Put the fast axis back to travel speed.
+
+        A fly scan leaves the axis at its scan velocity, which for a slow
+        scan is 0.02 mm/s - useless for anyone who jogs the stage next. Only
+        the fast axis is touched, because that is the only one this scan
+        changed.
+        """
+        velocity = getattr(self.stage, 'travel_velocity_mm_s', None)
+        if velocity and self.stage.set_velocity_mm_s(self.plan.fast_axis,
+                                                     velocity):
+            print(f" -> {self.plan.fast_axis} velocity restored to "
+                  f"{velocity} mm/s for manual use")
+
     def _halt(self, aborted):
-        """Stop motion and close the file, reporting rather than raising."""
-        for label, action in (
-            ("stage stop", lambda: self.stage.stop_all()),
-            ("writer close", lambda: self.writer.close()),
-        ):
+        """Stop motion, restore a usable velocity, and close the file."""
+        steps = [("stage stop", lambda: self.stage.stop_all())]
+        if getattr(self.stage, 'can_set_velocity', False):
+            steps.append(("velocity restore", self._restore_velocity))
+        steps.append(("writer close", lambda: self.writer.close()))
+
+        for label, action in steps:
             try:
                 action()
             except Exception as e:

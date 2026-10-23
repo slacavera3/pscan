@@ -12,6 +12,31 @@ MSG_MOVE_STOPPED   = 0x0466
 
 # Outbound.
 MSG_MOVE_STOP = 0x0465
+MSG_SET_VELPARAMS = 0x0413
+MSG_REQ_VELPARAMS = 0x0414
+MSG_GET_VELPARAMS = 0x0415
+
+# APT velocity scaling for brushless (BBD) controllers is
+# counts_per_mm * T * 65536, where T is the controller's sampling interval.
+# T = 102.4 us is CONFIRMED for the BBD303: calibrating against measured
+# motion gave 230531 raw per mm/s where this formula predicts 230210, a
+# 0.14% agreement. A different controller family needs a different T.
+BBD_SAMPLE_INTERVAL_S = 102.4e-6
+
+# Velocity to leave on the stage for manual use. Anything that changes the
+# velocity for its own purposes should put it back to this, so the next
+# person to jog the stage does not find it crawling or bolting.
+DEFAULT_MANUAL_VELOCITY_MM_S = 5.0
+
+
+def velocity_scale(counts_per_mm, sample_interval_s=BBD_SAMPLE_INTERVAL_S):
+    """Raw APT velocity units per mm/s.
+
+    A calculated fallback for callers with no measured calibration. Prefer
+    flyscan's VelocityCalibration where one exists - it is measured on the
+    actual hardware rather than assuming the sampling interval.
+    """
+    return counts_per_mm * sample_interval_s * 65536
 
 # Param2 of MOVE_STOP selects the stop mode.
 STOP_IMMEDIATE = 0x01
@@ -198,7 +223,10 @@ class ThorlabsStage:
         for axis in ('x', 'y'):
             try:
                 if not self.stop(axis, profiled=profiled):
-                    print(f"[WARNING] Stage {axis.upper()} did not confirm the stop.")
+                    # An axis that was already stationary sends no
+                    # MOVE_STOPPED, so note it rather than alarm about it.
+                    print(f"[note] Stage {axis.upper()} sent no stop "
+                          f"confirmation; it may already have been still.")
             except Exception as e:
                 print(f"[WARNING] Could not stop stage {axis.upper()}: {e}")
 

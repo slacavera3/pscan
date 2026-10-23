@@ -5,6 +5,11 @@ import time
 import serial
 import serial.tools.list_ports
 
+from pscan.stage_driver import (
+    MSG_SET_VELPARAMS, MSG_REQ_VELPARAMS, MSG_GET_VELPARAMS,
+    DEFAULT_MANUAL_VELOCITY_MM_S, velocity_scale,
+)
+
 # ==========================================
 # 1. Simple Blocking Keystroke Reader
 # ==========================================
@@ -36,7 +41,50 @@ else:
 class SimpleStage:
     def __init__(self):
         self.ser = None
-        self.scale = 34304.0 
+        self.scale = 34304.0
+        self.velocity_mm_s = None
+
+    def get_velocity_params(self, axis_id):
+        """Read this axis's velocity parameters, or None on no reply.
+
+        GET_VELPARAMS is 20 bytes: a 6-byte header, then chan_ident, min
+        velocity, acceleration and max velocity.
+        """
+        dest = 0x20 + axis_id
+        self.ser.reset_input_buffer()
+        self.ser.write(struct.pack('<HBBBB', MSG_REQ_VELPARAMS, 0x01, 0x00,
+                                   dest, 0x01))
+
+        timeout = time.time() + 0.5
+        while time.time() < timeout:
+            if self.ser.in_waiting >= 20:
+                data = self.ser.read(20)
+                if data[0:2] == struct.pack('<H', MSG_GET_VELPARAMS):
+                    _, min_v, accel, max_v = struct.unpack_from('<Hlll',
+                                                                data, 6)
+                    return {'min': min_v, 'accel': accel, 'max': max_v}
+        return None
+
+    def set_velocity_mm_s(self, axis_id, mm_per_s):
+        """Set max velocity, leaving acceleration as the controller has it.
+
+        Acceleration has its own scaling constant, which is not calibrated
+        here, so it is read back and written through unchanged rather than
+        guessed at.
+        """
+        current = self.get_velocity_params(axis_id)
+        if current is None:
+            return False
+
+        raw = int(round(mm_per_s * velocity_scale(self.scale)))
+        dest = 0x20 + axis_id
+        payload = struct.pack('<Hlll', 0x01, current['min'],
+                              current['accel'], raw)
+        header = struct.pack('<HHBB', MSG_SET_VELPARAMS, len(payload),
+                             dest | 0x80, 0x01)
+        self.ser.write(header + payload)
+        time.sleep(0.05)
+        return True
 
     def connect(self):
         for p in serial.tools.list_ports.comports():
@@ -56,6 +104,14 @@ class SimpleStage:
         self.set_enable(1, True)
         self.set_enable(2, True)
         time.sleep(0.2)
+
+        # Other tools change the velocity for their own purposes - a fly
+        # scan can leave an axis at 0.02 mm/s - so start from a known,
+        # jog-friendly speed rather than inheriting whatever was left behind.
+        if all(self.set_velocity_mm_s(axis, DEFAULT_MANUAL_VELOCITY_MM_S)
+               for axis in (1, 2)):
+            self.velocity_mm_s = DEFAULT_MANUAL_VELOCITY_MM_S
+
         return port
 
     def set_enable(self, axis_id, enable=True):
@@ -137,7 +193,10 @@ def main():
         print("==================================================")
         print(f" X-Axis Position: {x_pos:8.5f} mm  {x_status}")
         print(f" Y-Axis Position: {y_pos:8.5f} mm  {y_status}")
-        print(f"\n Current Step Size: {current_step:.5f} mm")
+        speed = (f"{stage.velocity_mm_s:.2f} mm/s"
+                 if stage.velocity_mm_s is not None else "as found")
+        print(f"\n Current Step Size: {current_step:.5f} mm   "
+              f"Velocity: {speed}")
         print("==================================================")
         print("   Up/Down/L/R : Jog Axes   |  J : Set Step Size")
         print("   G           : Go To Abs  |  C : Center (0.0, 0.0)")
