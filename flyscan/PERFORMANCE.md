@@ -12,21 +12,54 @@ numbers, not a replacement for running it.
 
 ## The one number that matters
 
-**Time per pixel is ~350 µs, and it does not depend on field size, velocity
-or pixel pitch.** Those all cancel. It splits as:
+**Time per pixel is ~815 µs, and it does not depend on field size, velocity
+or pixel pitch.** Those all cancel. At a 50 µs window, 10 MS/s and the
+**measured** transfer rate it splits as:
 
 | Term | Expression | Value |
 |---|---|---|
 | Flight | `1 / f_sweep` | **100 µs** |
-| Transfer | `2 · points_per_segment / transfer_rate` | **250 µs** |
+| Transfer | `2 · points_per_segment / transfer_rate` | **715 µs** |
 
-So a 1-megapixel map takes about **350 s, under six minutes**. The same map
-step-and-settle at ~250 ms/pixel is about **69 hours**. That is the ~700×
-the whole exercise buys.
+So a 1-megapixel map takes about **14 minutes**. The same map
+step-and-settle at ~250 ms/pixel is about **69 hours**, so this is still
+~300×. Scan time for any field is just `pixels × 815 µs`.
 
-Scan time for any field is just `pixels × 350 µs`. A 500 × 500 µm field at
-0.5 µm pitch is 10⁶ pixels; at 1 µm pitch it is 2.5 × 10⁵ pixels and about
-90 s.
+**You are transfer-bound 7:1.** Fixing the transport is worth more than
+every other optimisation combined — see the levers below.
+
+### Where 1.40 MB/s came from
+
+Measured on 2026-10-22, not assumed, from two pscan runs. Note both used
+the scope's **Cal output at 1 kHz** as trigger and signal — a loopback test
+of the chain, not the 10 kHz ASOPS clock — over a **50 µs** window:
+
+| | acquisitions | traces | bytes | wall time |
+|---|---|---|---|---|
+| real-time, 100 counts | 100 | 100 | 200,400 | 7.0 s |
+| `SEQ ON,1000`, 10 counts | 10 | 10,000 | 20,040,000 | 25.0 s |
+
+Both give 2004 B/trace: 1002 points over 50 µs, i.e. **20.04 MS/s**. The
+trigtime sidecar held exactly 10,000 entries, confirming the segment count.
+
+Each run is `acquisitions × (fill + overhead) + bytes/rate = wall time`,
+with `fill = segments / f_trigger`. Two runs, two unknowns, solved
+simultaneously:
+
+- **67.6 ms** of SCPI overhead per acquisition (~5 VXI-11 round trips)
+- **1.40 MB/s** transfer
+
+Both reproduce to the second: run 2 is 0.10 + 6.76 + 0.14, run 3 is
+10.00 + 0.68 + 14.32.
+
+**Only the fill term scales with trigger rate.** At 1 kHz a trace cost
+2.50 ms, of which just 40% was acquisition; at 10 kHz the same trace costs
+1.60 ms, not 250 µs. Dividing a 1 kHz measurement by ten overstates the
+gain by 6.4×.
+
+The overhead is paid once per *line* in a fly scan, so long lines amortise
+it: 67.6 ms over 500 segments is 135 µs/pixel, over 2000 segments 34 µs.
+Another reason to prefer long lines.
 
 ---
 
@@ -77,31 +110,45 @@ the optical setup. Not worth doing until transfer is fixed.
 
 ## Bottleneck ranking
 
-### 1. VXI-11 transfer — currently binding, 250 µs/pixel
+### 1. VXI-11 transfer — dominant, 715 µs/pixel
 
-The only term with real headroom, and three independent multiplicative
-levers:
+Three independent multiplicative levers. The first is free and not yet
+taken:
 
 | Lever | From | To | Transfer/pixel |
 |---|---|---|---|
-| (baseline) | | | 250 µs |
-| Window fraction | 1/2 | 1/4 | 125 µs |
-| Oversampling `n` | 16 | 8 pts/cycle | 125 µs |
-| Transfer rate | 4 MB/s | 8 MB/s | 125 µs |
-| All three together | | | **31 µs** |
+| As tested (20 MS/s) | | | 1430 µs |
+| **Sample rate** | 20 MS/s | **10 MS/s** | **715 µs** |
+| Window fraction | 1/2 | 1/4 | 357 µs |
+| Transfer rate | 1.40 MB/s | 8 MB/s | 125 µs |
+| All three | | | **62 µs** |
 
-With all three, transfer drops below flight and the scan becomes
-physics-limited at ~130 µs/pixel.
+Note how lopsided this is. Sample rate and window each buy a factor of two;
+**the transport buys a factor of six.** With all three, transfer drops below
+flight and the scan becomes physics-limited at ~162 µs/pixel — a 1 Mpx map
+in under three minutes.
 
+- **Sample rate is the free one.** The test ran 20 MS/s. A 5 GHz signal at
+  8000× stretch is 625 kHz in lab time, so 10 MS/s is already 16 points per
+  acoustic cycle. Halving it halves the data for no loss.
+- **Transfer rate is the big one.** 1.40 MB/s is poor even for VXI-11,
+  which is RPC-over-TCP and suffers badly from small block sizes. Worth
+  trying, roughly in order of effort: LeCroy's native VICP protocol; larger
+  transfer blocks; and the 66Zi runs Windows internally, so writing
+  waveforms to its own disk at full speed and pulling them over SMB
+  sidesteps the instrument link entirely.
 - **Window fraction** is free if the signal has decayed. Capture one
   full-window line with `configure_flat_line()` and look before cutting it —
   a substrate echo off the diamond could easily sit in the discarded half.
-- **Oversampling** at 8 points per acoustic cycle is still 4× Nyquist. 16 is
-  comfortable rather than necessary.
-- **Transfer rate** is the least certain number here. 4 MB/s is an
-  assumption, not a measurement. Measure it before optimising against it.
-  If it is poor, LeCroy's native VICP beats VXI-11, and the 66Zi runs
-  Windows internally so saving locally and pulling over SMB is an option.
+
+| If transport reaches | per pixel | 1 Mpx map | transfer:flight |
+|---|---|---|---|
+| 1.40 MB/s (measured) | 815 µs | 13.6 min | 7.1:1 |
+| 4 MB/s | 350 µs | 5.8 min | 2.5:1 |
+| 8 MB/s | 225 µs | 3.8 min | 1.2:1 |
+| 20 MB/s | 150 µs | 2.5 min | 0.5:1 |
+
+*(50 µs window, 10 MS/s, 500 points, 10 kHz ASOPS)*
 
 ### 2. ASOPS sweep rate — the floor, 100 µs/pixel
 
@@ -222,7 +269,9 @@ Same field, step-and-settle at 250 ms/pixel: **~69 hours**.
 
 | Assumption | Current value | How to settle it |
 |---|---|---|
-| VXI-11 transfer rate | 4 MB/s | time one `download_line()` against `line_budget()` |
+| ~~VXI-11 transfer rate~~ | **1.40 MB/s, measured 2026-10-22** | settled — now the top target to improve |
+| ~~Per-acquisition overhead~~ | **67.6 ms, measured 2026-10-22** | settled |
+| Trigger rate in the measurement | Cal output, 1 kHz, *assumed* | check trigtime spacing (see below) |
 | Optical spot | 1 µm | edge response or resolution target |
 | Sample tilt | 1 mrad | falls out of the 3×3 focus map |
 | Depth of focus | 310 nm | from measured NA and wavelength |

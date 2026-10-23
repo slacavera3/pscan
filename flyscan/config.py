@@ -229,7 +229,7 @@ class FlyConfig:
 
     def __init__(self, path, plan, channels, scope_ip, sample_rate_hz,
                  transfer_mb_s, autofocus, setup_pipeline, teardown_pipeline,
-                 count, warnings):
+                 count, warnings, spot_um=None):
         self.path = path
         self.plan = plan
         self.channels = channels
@@ -237,6 +237,9 @@ class FlyConfig:
         self.sample_rate_hz = sample_rate_hz
         self.transfer_mb_s = transfer_mb_s
         self.autofocus = autofocus
+        # Kept so the runner can re-check smear against the spot right
+        # before anything moves, not only at parse time.
+        self.spot_um = spot_um
         self.setup_pipeline = setup_pipeline
         self.teardown_pipeline = teardown_pipeline
         self.count = count
@@ -562,7 +565,7 @@ def parse_fly_config(path, counts_per_mm):
         autofocus=autofocus,
         setup_pipeline=compile_pipeline_list(setup_blocks, counter),
         teardown_pipeline=compile_pipeline_list(teardown_blocks, counter),
-        count=count, warnings=warnings,
+        count=count, warnings=warnings, spot_um=spot_um,
     )
 
 
