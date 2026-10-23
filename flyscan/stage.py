@@ -329,13 +329,30 @@ class FlyStage(ThorlabsStage):
         direction = 1.0 if distance_mm >= 0 else -1.0
         measurements = []
 
+        # Acceleration has its own scaling constant, different from the
+        # velocity one and equally uncalibrated, so leave whatever the
+        # controller already holds rather than writing a velocity-scaled
+        # number into it.
+        existing = self.get_velocity_params_raw(axis)
+        if existing is None:
+            raise RuntimeError(
+                "stage did not report its velocity parameters, so they "
+                "cannot be changed safely"
+            )
+        keep_accel = existing['acceleration']
+        keep_min = existing['min_velocity']
+        if verbose:
+            print(f"  current params: {existing} "
+                  f"(acceleration will be left alone)")
+
         for raw in raw_values:
             self.move_absolute(axis, start_mm, counts_per_mm)
             self.wait_for_move(axis, start_mm, counts_per_mm)
             time.sleep(settle_s)
 
             self.set_velocity_params_raw(axis, max_velocity=raw,
-                                         acceleration=raw)
+                                         acceleration=keep_accel,
+                                         min_velocity=keep_min)
             time.sleep(0.05)
 
             times, positions = self.profile_move(
