@@ -12,9 +12,11 @@ neither applies here.
 
 Two things this module always does rather than assumes, because both fail
 silently and both corrupt a whole scan:
-  - it reads the segment count back after asking for it, since a scope that
-    caps segments on available memory would otherwise hand back fewer
-    segments than there are pixels, misaligning every line;
+  - it reads the segment count AND the per-segment length back after asking
+    for them, since a scope that caps segments on available memory would
+    otherwise hand back fewer segments than there are pixels, misaligning
+    every line, and one that sizes segments itself would quietly acquire a
+    multiple of the intended data;
   - it reads the achieved sample interval and sparsing out of the returned
     waveform, rather than trusting that a requested timebase was honoured.
 """
@@ -118,17 +120,21 @@ class FlyScope:
         self.points_per_segment = max(1, int(round(segment_seconds * sample_rate)))
         self._expected_interval = 1.0 / sample_rate
 
-        self.instr.write(f"SEQ ON,{segments}")
+        # Both numbers in one command. MSIZ alone is not enough: what it
+        # means varies by model - the acquisition total on some, the
+        # per-segment length on others - and on a WaveRunner Xi-A it is
+        # silently ignored once Sequence mode is on. There, 'SEQ ON,10000'
+        # made the scope divide its 25 Mpts across the segments by itself,
+        # giving 2500 points each and quietly acquiring five times the
+        # intended data against a transfer budget sized for 500. The
+        # three-argument form states the segment length outright, so no
+        # model has to infer it.
+        self.instr.write(f"SEQ ON,{segments},{self.points_per_segment}")
         self.instr.write(f"TDIV {segment_seconds / DIVISIONS:.6E}")
-        # The scope picks its sample rate from the timebase and the memory
-        # it is allowed to use, so ask for enough memory to hold the whole
-        # line at the requested rate. Whether MSIZ counts per segment or
-        # across the acquisition is model-specific, which is exactly why
-        # the achieved interval is checked against the returned waveform
-        # rather than assumed here.
-        self.instr.write(f"MSIZ {segments * self.points_per_segment}")
 
-        granted = self._read_segment_count()
+        # Read back after TDIV, not before: the timebase can itself move the
+        # memory the scope is willing to give a segment.
+        granted, granted_points = self._read_sequence()
         if granted is None:
             raise ScopeConfigError(
                 "Scope did not report Sequence mode as on. A fly line needs "
@@ -140,6 +146,25 @@ class FlyScope:
                 f"pixel in the line maps to a segment, so a short count "
                 f"would misalign the whole line. Reduce pixels per line, "
                 f"shorten the capture window, or fit more memory."
+            )
+
+        # Older firmware that does not take a length with SEQ leaves the
+        # third field alone, so fall back to MSIZ and look again. One of the
+        # two reaches every model; which one did is not worth caring about,
+        # as long as the result is checked.
+        if granted_points is not None and granted_points != self.points_per_segment:
+            self.instr.write(f"MSIZ {self.points_per_segment}")
+            granted, granted_points = self._read_sequence()
+
+        if granted_points is not None and granted_points != self.points_per_segment:
+            raise ScopeConfigError(
+                f"Asked for {self.points_per_segment} points per segment and "
+                f"got {granted_points}. At {segments} segments that is "
+                f"{segments * granted_points / 1e6:.1f} Mpts per channel "
+                f"instead of {segments * self.points_per_segment / 1e6:.1f}, "
+                f"so the transfer would overrun its timeout and the delay "
+                f"axis would not be what was asked for. Shorten "
+                f"segment_window, lower sample_rate, or use fewer segments."
             )
 
         self.instr.timeout = self._timeout_for_line()
@@ -191,13 +216,32 @@ class FlyScope:
             'timeout_s': self.instr.timeout,
         }
 
-    def _read_segment_count(self):
-        """Segment count the scope reports, or None if Sequence mode is off."""
+    def _read_sequence(self):
+        """(segments, points_per_segment) as reported, or (None, None) if off.
+
+        The third field is the per-segment length and comes back in whatever
+        notation the scope likes - '500', '2.5E+3', '25E+3' have all been
+        seen - so it is parsed as a float and rounded. It is optional: a
+        scope that omits it gives None, which the caller treats as 'this
+        model does not tell us' rather than as a mismatch.
+        """
         reply = self._ask("SEQ?").upper()
         if 'ON' not in reply:
-            return None
-        match = re.search(r'ON\s*,\s*(\d+)', reply)
-        return int(match.group(1)) if match else None
+            return None, None
+
+        match = re.search(
+            r'ON\s*,\s*(\d+)\s*(?:,\s*([0-9.]+(?:E[+-]?\d+)?))?', reply
+        )
+        if not match:
+            return None, None
+
+        segments = int(match.group(1))
+        points = int(round(float(match.group(2)))) if match.group(2) else None
+        return segments, points
+
+    def _read_segment_count(self):
+        """Segment count the scope reports, or None if Sequence mode is off."""
+        return self._read_sequence()[0]
 
     def _timeout_for_line(self, channels=None, sparsing=None):
         """Cover filling the line and transferring it, with margin.
