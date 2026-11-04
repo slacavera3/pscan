@@ -26,7 +26,8 @@ from pscan.config_parser import (
     parse_flat_con_file, compile_pipeline_list, compile_stage_parameters,
     generate_positions, _field, _flag,
 )
-from flyscan.budget import ROLE_AC, ROLE_DC, ROLE_TRIGGER, ROLE_SPARE
+from flyscan.budget import (DEFAULT_REP_RATE_HZ, ROLE_AC, ROLE_DC,
+                            ROLE_TRIGGER, ROLE_SPARE)
 from flyscan.raster import ChannelPlan, RasterPlan
 
 # Actions a fly scan understands, on top of the fly-specific ones below.
@@ -43,11 +44,16 @@ REJECTED_ACTIONS = {
     'tucsen': "no camera can expose per pixel at kHz pixel rates",
     'd2a_phidget': ("the piezo is the focus actuator in a fly scan - "
                     "configure it with 'action autofocus'"),
+    # The generic spelling of the same block. Listed explicitly so writing it
+    # the new way gets this reason rather than a bare "unknown action type".
+    'd2a': ("an analog output is a step-and-settle axis; in a fly scan the "
+            "piezo is the focus actuator - configure it with "
+            "'action autofocus'"),
 }
 
 FLY_SCHEMAS = {
     'apt_fly': {
-        # No 'pixels': velocity and the sweep clock decide how many copeaks
+        # No 'pixels': velocity and the delay clock decide how many copeaks
         # fit in a line, so specifying both would over-determine it.
         'required': ['axis', 'scan', 'velocity'],
         'optional': ['runup', 'limits', 'unidirectional', 'spot', 'bin',
@@ -56,7 +62,7 @@ FLY_SCHEMAS = {
     'scope_line': {
         'required': ['ip', 'channels', 'roles', 'sample_rate',
                      'segment_window'],
-        'optional': ['sparsing', 'sweep_rate', 'transfer_rate'],
+        'optional': ['sparsing', 'delay_rate', 'rep_rate', 'transfer_rate'],
     },
     'autofocus': {
         'required': ['coarse'],
@@ -498,8 +504,24 @@ def parse_fly_config(path, counts_per_mm):
     channels = _build_channels(scope_body, scope_present, scope_label)
     sample_rate = _numbers(scope_body, 'sample_rate', 1, scope_label)[0]
     segment_window = _numbers(scope_body, 'segment_window', 1, scope_label)[0]
-    sweep_rate = (_numbers(scope_body, 'sweep_rate', 1, scope_label)[0]
-                  if 'sweep_rate' in scope_present else 10e3)
+    delay_rate = (_numbers(scope_body, 'delay_rate', 1, scope_label)[0]
+                  if 'delay_rate' in scope_present else 10e3)
+    # The laser rep rate is not a scope setting, but like delay_rate it is a
+    # property of the timing chain the scope is hanging off, and the two are
+    # only meaningful together: their ratio is the stretch factor. Benches
+    # here run 80 MHz and 100 MHz lasers, and the delay axis of every file
+    # scales directly with this, so an unstated value is worth a warning
+    # rather than a silent default.
+    if 'rep_rate' in scope_present:
+        rep_rate = _numbers(scope_body, 'rep_rate', 1, scope_label)[0]
+    else:
+        rep_rate = DEFAULT_REP_RATE_HZ
+        warnings.append(
+            f"{scope_label} has no 'rep_rate', so the delay axis will be "
+            f"written assuming {DEFAULT_REP_RATE_HZ / 1e6:.6g} MHz. State it "
+            f"outright - a rig running a different laser gets a delay axis "
+            f"wrong by the ratio of the two"
+        )
     transfer_mb_s = (_numbers(scope_body, 'transfer_rate', 1, scope_label)[0]
                      if 'transfer_rate' in scope_present else 4.0)
 
@@ -533,7 +555,8 @@ def parse_fly_config(path, counts_per_mm):
             slow_start_mm=slow_positions[0], slow_stop_mm=slow_positions[-1],
             lines=len(slow_positions),
             velocity_mm_s=velocity, counts_per_mm=counts_per_mm,
-            sample_rate_hz=sample_rate, sweep_rate_hz=sweep_rate,
+            sample_rate_hz=sample_rate, delay_rate_hz=delay_rate,
+            rep_rate_hz=rep_rate,
             segment_seconds=segment_window, runup_mm=runup,
             bidirectional=bidirectional, fast_limits_mm=fast_limits,
             bin_um=bin_um, acceleration_mm_s2=acceleration,

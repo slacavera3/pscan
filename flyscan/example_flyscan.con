@@ -46,7 +46,7 @@ end
 ## -------------------------------------------------------------------------
 ## FAST AXIS - swept at constant velocity, one ASOPS sweep per pixel
 ##
-## VELOCITY IS THE DIAL. One ASOPS sweep covers velocity/sweep_rate, and that
+## VELOCITY IS THE DIAL. One ASOPS sweep covers velocity/delay_rate, and that
 ## is the native sample spacing; how many fit in the line is the scope's
 ## segment count. There is no 'pixels' key - specifying both would
 ## over-determine it.
@@ -99,8 +99,12 @@ end
 ## Sparsing the trigger channel is bounded by the TTL pulse WIDTH: sparse
 ## harder than the pulse is wide and pulses are missed entirely.
 ##
-## segment_window is how much of each 12.5 ns delay window to keep, in lab
-## seconds. Half the window is 50 us, which at 10 MS/s is 500 points.
+## segment_window is how much of each delay window to keep, in LAB seconds.
+## The window itself is one laser period, 1/rep_rate - 12.5 ns at 80 MHz,
+## 10 ns at 100 MHz - and lab seconds convert to delay seconds by dividing
+## by the stretch factor rep_rate/delay_rate. At 80 MHz / 10 kHz the stretch
+## is 8000, so 50 us of lab time is 6.25 ns of delay, exactly half the
+## window, and at 10 MS/s that is 500 points.
 ## -------------------------------------------------------------------------
 action scope_line
 ip 192.168.74.2
@@ -109,7 +113,12 @@ roles ac, dc, trigger
 sparsing 1, 100, 20
 sample_rate 10000000
 segment_window 50e-6
-sweep_rate 10000
+delay_rate 10000
+## Laser repetition rate. Benches here run both 80e6 and 100e6 - state the
+## one on THIS rig. Nothing about the acquisition depends on it, but the
+## delay axis of every file scales directly with it, so getting it wrong
+## silently rescales every result. Omitting it warns and falls back to 80e6.
+rep_rate 80e6
 transfer_rate 4.0
 end
 

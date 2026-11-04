@@ -75,14 +75,14 @@ flight per pixel  = (L/v) / (L·f_sweep/v) = 1 / f_sweep
 ```
 
 The line length and the velocity divide out. Flying faster gets you a
-coarser pitch, not more pixels per second. **The ASOPS sweep rate is the
+coarser pitch, not more pixels per second. **The ASOPS delay rate is the
 pixel clock, and nothing else is.**
 
 ---
 
 ## The invariant that makes transfer stubborn
 
-Points per segment looks like it should depend on the sweep rate, since the
+Points per segment looks like it should depend on the delay rate, since the
 delay window is `1/Δf` long. It does not:
 
 ```
@@ -150,7 +150,7 @@ in under three minutes.
 
 *(50 µs window, 10 MS/s, 500 points, 10 kHz ASOPS)*
 
-### 2. ASOPS sweep rate — the floor, 100 µs/pixel
+### 2. ASOPS delay rate — the floor, 100 µs/pixel
 
 Once transfer is fixed this is what remains: **10 kpixel/s**, a megapixel in
 100 s. Raising Δf is the only way past it, and per the invariant above it

@@ -1,5 +1,14 @@
 import re
 
+from pscan.daq import BACKENDS as _DAQ_BACKEND_CLASSES
+from pscan.daq.base import DEFAULT_TERMINAL as DEFAULT_DAQ_TERMINAL
+from pscan.daq.base import TERMINALS as DAQ_TERMINALS
+
+# Backend names a .con file may ask for by name. Taken from the registry
+# rather than restated here, so adding a backend cannot leave the validator
+# rejecting it.
+DAQ_BACKENDS = tuple(sorted(_DAQ_BACKEND_CLASSES))
+
 # Keys each action block understands. Anything else is a typo - which used to
 # fall straight through to a silent default, so a misspelled 'sweep' left the
 # scope on whatever it happened to be set to and nothing said a word.
@@ -14,9 +23,22 @@ ACTION_SCHEMAS = {
         'required': ['axis', 'scan'],
         'optional': ['restore', 'save', 'limits'],
     },
+    # The original piezo block. Kept working exactly as it was, and now
+    # compiled into a 'd2a' axis with the phidget backend pinned - see
+    # compile_stage_parameters().
     'd2a_phidget': {
         'required': [],
         'optional': ['scan', 'position', 'limits'],
+        'one_of': ['scan', 'position'],
+    },
+    # Generic analog output: a piezo, a scanning mirror, anything driven by a
+    # DC voltage. Each block owns one output channel and one scan axis, so a
+    # galvo pair is two blocks on two axes.
+    'd2a': {
+        'required': [],
+        'optional': ['backend', 'device', 'channel', 'axis', 'units',
+                     'um_per_volt', 'scan', 'position', 'limits', 'settle',
+                     'restore'],
         'one_of': ['scan', 'position'],
     },
     'scope': {
@@ -25,7 +47,8 @@ ACTION_SCHEMAS = {
     },
     'a2d': {
         'required': ['channel'],
-        'optional': ['range', 'sample_rate', 'n_samples'],
+        'optional': ['range', 'sample_rate', 'n_samples', 'backend', 'device',
+                     'terminal', 'v_min', 'v_max'],
     },
     'webcam': {
         'required': [],
@@ -53,17 +76,47 @@ ACTION_SCHEMAS = {
 
 # Blocks that anchor the setup / acquisition / teardown split. See
 # categorize_pipeline().
-CORE_TYPES = ['apt_stage', 'd2a_phidget', 'count', 'scope', 'a2d', 'webcam',
-              'delay', 'ixon', 'tucsen']
+CORE_TYPES = ['apt_stage', 'd2a_phidget', 'd2a', 'count', 'scope', 'a2d',
+              'webcam', 'delay', 'ixon', 'tucsen']
+
+# Block types that declare a scan axis rather than a pipeline action.
+AXIS_TYPES = ('apt_stage', 'd2a_phidget', 'd2a')
 
 # Waverunner trace names: input channels, maths functions, memories and the
 # four zoom traces.
 CHANNEL_RE = re.compile(r'^(?:C\d+|F\d+|M\d+|Z\d+|T[A-D])$', re.IGNORECASE)
 
-# The APT axes main() actually iterates. The piezo is a d2a_phidget block,
-# which lands on virtual axis 99.
+# The APT axes main() actually iterates. Analog-output axes are virtual: they
+# get their own ids and main() nests them inside the stage axes.
 APT_AXES = (0, 1)
+
+# Where a d2a block lands when it does not say. 99 is where the piezo has
+# always lived, so an existing config's axis numbering does not move.
 PIEZO_AXIS = 99
+DEFAULT_D2A_AXIS = PIEZO_AXIS
+
+# Virtual axis ids a d2a block may claim. 0 and 1 belong to the APT stage, and
+# an analog output landing on one of them would be iterated as a stage move.
+D2A_AXIS_RANGE = (2, 99)
+
+# Nesting order is by axis id ascending: axis 0 is the outermost loop and the
+# highest-numbered axis the innermost. The piezo's 99 therefore stays the
+# innermost axis, as it was when the loop was hardcoded.
+
+#: What a d2a block's 'units' line may say.
+D2A_UNITS = ('volts', 'um')
+
+#: Default settle time for a new 'action d2a' block, in seconds.
+DEFAULT_D2A_SETTLE_S = 0.05
+
+# What 'action d2a_phidget' settles for, preserving the original total exactly:
+# main() slept PIEZO_SETTLE_S (0.20s) after the move and the Phidget driver
+# slept a further 0.05s inside set_position_um(). The backend no longer sleeps
+# at all, so the whole 0.25s now lives on the axis.
+PHIDGET_SETTLE_S = 0.25
+
+#: The Phidget piezo's scaling, from the original driver's um_per_volt.
+PHIDGET_UM_PER_VOLT = 20.0
 
 
 def generate_positions(start, stop, step):
@@ -218,6 +271,102 @@ def _check_within_limits(positions, limits, label, unit):
         )
 
 
+def _optional_number(body, key, cast=float):
+    """A numeric field's value, or None when the block does not declare it."""
+    match = _field(body, key, r'(\S+)')
+    if match is None:
+        return None
+    try:
+        return cast(match.group(1))
+    except ValueError:
+        # validate_blocks() has already rejected a non-numeric value with a
+        # message naming the block, so reaching here means compilation ran
+        # without validation. None keeps the default rather than crashing.
+        return None
+
+
+def _optional_text(body, key):
+    match = _field(body, key, r'(\S+)')
+    return match.group(1) if match else None
+
+
+def _optional_backend(body):
+    """A block's 'backend' line, with 'auto' normalised to None.
+
+    None is what pscan.daq treats as "detect it", so the explicit 'auto'
+    spelling and omitting the line entirely mean the same thing.
+    """
+    name = _optional_text(body, 'backend')
+    if name is None:
+        return None
+    name = name.lower()
+    return None if name == 'auto' else name
+
+
+def _d2a_positions(body, label):
+    """The coordinate list for a d2a block, from 'scan' or 'position'.
+
+    Shared by validation and compilation so the two cannot disagree about
+    what a block's grid is - which would show up as a scan that validated
+    cleanly and then ran a different number of points.
+    """
+    scan = _field(body, 'scan', r'(\S+)\s+(\S+)\s+(\S+)')
+    if scan is not None:
+        try:
+            start, stop, step = (float(v) for v in scan.groups())
+        except ValueError:
+            raise ValueError(
+                f"{label} scan values are not all numbers: "
+                f"{' '.join(scan.groups())}"
+            ) from None
+        return generate_positions(start, stop, step)
+
+    return [_require_number(body, 'position', label)]
+
+
+def _d2a_axis(body, label, present):
+    """Which virtual axis a d2a block claims, validated."""
+    if 'axis' not in present:
+        return DEFAULT_D2A_AXIS
+
+    axis = _require_number(body, 'axis', label, int)
+    low, high = D2A_AXIS_RANGE
+    if not low <= axis <= high:
+        raise ValueError(
+            f"{label} axis {axis} is out of range. An analog output axis must "
+            f"be {low}..{high}; axes {APT_AXES[0]} and {APT_AXES[1]} belong "
+            f"to the APT stage. Lower numbers are outer loops, so a galvo "
+            f"pair reads naturally as axis 98 (slow) and 99 (fast)."
+        )
+    return axis
+
+
+def _d2a_units(body, label, present):
+    """The ('volts'|'um', um_per_volt) a d2a block works in."""
+    if 'units' not in present:
+        return 'volts', None
+
+    units = _field(body, 'units', r'(\S+)').group(1).lower()
+    if units not in D2A_UNITS:
+        raise ValueError(
+            f"{label} units must be one of: {', '.join(D2A_UNITS)}, "
+            f"not '{units}'"
+        )
+
+    if units != 'um':
+        return units, None
+
+    um_per_volt = (
+        _require_number(body, 'um_per_volt', label)
+        if 'um_per_volt' in present else PHIDGET_UM_PER_VOLT
+    )
+    if um_per_volt <= 0:
+        raise ValueError(
+            f"{label} um_per_volt must be positive, not {um_per_volt}"
+        )
+    return units, um_per_volt
+
+
 def validate_blocks(all_blocks):
     """Check parsed blocks before any hardware is opened.
 
@@ -232,8 +381,20 @@ def validate_blocks(all_blocks):
         )
 
     warnings = []
-    seen_axes = {}
-    seen_piezo = False
+
+    # axis id -> the label of the block that claimed it. One map for the stage
+    # axes and the analog-output axes together, because they share a numbering
+    # space and main() iterates them in one nest: two blocks on one id would
+    # mean one of them silently never moving.
+    claimed_axes = {}
+
+    def claim_axis(axis, label):
+        if axis in claimed_axes:
+            raise ValueError(
+                f"axis {axis} is claimed by both {claimed_axes[axis]} and "
+                f"{label}. Give one of them a different 'axis' line."
+            )
+        claimed_axes[axis] = label
 
     for block in all_blocks:
         t = block['type']
@@ -286,14 +447,11 @@ def validate_blocks(all_blocks):
             if axis not in APT_AXES:
                 raise ValueError(
                     f"{label} axis {axis} is not a stage axis. Use axis 0 (X) "
-                    f"or 1 (Y); the piezo is 'action d2a_phidget' and lands on "
-                    f"axis {PIEZO_AXIS}."
+                    f"or 1 (Y); an analog output is 'action d2a' and takes an "
+                    f"axis in {D2A_AXIS_RANGE[0]}..{D2A_AXIS_RANGE[1]} "
+                    f"(default {DEFAULT_D2A_AXIS})."
                 )
-            if axis in seen_axes:
-                raise ValueError(
-                    f"axis {axis} is declared by more than one {label} block"
-                )
-            seen_axes[axis] = True
+            claim_axis(axis, label)
 
             scan = _field(body, 'scan', r'(\S+)\s+(\S+)\s+(\S+)')
             if scan is None:
@@ -320,30 +478,50 @@ def validate_blocks(all_blocks):
                 )
             _check_within_limits(positions, limits, f"{label} axis {axis}", 'mm')
 
-        elif t == 'd2a_phidget':
-            if seen_piezo:
-                raise ValueError(
-                    "more than one 'action d2a_phidget' block - "
-                    f"they would both land on axis {PIEZO_AXIS}"
-                )
-            seen_piezo = True
-
-            scan = _field(body, 'scan', r'(\S+)\s+(\S+)\s+(\S+)')
-            if scan is not None:
-                try:
-                    start, stop, step = (float(v) for v in scan.groups())
-                except ValueError:
-                    raise ValueError(
-                        f"{label} scan values are not all numbers: "
-                        f"{' '.join(scan.groups())}"
-                    ) from None
-                positions = generate_positions(start, stop, step)
+        elif t in ('d2a_phidget', 'd2a'):
+            if t == 'd2a_phidget':
+                # The legacy block has no axis, units or backend keys: it is
+                # the Phidget piezo in um on axis 99, by definition.
+                axis, unit = DEFAULT_D2A_AXIS, 'um'
             else:
-                positions = [_require_number(body, 'position', label)]
+                axis = _d2a_axis(body, label, present)
+                unit = _d2a_units(body, label, present)[0]
 
-            _check_within_limits(
-                positions, _parse_limits(body, label, 'um'), label, 'um'
-            )
+                if 'backend' in present:
+                    backend = _field(body, 'backend', r'(\S+)').group(1).lower()
+                    if backend not in DAQ_BACKENDS and backend != 'auto':
+                        raise ValueError(
+                            f"{label} backend '{backend}' is not known. Use "
+                            f"one of: auto, {', '.join(sorted(DAQ_BACKENDS))}"
+                        )
+
+                if 'channel' in present:
+                    channel = _require_number(body, 'channel', label, int)
+                    if channel < 0:
+                        raise ValueError(
+                            f"{label} channel cannot be negative"
+                        )
+
+                if 'settle' in present:
+                    settle = _require_number(body, 'settle', label)
+                    if settle < 0:
+                        raise ValueError(
+                            f"{label} settle cannot be negative, not {settle}"
+                        )
+
+            claim_axis(axis, label)
+
+            positions = _d2a_positions(body, label)
+            limits = _parse_limits(body, label, unit)
+            if limits is None:
+                warnings.append(
+                    f"{label} declares no 'limits <min> <max>', so its "
+                    f"{len(positions)} output level(s) are checked only "
+                    f"against what the card can physically produce. A piezo "
+                    f"or mirror with less travel than that will be driven "
+                    f"past it."
+                )
+            _check_within_limits(positions, limits, label, unit)
 
         elif t == 'scope':
             ip_match = _field(body, 'ip', r'(\S+)')
@@ -406,17 +584,61 @@ def validate_blocks(all_blocks):
                 rng = _require_number(body, 'range', label, int)
                 if rng < 0:
                     raise ValueError(f"{label} range cannot be negative")
-                # The driver asks the card for its own range list, so a high
+                # The backend asks the card for its own range list, so a high
                 # index may well be valid - validation runs before any
                 # hardware opens and cannot know. Warn rather than refuse,
-                # since the built-in fallback table only covers 0-3.
+                # since the comedi fallback table only covers 0-3.
                 if rng > 3:
                     warnings.append(
-                        f"{label} range {rng} is outside the built-in "
-                        f"fallback table (0=10V, 1=5V, 2=1V, 3=0.2V). It will "
-                        f"work if the card reports that range, but if the "
-                        f"query fails the conversion falls back to 10V."
+                        f"{label} range {rng} is outside the comedi fallback "
+                        f"table (0=10V, 1=5V, 2=1V, 3=0.2V). It will work if "
+                        f"the card reports that range; on comedi, if the "
+                        f"query fails the conversion falls back to 10V. "
+                        f"Prefer 'v_min'/'v_max' to say the volts you want "
+                        f"and let pscan pick the range on either backend."
                     )
+
+            # A range *index* means different things on different cards, which
+            # is exactly the portability trap this pairing avoids. Explicit
+            # volts resolve to the narrowest range that contains them, on
+            # comedi and DAQmx alike.
+            if present & {'v_min', 'v_max'}:
+                if 'range' in present:
+                    warnings.append(
+                        f"{label} declares both 'range' and 'v_min'/'v_max'; "
+                        f"the explicit volts win and 'range' is ignored."
+                    )
+                v_min = (_require_number(body, 'v_min', label)
+                         if 'v_min' in present else None)
+                v_max = (_require_number(body, 'v_max', label)
+                         if 'v_max' in present else None)
+                if v_min is not None and v_max is not None and v_max <= v_min:
+                    raise ValueError(
+                        f"{label} v_min {v_min:g} is not below v_max "
+                        f"{v_max:g}"
+                    )
+
+            if 'backend' in present:
+                backend = _field(body, 'backend', r'(\S+)').group(1).lower()
+                if backend not in DAQ_BACKENDS and backend != 'auto':
+                    raise ValueError(
+                        f"{label} backend '{backend}' is not known. Use one "
+                        f"of: auto, {', '.join(DAQ_BACKENDS)}"
+                    )
+                if backend == 'phidget':
+                    raise ValueError(
+                        f"{label} cannot use the phidget backend: the Phidget "
+                        f"analog board has outputs only and no analog input."
+                    )
+
+            if 'terminal' in present:
+                term = _field(body, 'terminal', r'(\S+)').group(1).lower()
+                if term not in DAQ_TERMINALS:
+                    raise ValueError(
+                        f"{label} terminal '{term}' is not one of: "
+                        f"{', '.join(DAQ_TERMINALS)}"
+                    )
+
             for key in ('sample_rate', 'n_samples'):
                 if key in present:
                     value = _require_number(body, key, label, int)
@@ -499,7 +721,7 @@ def categorize_pipeline(all_blocks):
     count_val = 1
 
     for i, block in enumerate(all_blocks):
-        if block['type'] in ['apt_stage', 'd2a_phidget']:
+        if block['type'] in AXIS_TYPES:
             stages.append(block)
             continue
         if block['type'] == 'count':
@@ -561,6 +783,24 @@ def compile_pipeline_list(raw_pipeline, a2d_counter):
             p['range'] = int(rg_m.group(1)) if rg_m else 0
             p['sample_rate'] = int(sr_m.group(1)) if sr_m else 10000
             p['n_samples'] = int(ns_m.group(1)) if ns_m else 100
+
+            # Which card, reached how. None on either means "work it out",
+            # which pscan.daq does by enumerating and refusing to guess if
+            # more than one card could serve the block.
+            p['backend'] = _optional_backend(body)
+            p['device'] = _optional_text(body, 'device')
+
+            # How the input is wired. 'rse' is what the comedi path did
+            # unconditionally before this key existed.
+            term_m = _field(body, 'terminal', r'(\S+)')
+            p['terminal'] = (term_m.group(1).lower() if term_m
+                             else DEFAULT_DAQ_TERMINAL)
+
+            # Explicit volts, resolved against whatever range list the card
+            # reports. Portable in a way a bare range index is not.
+            p['v_min'] = _optional_number(body, 'v_min')
+            p['v_max'] = _optional_number(body, 'v_max')
+
             p['legacy_index'] = a2d_counter[0]
             a2d_counter[0] += 1
 
@@ -631,32 +871,61 @@ def compile_stage_parameters(stages):
                     'start_pos': start
                 }
 
-        elif block['type'] == 'd2a_phidget':
-            scan_match = _field(
-                body, 'scan', r'([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)'
-            )
-            pos_match = _field(body, 'position', r'([\d\.\-]+)')
-            limits = _parse_limits(body, "'action d2a_phidget'", 'um')
-
-            if scan_match:
-                start = float(scan_match.group(1))
-                stop = float(scan_match.group(2))
-                step = float(scan_match.group(3))
-
-                # Using 99 as a virtual axis ID for the piezo
-                stage_params[PIEZO_AXIS] = {
-                    'type': 'piezo', # Tagged for main.py routing
-                    'positions': generate_positions(start, stop, step),
-                    'limits': limits,
-                    'start_pos': start
-                }
-            elif pos_match:
-                target = float(pos_match.group(1))
-                stage_params[PIEZO_AXIS] = {
-                    'type': 'piezo',
-                    'positions': [target],
-                    'limits': limits,
-                    'start_pos': target
-                }
+        elif block['type'] in ('d2a_phidget', 'd2a'):
+            axis, params = _compile_d2a_axis(block)
+            stage_params[axis] = params
 
     return stage_params
+
+
+def _compile_d2a_axis(block):
+    """Compile one analog-output block into an (axis_id, params) axis entry.
+
+    Both spellings land here. 'action d2a_phidget' is the original piezo
+    block and is compiled as a d2a axis with the Phidget backend pinned, um as
+    its unit and the piezo's 20 um/V - so an existing config scans exactly the
+    positions it always did, through exactly the same board.
+    """
+    body = block['body']
+    legacy = block['type'] == 'd2a_phidget'
+    label = f"'action {block['type']}'"
+    present = _block_keys(body)
+
+    if legacy:
+        axis = DEFAULT_D2A_AXIS
+        backend, device, channel = 'phidget', None, 0
+        units, um_per_volt = 'um', PHIDGET_UM_PER_VOLT
+        settle = PHIDGET_SETTLE_S
+        restore = False
+    else:
+        axis = _d2a_axis(body, label, present)
+        backend = _optional_backend(body)
+        device = _optional_text(body, 'device')
+        channel = _optional_number(body, 'channel', int)
+        channel = 0 if channel is None else channel
+        units, um_per_volt = _d2a_units(body, label, present)
+        settle = _optional_number(body, 'settle')
+        settle = DEFAULT_D2A_SETTLE_S if settle is None else settle
+        restore = _flag(body, 'restore')
+
+    unit = 'um' if units == 'um' else 'V'
+    positions = _d2a_positions(body, label)
+
+    return axis, {
+        # 'd2a' for every analog-output axis, whichever block declared it.
+        # main() routes on this, so the legacy 'piezo' tag is gone - nothing
+        # outside this module read it.
+        'type': 'd2a',
+        'positions': positions,
+        'limits': _parse_limits(body, label, unit),
+        'start_pos': positions[0],
+        'backend': backend,
+        'device': device,
+        'channel': channel,
+        'units': units,
+        'um_per_volt': um_per_volt,
+        'settle': settle,
+        'restore': restore,
+        'unit_label': unit,
+        'source': block['type'],
+    }

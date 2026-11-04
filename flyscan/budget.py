@@ -16,7 +16,7 @@ servo: it will do about 250 mm/s. But one ASOPS sweep takes 100 us, so at
 250 mm/s a single delay trace is smeared over 25 um of sample - far wider
 than a ~1 um optical spot, and useless. The governing limit is
 
-    smear per sweep = velocity / sweep_rate  <=  spot size
+    smear per sweep = velocity / delay_rate  <=  spot size
 
 which caps the velocity at ~10 mm/s for a 1 um spot, or ~5 mm/s for half-spot
 smear: a few percent of what the stage can do. Smear against spot size is
@@ -55,7 +55,7 @@ BYTES_PER_MB = 1.0e6
 # Conventional defaults for this instrument. Configurable because the offset
 # lock is a knob on the bench and the rep rate depends on the laser.
 DEFAULT_REP_RATE_HZ = 80.0e6
-DEFAULT_SWEEP_RATE_HZ = 10.0e3
+DEFAULT_DELAY_RATE_HZ = 10.0e3
 
 # Points per cycle used when asking "what is the highest Brillouin frequency
 # this sample rate can carry". Two is Nyquist and is honest only in the sense
@@ -129,23 +129,23 @@ class AsopsTiming:
     """
 
     rep_rate_hz: float = DEFAULT_REP_RATE_HZ
-    sweep_rate_hz: float = DEFAULT_SWEEP_RATE_HZ
+    delay_rate_hz: float = DEFAULT_DELAY_RATE_HZ
 
     def __post_init__(self):
         if self.rep_rate_hz <= 0:
             raise ValueError("rep_rate_hz must be positive")
-        if self.sweep_rate_hz <= 0:
-            raise ValueError("sweep_rate_hz must be positive")
-        if self.sweep_rate_hz >= self.rep_rate_hz:
+        if self.delay_rate_hz <= 0:
+            raise ValueError("delay_rate_hz must be positive")
+        if self.delay_rate_hz >= self.rep_rate_hz:
             raise ValueError(
-                "sweep_rate_hz must be far below rep_rate_hz for ASOPS "
-                f"(got {self.sweep_rate_hz:g} Hz offset on "
+                "delay_rate_hz must be far below rep_rate_hz for ASOPS "
+                f"(got {self.delay_rate_hz:g} Hz offset on "
                 f"{self.rep_rate_hz:g} Hz rep rate)")
 
     @property
     def stretch_factor(self) -> float:
         """Lab time per unit delay time. 8000 for 80 MHz / 10 kHz."""
-        return self.rep_rate_hz / self.sweep_rate_hz
+        return self.rep_rate_hz / self.delay_rate_hz
 
     @property
     def delay_window_s(self) -> float:
@@ -155,7 +155,7 @@ class AsopsTiming:
     @property
     def sweep_period_s(self) -> float:
         """Lab time taken to sweep the delay window once."""
-        return 1.0 / self.sweep_rate_hz
+        return 1.0 / self.delay_rate_hz
 
     @property
     def pulses_per_sweep(self) -> float:
@@ -173,7 +173,7 @@ class AsopsTiming:
 
     def samples_per_sweep(self, sample_rate_hz: float) -> float:
         """Digitiser samples in one whole ASOPS sweep."""
-        return sample_rate_hz / self.sweep_rate_hz
+        return sample_rate_hz / self.delay_rate_hz
 
     def delay_resolution_s(self, sample_rate_hz: float) -> float:
         """Delay step per digitiser sample, floored at the intrinsic step."""
@@ -228,7 +228,7 @@ class AsopsTiming:
     def describe(self) -> str:
         return "\n".join([
             f"  laser rep rate      {self.rep_rate_hz / 1e6:.6g} MHz",
-            f"  ASOPS sweep rate    {self.sweep_rate_hz / 1e3:.6g} kHz",
+            f"  ASOPS delay rate    {self.delay_rate_hz / 1e3:.6g} kHz",
             f"  stretch factor      {self.stretch_factor:.6g}",
             f"  delay window        {self.delay_window_s * 1e9:.6g} ns",
             f"  sweep period        {self.sweep_period_s * 1e6:.6g} us",
@@ -435,7 +435,7 @@ class Budget:
     # Echo of the inputs, so a Budget is self-describing in a log or a dump.
     mode: str
     rep_rate_hz: float
-    sweep_rate_hz: float
+    delay_rate_hz: float
     sample_rate_hz: float
     line_length_um: float
     velocity_mm_s: float
@@ -577,7 +577,7 @@ def compute_budget(
     sweeps_per_pixel = scan.pixel_pitch_um / smear_um
 
     line_duration_s = scan.line_length_um / velocity_um_s
-    sweeps_per_line = line_duration_s * timing.sweep_rate_hz
+    sweeps_per_line = line_duration_s * timing.delay_rate_hz
 
     window_real = acq.window_real_s(timing)
     window_lab = timing.lab_time(window_real)
@@ -608,7 +608,7 @@ def compute_budget(
     headroom_fraction = headroom_points / record_length
     # Longest line that still fits, at this velocity, rate and window.
     if acq.mode == "sequence":
-        per_um = (timing.sweep_rate_hz * points_per_segment) / velocity_um_s
+        per_um = (timing.delay_rate_hz * points_per_segment) / velocity_um_s
     else:
         per_um = fs / velocity_um_s
     max_line_length_um = record_length / per_um if per_um > 0 else math.inf
@@ -667,7 +667,7 @@ def compute_budget(
     budget = Budget(
         mode=acq.mode,
         rep_rate_hz=timing.rep_rate_hz,
-        sweep_rate_hz=timing.sweep_rate_hz,
+        delay_rate_hz=timing.delay_rate_hz,
         sample_rate_hz=fs,
         line_length_um=scan.line_length_um,
         velocity_mm_s=scan.velocity_mm_s,
@@ -1206,7 +1206,7 @@ def solve_for_pitch(
     # 2. Line duration and segment count.
     velocity_um_s = velocity * 1.0e3
     line_duration_s = request.line_length_um / velocity_um_s
-    n_segments = line_duration_s * timing.sweep_rate_hz
+    n_segments = line_duration_s * timing.delay_rate_hz
 
     # 3. Sample-rate ceilings. Points per segment scales with the rate, so a
     # memory budget divided by (segments * window_lab) is a rate ceiling.
@@ -1266,7 +1266,7 @@ def solve_for_pitch(
                 f"{request.points_per_cycle:g} points/cycle; taking the "
                 f"cheapest ladder rate that covers it keeps the record short "
                 f"(a line of up to "
-                f"{record_length / (timing.sweep_rate_hz * window_lab * chosen / velocity_um_s):,.0f}"
+                f"{record_length / (timing.delay_rate_hz * window_lab * chosen / velocity_um_s):,.0f}"
                 f" um would still fit).")
     else:
         chosen = (snap_sample_rate_down(ceiling)
@@ -1315,7 +1315,7 @@ def _fix_suggestions(request, timing, acq, scope, velocity, required,
     """Concrete ways out when the target frequency does not fit."""
     out = []
     velocity_um_s = velocity * 1.0e3
-    per_um = timing.sweep_rate_hz * window_lab * required / velocity_um_s
+    per_um = timing.delay_rate_hz * window_lab * required / velocity_um_s
     out.append(
         f"  fix: shorten the line to {record_length / per_um:,.1f} um (from "
         f"{request.line_length_um:,.1f} um) and the target fits in the "
@@ -1368,7 +1368,7 @@ def format_budget(budget: Budget, include_assumptions: bool = True) -> str:
     add("Spatial smear (the binding constraint on this stage)")
     add(f"  velocity                 {b.velocity_mm_s:.4g} mm/s")
     add(f"  smear per sweep          {b.smear_per_sweep_um:.4g} um "
-        f"= velocity / sweep rate")
+        f"= velocity / delay rate")
     add(f"  optical spot             {b.spot_size_um:.4g} um")
     add(f"  smear / spot             {b.smear_fraction_of_spot:.3f} "
         f"-> {'OK' if b.smear_ok else 'TOO FAST'} "
@@ -1378,7 +1378,7 @@ def format_budget(budget: Budget, include_assumptions: bool = True) -> str:
     add("")
     add("ASOPS timing")
     add(f"  rep rate                 {b.rep_rate_hz / 1e6:.6g} MHz")
-    add(f"  sweep rate (offset)      {b.sweep_rate_hz / 1e3:.6g} kHz "
+    add(f"  delay rate (offset)      {b.delay_rate_hz / 1e3:.6g} kHz "
         f"- also the scope trigger")
     add(f"  stretch factor           {b.stretch_factor:.6g}")
     add(f"  delay window             {_fmt_time(b.delay_window_s)} of delay "
@@ -1575,9 +1575,9 @@ def _add_common_args(parser):
                              "(default); flat: one continuous record")
     parser.add_argument("--rep-rate", type=float, default=DEFAULT_REP_RATE_HZ,
                         help="laser repetition rate in Hz (default 80e6)")
-    parser.add_argument("--sweep-rate", type=float,
-                        default=DEFAULT_SWEEP_RATE_HZ,
-                        help="ASOPS sweep rate / laser offset / scope trigger "
+    parser.add_argument("--delay-rate", type=float,
+                        default=DEFAULT_DELAY_RATE_HZ,
+                        help="ASOPS delay rate / laser offset / scope trigger "
                              "rate in Hz (default 10e3)")
     parser.add_argument("--line", type=float, default=500.0,
                         dest="line_length_um",
@@ -1662,7 +1662,7 @@ def _add_common_args(parser):
 
 def _configs_from_args(args):
     timing = AsopsTiming(rep_rate_hz=args.rep_rate,
-                         sweep_rate_hz=args.sweep_rate)
+                         delay_rate_hz=args.delay_rate)
     scope = ScopeConfig(
         record_length=args.record_length,
         max_sample_rate_hz=args.max_sample_rate,

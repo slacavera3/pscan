@@ -53,6 +53,15 @@ def report(config, slow_step_s=DEFAULT_SLOW_STEP_S):
         f"  native sampling {plan.native_pitch_um:.3f} um along the fast "
         f"axis, {plan.slow_pitch_mm * 1000.0:.3f} um between lines"
     )
+    stretch = plan.rep_rate_hz / plan.delay_rate_hz
+    out.append(
+        f"  {plan.rep_rate_hz / 1e6:.6g} MHz laser / "
+        f"{plan.delay_rate_hz / 1e3:.6g} kHz delay rate = "
+        f"{stretch:.6g}x stretch: "
+        f"{plan.segment_seconds / stretch * 1e9:.3f} ns of delay per segment "
+        f"out of a {1e9 / plan.rep_rate_hz:.3f} ns window, "
+        f"{1e12 / (plan.sample_rate_hz * stretch):.3f} ps per sample"
+    )
     if plan.bin_um is not None:
         out.append(
             f"  binned to {plan.bin_um * 1000:.0f} nm steps: "

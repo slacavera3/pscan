@@ -254,7 +254,7 @@ class FlyscanWriter:
             "created_unix": time.time(),
             "program": "flyscan",
             "rep_rate_hz": timing.rep_rate_hz,
-            "sweep_rate_hz": timing.sweep_rate_hz,
+            "delay_rate_hz": timing.delay_rate_hz,
             "stretch_factor": timing.stretch_factor,
             "delay_window_s": timing.delay_window_s,
             "intrinsic_delay_resolution_s": timing.intrinsic_delay_resolution_s,
@@ -318,7 +318,7 @@ class FlyscanWriter:
             "velocity_mm_s": float(velocity_mm_s),
             "x_start_um": float(x_start_um),
             "sample_rate_hz": float(sample_rate_hz),
-            "sweep_rate_hz": self.timing.sweep_rate_hz,
+            "delay_rate_hz": self.timing.delay_rate_hz,
             "rep_rate_hz": self.timing.rep_rate_hz,
             "stretch_factor": self.timing.stretch_factor,
             "mode": mode,
@@ -533,9 +533,13 @@ class _ReaderBase:
 
     def timing(self) -> AsopsTiming:
         attrs = self.root_attrs()
+        # 'sweep_rate_hz' is what files written before the rename carry; it
+        # is the same number under the old name, so read either.
+        delay_rate = attrs.get("delay_rate_hz", attrs.get("sweep_rate_hz",
+                                                          10.0e3))
         return AsopsTiming(
             rep_rate_hz=float(attrs.get("rep_rate_hz", 80.0e6)),
-            sweep_rate_hz=float(attrs.get("sweep_rate_hz", 10.0e3)))
+            delay_rate_hz=float(delay_rate))
 
     # --- per line ---------------------------------------------------------
 

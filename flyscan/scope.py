@@ -1,6 +1,6 @@
 """One raster line per oscilloscope acquisition, in Sequence mode.
 
-Each segment is one ASOPS delay sweep, triggered by the 10 kHz sweep clock
+Each segment is one ASOPS delay sweep, triggered by the 10 kHz delay clock
 the rig already provides. So segments arrive pre-aligned in delay - there is
 no peak finding needed to cut the record up - and a whole line comes back in
 a single transfer rather than one round trip per pixel. Getting Python out of
@@ -60,7 +60,7 @@ class FlyScope:
         self.segments = None
         self.points_per_segment = None
         self.sample_rate = None
-        self.sweep_rate = None
+        self.delay_rate = None
         self._expected_interval = None
 
     # ------------------------------------------------------------ session
@@ -95,28 +95,30 @@ class FlyScope:
     # ------------------------------------------------------------- config
 
     def configure_line(self, segments, segment_seconds, sample_rate,
-                       sweep_rate):
+                       delay_rate):
         """Set up one line: `segments` sweeps of `segment_seconds` each.
 
-        segment_seconds is how much of each 12.5 ns delay window to keep,
-        expressed in lab time - the ASOPS stretch means a few ns of real
-        delay is tens of microseconds here. Capturing less than the full
-        100 us sweep is where most of the data saving comes from.
+        segment_seconds is how much of each delay window to keep, expressed
+        in lab time - the ASOPS stretch means a few ns of real delay is tens
+        of microseconds here. The window is one laser period, so 12.5 ns on
+        an 80 MHz bench and 10 ns on a 100 MHz one; the scope is told lab
+        seconds either way and does not need to know which. Capturing less
+        than the full sweep is where most of the data saving comes from.
 
-        sweep_rate is the ASOPS sweep clock in Hz, used only to size the
+        delay_rate is the ASOPS delay clock in Hz, used only to size the
         timeout, since that is what sets how long a line takes to fill.
         """
         if self.instr is None:
             raise RuntimeError("Scope not connected. Call connect() first.")
         if segments < 1:
             raise ValueError(f"segments must be at least 1, not {segments}")
-        if segment_seconds <= 0 or sample_rate <= 0 or sweep_rate <= 0:
-            raise ValueError("segment_seconds, sample_rate and sweep_rate "
+        if segment_seconds <= 0 or sample_rate <= 0 or delay_rate <= 0:
+            raise ValueError("segment_seconds, sample_rate and delay_rate "
                              "must all be positive")
 
         self.segments = segments
         self.sample_rate = sample_rate
-        self.sweep_rate = sweep_rate
+        self.delay_rate = delay_rate
         self.points_per_segment = max(1, int(round(segment_seconds * sample_rate)))
         self._expected_interval = 1.0 / sample_rate
 
@@ -175,7 +177,7 @@ class FlyScope:
             'timeout_s': self.instr.timeout,
         }
 
-    def configure_flat_line(self, line_seconds, sample_rate, sweep_rate):
+    def configure_flat_line(self, line_seconds, sample_rate, delay_rate):
         """Capture a whole line as ONE real-time record, Sequence mode off.
 
         The diagnostic counterpart to configure_line(): it keeps every
@@ -188,13 +190,13 @@ class FlyScope:
         """
         if self.instr is None:
             raise RuntimeError("Scope not connected. Call connect() first.")
-        if line_seconds <= 0 or sample_rate <= 0 or sweep_rate <= 0:
-            raise ValueError("line_seconds, sample_rate and sweep_rate must "
+        if line_seconds <= 0 or sample_rate <= 0 or delay_rate <= 0:
+            raise ValueError("line_seconds, sample_rate and delay_rate must "
                              "all be positive")
 
         self.segments = 1
         self.sample_rate = sample_rate
-        self.sweep_rate = sweep_rate
+        self.delay_rate = delay_rate
         self.points_per_segment = max(1, int(round(line_seconds * sample_rate)))
         self._expected_interval = 1.0 / sample_rate
 
@@ -252,7 +254,7 @@ class FlyScope:
         real channel list is known, since three channels move three times
         the bytes.
         """
-        fill_s = self.segments / self.sweep_rate
+        fill_s = self.segments / self.delay_rate
 
         if channels is None:
             payload_points = self.segments * self.points_per_segment
@@ -378,7 +380,7 @@ class FlyScope:
         `on_armed` is where the stage move goes: it is called once the scope
         is armed and before the wait, which is the only window in which
         starting the move does not either miss triggers or deadlock.
-        Omitting it is useful on the bench, where the sweep clock alone will
+        Omitting it is useful on the bench, where the delay clock alone will
         fill the segments.
         """
         self.arm_line()
@@ -410,6 +412,6 @@ class FlyScope:
             'per_channel_points': per_channel,
             'total_points': total_points,
             'megabytes': megabytes,
-            'fill_s': self.segments / self.sweep_rate,
+            'fill_s': self.segments / self.delay_rate,
             'estimated_transfer_s': megabytes / max(self.transfer_mb_s, 0.1),
         }

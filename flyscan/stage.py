@@ -299,7 +299,7 @@ class FlyStage(ThorlabsStage):
         """Run one line: arm the scope, release the stage, collect.
 
         `plan` is what prepare_line() returned. The ordering is the whole
-        point - the scope is armed first because the ASOPS sweep clock runs
+        point - the scope is armed first because the ASOPS delay clock runs
         continuously and segments start filling immediately, then the stage
         is released with one short write, so the gap between the two is as
         small and as repeatable as it can be made.

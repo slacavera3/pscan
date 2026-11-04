@@ -13,7 +13,7 @@ set -euo pipefail
 
 VENV_DIR="${PSCAN_DEV_HOME:-$HOME/.local/share/pscan-dev}/venv"
 BIN_DIR="$HOME/.local/bin"
-COMMANDS=(pscan-dev pystage-dev pypiezo-dev flyscan-dev)
+COMMANDS=(pscan-dev pystage-dev pypiezo-dev pydaq-dev flyscan-dev)
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -62,6 +62,22 @@ else
     echo " -> The Tucsen camera will not work until install.sh has been run."
 fi
 
+# NI-DAQmx is the only way to reach an NI X Series card - comedi's ni_pcimio
+# driver covers the E and M series and no X Series board, so a PCIe-6351 is
+# invisible to it. Not installed here: the driver is a large system package
+# with kernel modules, which is the user's call, not an installer's.
+if ldconfig -p 2>/dev/null | grep -q libnidaqmx; then
+    echo " -> libnidaqmx found (NI-DAQmx driver installed)."
+    NEED_DAQMX_PY=1
+else
+    echo " -> [INFO] libnidaqmx not found. Only needed for NI X Series cards"
+    echo " ->        (PCIe-635x/636x, e.g. the PCIe-6351); comedi cards are"
+    echo " ->        unaffected. To install:"
+    echo " ->          https://www.ni.com/en/support/documentation/supplemental/18/downloading-and-installing-ni-driver-software-on-linux-desktop.html"
+    echo " ->          sudo apt install ni-daqmx && sudo dkms autoinstall"
+    NEED_DAQMX_PY=0
+fi
+
 # --- 3. Build a clean virtualenv ---
 # --clear rather than a reuse-if-present check: a stale venv carrying a
 # half-removed earlier build is the failure mode worth spending 20 seconds to
@@ -78,7 +94,16 @@ python3 -m venv --clear "$VENV_DIR"
 
 # --- 4. Install this branch into it ---
 echo -e "\n[4/5] Installing the experimental build (this pulls its own deps)..."
-"$VENV_DIR/bin/python" -m pip install --no-cache-dir "$REPO_DIR"
+# The daqmx extra is added only when the system driver is actually present.
+# The nidaqmx Python package is useless without it, and installing it anyway
+# would make 'pydaq-dev list' report the backend as available right up to the
+# point it fails to open anything.
+if [ "${NEED_DAQMX_PY:-0}" -eq 1 ]; then
+    echo " -> NI-DAQmx driver present: including the [daqmx] extra."
+    "$VENV_DIR/bin/python" -m pip install --no-cache-dir "$REPO_DIR[daqmx]"
+else
+    "$VENV_DIR/bin/python" -m pip install --no-cache-dir "$REPO_DIR"
+fi
 
 # --- 5. Expose the -dev commands on PATH ---
 # Symlinks, not copies, so a re-run of step 4 is picked up without reinstalling
@@ -107,8 +132,12 @@ esac
 
 if [ "$PATH_OK" -eq 1 ]; then
     echo -e "\n======================================================="
-    echo " DONE! Run 'pscan-dev' | 'pystage-dev' | 'pypiezo-dev' | 'flyscan-dev'."
+    echo " DONE! Run 'pscan-dev' | 'pystage-dev' | 'pypiezo-dev' |"
+    echo "       'pydaq-dev' | 'flyscan-dev'."
     echo " The stable 'pscan' command is untouched."
+    echo ""
+    echo " Start with 'pydaq-dev list' to see which DAQ cards pscan can"
+    echo " reach and under which backend."
     echo "======================================================="
 else
     echo -e "\n======================================================="

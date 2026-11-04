@@ -103,9 +103,12 @@ class RasterPlan:
     def __init__(self, fast_axis, slow_axis, fast_start_mm, fast_stop_mm,
                  velocity_mm_s, slow_start_mm, slow_stop_mm, lines,
                  counts_per_mm, sample_rate_hz,
-                 sweep_rate_hz=10e3, segment_seconds=50e-6, runup_mm=0.05,
+                 delay_rate_hz=10e3, rep_rate_hz=None,
+                 segment_seconds=50e-6, runup_mm=0.05,
                  bidirectional=True, fast_limits_mm=None, bin_um=None,
                  acceleration_mm_s2=None):
+        from flyscan.budget import DEFAULT_REP_RATE_HZ
+
         self.fast_axis = fast_axis
         self.slow_axis = slow_axis
         self.fast_start_mm = float(fast_start_mm)
@@ -116,7 +119,13 @@ class RasterPlan:
         self.velocity_mm_s = float(velocity_mm_s)
         self.counts_per_mm = float(counts_per_mm)
         self.sample_rate_hz = float(sample_rate_hz)
-        self.sweep_rate_hz = float(sweep_rate_hz)
+        self.delay_rate_hz = float(delay_rate_hz)
+        # Carried rather than used: nothing about the geometry or the scope
+        # setup depends on the rep rate. It rides along so that the file this
+        # plan writes records the laser it was taken on, which is what the
+        # delay axis is reconstructed from later.
+        self.rep_rate_hz = float(DEFAULT_REP_RATE_HZ if rep_rate_hz is None
+                                 else rep_rate_hz)
         self.segment_seconds = float(segment_seconds)
         self.runup_mm = float(runup_mm)
         self.bidirectional = bool(bidirectional)
@@ -140,7 +149,7 @@ class RasterPlan:
         Also the smear within a single sweep, which is why it is the one
         number the optics constrain.
         """
-        return self.velocity_mm_s * 1000.0 / self.sweep_rate_hz
+        return self.velocity_mm_s * 1000.0 / self.delay_rate_hz
 
     # Kept under its old name because the smear interpretation is the one
     # the optical ceiling is phrased in.
@@ -150,7 +159,7 @@ class RasterPlan:
     def segments(self):
         """Copeaks per line, which is the scope's segment count.
 
-        Derived from velocity rather than chosen: the sweep clock decides
+        Derived from velocity rather than chosen: the delay clock decides
         how many samples fit in the line.
         """
         return _floor_with_slack(
@@ -160,7 +169,7 @@ class RasterPlan:
     @property
     def dwell_s(self):
         """Time per native sample - one ASOPS period, by construction."""
-        return 1.0 / self.sweep_rate_hz
+        return 1.0 / self.delay_rate_hz
 
     @property
     def copeaks_per_bin(self):
@@ -280,8 +289,13 @@ class RasterPlan:
             )
         if self.fast_span_mm == 0:
             raise ValueError("fast axis start and stop are the same position")
-        if self.sample_rate_hz <= 0 or self.sweep_rate_hz <= 0:
-            raise ValueError("sample rate and sweep rate must be positive")
+        if self.sample_rate_hz <= 0 or self.delay_rate_hz <= 0:
+            raise ValueError("sample rate and delay rate must be positive")
+        if self.rep_rate_hz <= self.delay_rate_hz:
+            raise ValueError(
+                f"rep rate {self.rep_rate_hz:g} Hz must be far above the "
+                f"delay rate {self.delay_rate_hz:g} Hz for ASOPS"
+            )
         if self.runup_mm < 0:
             raise ValueError("runup cannot be negative")
         if self.fast_axis == self.slow_axis:
@@ -289,7 +303,7 @@ class RasterPlan:
                 f"fast and slow axis are both '{self.fast_axis}'"
             )
 
-        sweep_period = 1.0 / self.sweep_rate_hz
+        sweep_period = 1.0 / self.delay_rate_hz
         if self.segment_seconds > sweep_period:
             raise ValueError(
                 f"segment window {self.segment_seconds * 1e6:.1f} us exceeds "
@@ -319,7 +333,7 @@ class RasterPlan:
         # The one hard optical limit: past half a spot per sweep, the data
         # is smeared rather than merely coarse, and binning cannot undo it.
         if spot_um is not None and self.native_pitch_um > spot_um / 2.0:
-            ceiling = spot_um / 2.0 * self.sweep_rate_hz / 1000.0
+            ceiling = spot_um / 2.0 * self.delay_rate_hz / 1000.0
             warnings.append(
                 f"one sweep covers {self.native_pitch_um:.3f} um against a "
                 f"{spot_um:.2f} um spot - more than half a resolution "
@@ -401,7 +415,7 @@ class RasterScan:
             segments=plan.segments,
             segment_seconds=plan.segment_seconds,
             sample_rate=plan.sample_rate_hz,
-            sweep_rate=plan.sweep_rate_hz,
+            delay_rate=plan.delay_rate_hz,
         )
 
         started = time.perf_counter()
@@ -603,7 +617,8 @@ def build_writer(path, plan, overwrite=False, notes=""):
 
     return FlyscanWriter(
         path,
-        timing=AsopsTiming(sweep_rate_hz=plan.sweep_rate_hz),
+        timing=AsopsTiming(delay_rate_hz=plan.delay_rate_hz,
+                           rep_rate_hz=plan.rep_rate_hz),
         overwrite=overwrite,
         notes=notes,
         extra_attrs={

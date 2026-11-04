@@ -223,10 +223,10 @@ class TrigtimeStats:
     spacing_min_s: float = float("nan")
     spacing_max_s: float = float("nan")
     fitted_spacing_s: float = float("nan")
-    implied_sweep_rate_hz: float = float("nan")
-    nominal_sweep_rate_hz: float = float("nan")
-    sweep_rate_error_hz: float = float("nan")
-    sweep_rate_error_ppm: float = float("nan")
+    implied_delay_rate_hz: float = float("nan")
+    nominal_delay_rate_hz: float = float("nan")
+    delay_rate_error_hz: float = float("nan")
+    delay_rate_error_ppm: float = float("nan")
     jitter_rms_s: float = float("nan")
     jitter_rms_delay_s: float = float("nan")
     jitter_frac_of_sweep: float = float("nan")
@@ -263,7 +263,7 @@ def analyse_trigtime(trigtime, timing: AsopsTiming = AsopsTiming(),
 
     stats = TrigtimeStats()
     stats.n_segments = int(times.size)
-    stats.nominal_sweep_rate_hz = timing.sweep_rate_hz
+    stats.nominal_delay_rate_hz = timing.delay_rate_hz
     stats.offset_mean_s = float(np.mean(offsets)) if offsets.size else float("nan")
     stats.offset_spread_s = (float(np.max(offsets) - np.min(offsets))
                              if offsets.size else float("nan"))
@@ -290,11 +290,11 @@ def analyse_trigtime(trigtime, timing: AsopsTiming = AsopsTiming(),
         stats.last_sweep_index = int(np.max(fit.index[inlier]))
 
     if math.isfinite(stats.spacing_mean_s) and stats.spacing_mean_s > 0:
-        stats.implied_sweep_rate_hz = 1.0 / stats.spacing_mean_s
-        stats.sweep_rate_error_hz = (
-            stats.implied_sweep_rate_hz - timing.sweep_rate_hz)
-        stats.sweep_rate_error_ppm = (
-            1e6 * stats.sweep_rate_error_hz / timing.sweep_rate_hz)
+        stats.implied_delay_rate_hz = 1.0 / stats.spacing_mean_s
+        stats.delay_rate_error_hz = (
+            stats.implied_delay_rate_hz - timing.delay_rate_hz)
+        stats.delay_rate_error_ppm = (
+            1e6 * stats.delay_rate_error_hz / timing.delay_rate_hz)
     if math.isfinite(fit.residual_rms):
         stats.jitter_rms_s = fit.residual_rms
         stats.jitter_rms_delay_s = fit.residual_rms / timing.stretch_factor
@@ -314,15 +314,15 @@ def analyse_trigtime(trigtime, timing: AsopsTiming = AsopsTiming(),
             f"lattice, at segment index {stats.extra_segment_indices}. Their "
             f"capture window does not sit on a coincidence, so they are "
             f"dropped rather than averaged in.")
-    if abs(stats.sweep_rate_error_ppm) > 1000.0:
+    if abs(stats.delay_rate_error_ppm) > 1000.0:
         stats.warnings.append(
-            f"Measured trigger rate {stats.implied_sweep_rate_hz:,.4f} Hz is "
-            f"{stats.sweep_rate_error_ppm:,.0f} ppm from the nominal "
-            f"{timing.sweep_rate_hz:,.1f} Hz. Either the offset lock has "
+            f"Measured trigger rate {stats.implied_delay_rate_hz:,.4f} Hz is "
+            f"{stats.delay_rate_error_ppm:,.0f} ppm from the nominal "
+            f"{timing.delay_rate_hz:,.1f} Hz. Either the offset lock has "
             f"moved or the scope timebase is not what it claims; both "
             f"rescale the delay axis, since delay = lab time / stretch.")
     if (math.isfinite(stats.offset_spread_s)
-            and stats.offset_spread_s > 0.5 / max(timing.sweep_rate_hz, 1.0)):
+            and stats.offset_spread_s > 0.5 / max(timing.delay_rate_hz, 1.0)):
         stats.warnings.append(
             "TRIGTIME offsets vary by more than half a sweep period, which is "
             "not a sample-clock phase. Check the TRIGTIME column convention "
@@ -560,7 +560,7 @@ def _block_baseline(x: np.ndarray, block: int) -> np.ndarray:
     """Slow baseline as a per-block median, linearly interpolated.
 
     A true rolling median over a million samples is not worth the time; one
-    median per sweep tracks any drift well below the sweep rate, which is the
+    median per sweep tracks any drift well below the delay rate, which is the
     only drift that matters. The copeak occupies a handful of samples in a
     block of hundreds, so it cannot pull the median.
     """
@@ -604,7 +604,7 @@ def find_flat_peaks(signal, sample_rate_hz: float,
         raise ValueError("record too short to contain a sweep")
 
     warnings = []
-    expected = sample_rate_hz / timing.sweep_rate_hz
+    expected = sample_rate_hz / timing.delay_rate_hz
     block = int(round(expected / max(config.baseline_blocks_per_sweep, 1e-9)))
     detrended = signal - _block_baseline(signal, block)
 
@@ -2240,9 +2240,9 @@ def format_trigtime_stats(s: TrigtimeStats) -> str:
         f"std {s.spacing_std_s * 1e9:.4g} ns)",
         f"  min / max spacing        {s.spacing_min_s * 1e6:.6f} / "
         f"{s.spacing_max_s * 1e6:.6f} us",
-        f"  implied sweep rate       {s.implied_sweep_rate_hz:,.4f} Hz "
-        f"(nominal {s.nominal_sweep_rate_hz:,.1f}, "
-        f"error {s.sweep_rate_error_ppm:,.1f} ppm)",
+        f"  implied delay rate       {s.implied_delay_rate_hz:,.4f} Hz "
+        f"(nominal {s.nominal_delay_rate_hz:,.1f}, "
+        f"error {s.delay_rate_error_ppm:,.1f} ppm)",
         f"  trigger jitter           {s.jitter_rms_s * 1e9:.3f} ns rms "
         f"= {s.jitter_rms_delay_s * 1e15:.2f} fs of delay",
         f"  missed / extra triggers  {s.n_missed_triggers} / "

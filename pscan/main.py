@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import glob
 import time
@@ -9,23 +9,26 @@ import shutil
 from pscan.tucsen_driver import TucsenCamera
 import queue
 import threading
-from pscan.d2aphidget_driver import D2APhidgetDriver
 
-# Stage settling. The encoder is the authority: wait_for_move() polls the
-# position counter until the axis is inside SETTLE_TOLERANCE_MM, then naps
-# SETTLE_DWELL_S for mechanical ringdown. This replaces a blind 0.2s sleep
-# that was too short for the fast axis returning to the start of the next
-# row, which meant the first point of every row after the first was acquired
-# while the stage was still moving.
-SETTLE_TOLERANCE_MM = 0.001
-SETTLE_DWELL_S = 0.02
-SETTLE_TIMEOUT_S = 15.0
+# Stage settling (SETTLE_TOLERANCE_MM, SETTLE_DWELL_S, SETTLE_TIMEOUT_S) now
+# lives in pscan/scan_axes.py beside the axis that uses it, and is re-exported
+# through this module's imports so anything that read it from here still can.
+# The encoder is the authority: wait_for_move() polls the position counter
+# until the axis is inside the tolerance, then naps for mechanical ringdown.
+# That replaced a blind 0.2s sleep which was too short for the fast axis
+# returning to the start of the next row, so the first point of every row
+# after the first was acquired while the stage was still moving.
 
 # Extra time at the very first coordinate, for everything to stabilise.
 INITIAL_SETTLE_S = 1.5
 
-# The Phidget analog output is open-loop, so there is no position to poll.
-PIEZO_SETTLE_S = 0.20
+# An analog output is open-loop, so there is no position to poll and arrival
+# is a declared settle time. That time now lives on the axis itself, set by
+# the 'settle' key in an 'action d2a' block - a galvo mirror and a piezo do
+# not settle alike, and the old single constant here could not tell them
+# apart. 'action d2a_phidget' defaults to PHIDGET_SETTLE_S in config_parser,
+# which is this constant plus the 0.05s the Phidget driver used to sleep
+# internally, so an existing piezo config waits exactly as long as it did.
 
 # Paid once when the USB capture opens, not at every coordinate.
 WEBCAM_WARMUP_S = 0.5
@@ -85,11 +88,16 @@ writer_thread.start()
 from pscan.config_parser import (
     parse_flat_con_file, categorize_pipeline,
     compile_pipeline_list, compile_stage_parameters,
-    validate_blocks, CORE_TYPES
+    validate_blocks, CORE_TYPES, APT_AXES, PIEZO_AXIS
 )
 from pscan.lecroy_driver import LeCroyScope
-from pscan.a2d_driver import NIDriver
 from pscan.stage_driver import ThorlabsStage
+from pscan import daq
+from pscan.scan_axes import (
+    AxisCommandFailed, PendingSettle, axis_display, axis_grid_size,
+    build_axes, format_position_line, walk_axes,
+    SETTLE_DWELL_S, SETTLE_TIMEOUT_S, SETTLE_TOLERANCE_MM,
+)
 
 # OS-Specific Andor Import
 try:
@@ -101,9 +109,15 @@ try:
 except ImportError:
     ANDOR_AVAILABLE = False
 
-def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
-                          total_a2d_blocks, global_total_traces, 
+def run_pipeline_sequence(pipeline, scope, ixon, tucsen, base_filename,
+                          total_a2d_blocks, global_total_traces,
                           call_state, silent_acq=False, timer_mode=False):
+    """Run one pass of a pipeline.
+
+    The a2d session is no longer passed in: each 'action a2d' block carries
+    its own, resolved by open_a2d_sessions() before the scan starts, because
+    two a2d blocks may now sit on two different cards.
+    """
     is_first = (call_state['current_trace_idx'] == 0)
     
     for step_idx, action in enumerate(pipeline):
@@ -171,28 +185,39 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, tucsen, base_filename,
                 note_dropped_trace(call_state, 'scope')
 
         elif act_type == 'a2d':
+            session = p.get('session')
+            if session is None:
+                raise AcquisitionAborted(
+                    "An 'action a2d' block has no DAQ session. This means "
+                    "open_a2d_sessions() did not run, which should be "
+                    "impossible in a real scan."
+                )
+
             idx_num = p['legacy_index']
             output_name = (
                 f"{base_filename}_"
                 f"a2d{idx_num}_{total_a2d_blocks}f.d"
             )
-            ok = ni_daq.acquire_a2d(
+            ok = session.acquire_a2d(
                 channel=p['channel'], range_val=p['range'],
                 n_samples=p['n_samples'], sample_rate=p['sample_rate'],
-                output_filename=output_name, is_first_trace=is_first
+                output_filename=output_name, is_first_trace=is_first,
+                v_min=p.get('v_min'), v_max=p.get('v_max'),
+                terminal=p.get('terminal', daq.DEFAULT_TERMINAL),
             )
 
-            # Same hazard as the scope: a DMA timeout returns False and writes
-            # nothing, shifting every subsequent trace in the file.
+            # Same hazard as the scope: a read timeout returns False and
+            # writes nothing, shifting every subsequent trace in the file.
             if ok:
                 call_state['consecutive_drops'] = 0
             else:
                 if is_first:
                     raise AcquisitionAborted(
-                        "The first A2D trace failed. Check the NI card and "
-                        "re-run."
+                        f"The first A2D trace failed on "
+                        f"{session.describe().summary()}. Check the card and "
+                        f"re-run."
                     )
-                ni_daq.write_placeholder_trace(output_name, p['n_samples'])
+                session.write_placeholder_trace(output_name, p['n_samples'])
                 note_dropped_trace(call_state, 'a2d')
 
         elif act_type == 'ixon' and ixon:
@@ -249,6 +274,35 @@ def run_pipeline_sequence(pipeline, scope, ni_daq, ixon, tucsen, base_filename,
             t_mod_end = time.perf_counter()
             print(f"      [Timer] {act_type.upper()} module : {t_mod_end - t_mod_start:.4f}s")
 
+def open_a2d_sessions(pipelines, announce=True):
+    """Resolve and open the DAQ card each 'action a2d' block will read from.
+
+    Done once, before anything moves, and the session is stashed on the
+    block's own params. Two a2d blocks can now name two different cards, so
+    there is no single "the" DAQ handle any more - and pscan.daq caches
+    sessions per card, so several blocks on one card still open it once.
+
+    Opening here rather than lazily at the first trace matters: a card that is
+    missing, or a config ambiguous about which of two cards it means, should
+    stop the run before the sample has been moved anywhere.
+    """
+    blocks = [a for a in pipelines if a['type'] == 'a2d']
+    if not blocks:
+        return
+
+    print("\nConnecting to A2D hardware...")
+    for action in blocks:
+        p = action['params']
+        p['session'] = daq.open_device(
+            backend=p.get('backend'),
+            address=p.get('device'),
+            need_ai=True,
+            role='a2d',
+            announce=announce,
+        )
+
+
+
 def describe_action(action):
     """One line summarising what an action will actually do."""
     t = action['type']
@@ -258,8 +312,16 @@ def describe_action(action):
         line = f"scope    {', '.join(p['channels'])} @ {p['ip']}"
         return line + (f"  (sweeps {p['sweeps']})" if p.get('sweeps') else "  (sweeps: scope default)")
     if t == 'a2d':
-        return (f"a2d      ch{p['channel']}, range {p['range']}, "
-                f"{p['n_samples']} samples @ {p['sample_rate']} Hz")
+        card = p.get('backend') or 'auto'
+        if p.get('device'):
+            card += f" {p['device']}"
+        if p.get('v_min') is not None or p.get('v_max') is not None:
+            span = f"{p.get('v_min')}..{p.get('v_max')} V"
+        else:
+            span = f"range {p['range']}"
+        return (f"a2d      ch{p['channel']}, {span}, {p['n_samples']} samples "
+                f"@ {p['sample_rate']} Hz, {p.get('terminal', 'rse')}, "
+                f"on {card}")
     if t == 'delay':
         return f"delay    {p['seconds']}s"
     if t == 'script':
@@ -382,8 +444,8 @@ def record_camera_frame(call_state, kind, frame):
 
 def print_dry_run(con_filepath, base_filename, setup_pipeline,
                   acquisition_pipeline, teardown_pipeline, stage_params,
-                  axis_0_pos, axis_1_pos, axis_99_pos, count_val,
-                  global_total_traces, total_a2d_blocks, config_warnings):
+                  count_val, global_total_traces, total_a2d_blocks,
+                  config_warnings):
     """Report exactly what a run would do, without opening any hardware."""
     rule = "=" * 72
     print(f"\n{rule}\n DRY RUN - {con_filepath}\n{rule}")
@@ -414,19 +476,51 @@ def print_dry_run(con_filepath, base_filename, setup_pipeline,
               f"run them at teardown.")
 
     print("\nGRID")
-    for axis, positions, unit, name in (
-        (0, axis_0_pos, 'mm', 'X'),
-        (1, axis_1_pos, 'mm', 'Y'),
-        (99, axis_99_pos, 'um', 'Z/piezo'),
-    ):
-        limits = (stage_params.get(axis) or {}).get('limits')
-        bounds = f"  [limits {limits[0]}..{limits[1]} {unit}]" if limits else ""
+    print("  Listed outermost first. Axis ids set the nesting order, so the "
+          "highest-numbered")
+    print("  axis is the innermost loop and moves most often.")
+
+    if not stage_params:
+        print("\n  (no axis declared - one coordinate, nothing moves)")
+    else:
+        print()
+
+    axis_order = sorted(stage_params)
+    for axis_id in axis_order:
+        params = stage_params[axis_id]
+        name, unit = axis_display(axis_id, params)
+        positions = params['positions']
+
+        limits = params.get('limits')
+        bounds = (f"  [limits {limits[0]}..{limits[1]} {unit}]"
+                  if limits else "  [no limits declared]")
         print(f"  {name:<8} {len(positions):>5} step(s): "
               f"{format_positions(positions, unit)}{bounds}")
 
+        if params.get('type') == 'd2a':
+            target = params.get('backend') or 'auto-detect'
+            if params.get('device'):
+                target += f" {params['device']}"
+            scaling = (f", {params['um_per_volt']:g} um/V"
+                       if params.get('units') == 'um' else "")
+            print(f"           -> {target}, AO channel "
+                  f"{params['channel']}, settle {params['settle']:g}s"
+                  f"{scaling}"
+                  f"{', restores to start' if params.get('restore') else ''}")
+
+    factors = " x ".join(
+        str(len(stage_params[a]['positions'])) for a in axis_order
+    )
+    factors = f"{factors} x " if factors else ""
     print(f"\n  Repeats per coordinate (count): {count_val}")
-    print(f"  Total traces: {len(axis_0_pos)} x {len(axis_1_pos)} x "
-          f"{len(axis_99_pos)} x {count_val} = {global_total_traces}")
+    print(f"  Total traces: {factors}{count_val} = {global_total_traces}")
+
+    if total_a2d_blocks or any(p.get('type') == 'd2a'
+                               for p in stage_params.values()):
+        print("\n  No card was opened to produce this report, so which "
+              "backend each")
+        print("  'auto' resolves to is not shown. Run 'pydaq-dev list' to see "
+              "that.")
 
     print("\nOUTPUT FILES")
     all_actions = setup_pipeline + acquisition_pipeline + teardown_pipeline
@@ -566,15 +660,13 @@ def main():
         print(f"\n[CONFIG ERROR] in '{con_filepath}': {e}")
         sys.exit(1)
 
-    # Extract positions, defaulting to a single 'None' step if not in the config
-    axis_0_pos = stage_params.get(0, {}).get('positions', [None]) 
-    axis_1_pos = stage_params.get(1, {}).get('positions', [None]) 
-    axis_99_pos = stage_params.get(99, {}).get('positions', [None]) # Added Piezo axis
-    
+    # The grid is whatever axes the config declared, nested by axis id. There
+    # is no longer a fixed set of three slots that an undeclared axis has to
+    # occupy with a placeholder step.
     total_a2d_blocks = sum(1 for act in acquisition_pipeline if act['type'] == 'a2d')
-    # Updated total traces to include the Z-axis multiplier
-    global_total_traces = len(axis_0_pos) * len(axis_1_pos) * len(axis_99_pos) * count_val
-    
+    global_total_traces = axis_grid_size(stage_params) * count_val
+
+
     scope_ip = next((act['params']['ip'] for act in acquisition_pipeline if act['type'] == 'scope'), None)
     ixon_in_pipeline = any(act['type'] == 'ixon' for act in acquisition_pipeline + setup_pipeline + teardown_pipeline)
     
@@ -583,9 +675,8 @@ def main():
     if dry_run:
         print_dry_run(
             con_filepath, base_filename, setup_pipeline, acquisition_pipeline,
-            teardown_pipeline, stage_params, axis_0_pos, axis_1_pos,
-            axis_99_pos, count_val, global_total_traces, total_a2d_blocks,
-            config_warnings,
+            teardown_pipeline, stage_params, count_val, global_total_traces,
+            total_a2d_blocks, config_warnings,
         )
         return
 
@@ -625,8 +716,11 @@ def main():
     # came up. Construction and connection happen inside the try, because when
     # they sat outside it a failure part way through left earlier devices
     # running - a streaming Tucsen, or the iXon with its shutter open.
-    scope = ni_daq = stage = piezo = ixon = tucsen = None
-    settle_timeouts = 0
+    scope = stage = ixon = tucsen = None
+    axes = []
+    # Shared across every APT axis so the "repeated settle timeouts" advice
+    # fires once for the run rather than once per axis.
+    axis_state = {'settle_timeouts': 0}
     aborted = False
 
     call_state = {
@@ -649,15 +743,34 @@ def main():
             print(f"\nOpening session to LeCroy at {scope_ip}...")
             scope = LeCroyScope(scope_ip)
             scope.connect()
-        if total_a2d_blocks > 0:
-            print("Connecting to NI A2D card...")
-            ni_daq = NIDriver()
-            ni_daq.connect()
-        if 0 in stage_params or 1 in stage_params:
+        # Opened before anything moves, so a missing card - or a config that
+        # is ambiguous about which of two cards it means - stops the run
+        # before the sample has been driven anywhere.
+        open_a2d_sessions(all_actions)
+
+        if any(axis in stage_params for axis in APT_AXES):
             stage = ThorlabsStage()
             stage.connect()
-        if 99 in stage_params:
-            piezo = D2APhidgetDriver()
+
+        # Builds the axis nest and opens any analog-output card it needs. A
+        # card already opened for an a2d block is reused, not reopened: on a
+        # PCIe-6351 the photodiode input and the mirror output are the same
+        # board.
+        if stage_params:
+            print("\nResolving scan axes...")
+
+            def open_d2a(params):
+                return daq.open_device(
+                    backend=params.get('backend'),
+                    address=params.get('device'),
+                    need_ao=True,
+                    role='d2a',
+                )
+
+            axes = build_axes(
+                stage_params, stage, counts_per_mm, axis_state, open_d2a
+            )
+
         if ixon_in_pipeline and ANDOR_AVAILABLE:
             print("\nConnecting to Windows iXon Camera...")
             ixon = IXonCamera()
@@ -667,14 +780,20 @@ def main():
         # cooldown does not happen with the sample sitting at coordinate 0.
         configure_cameras(all_actions, ixon, tucsen, call_state)
 
-        print(f"\nGrid: {len(axis_0_pos)} X steps x {len(axis_1_pos)} Y steps x {len(axis_99_pos)} Z steps.")
+        if axes:
+            grid = " x ".join(
+                f"{len(ax.positions)} {ax.label}" for ax in axes
+            )
+            print(f"\nGrid: {grid} (outermost first).")
+        else:
+            print("\nGrid: no axis declared - one coordinate, nothing moves.")
         print(f"Total Traces Target: {global_total_traces}")
 
         if setup_pipeline:
             print("\nExecuting Pre-Scan Initialization Commands...")
             run_pipeline_sequence(
-                setup_pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
-                total_a2d_blocks, global_total_traces, call_state, 
+                setup_pipeline, scope, ixon, tucsen, base_filename,
+                total_a2d_blocks, global_total_traces, call_state,
                 timer_mode=timer_mode
             )
 
@@ -686,112 +805,58 @@ def main():
                 print(f" -> Scope Hardware Target: {scope_act['params']['sweeps']} Averages\n")
                 
         master_trace_idx = 0
-        
-        # Modified Loop Hierarchy: X -> Y -> Z -> Count
-        for x_val in axis_0_pos:
-            # Commanded moves are collected and waited on together below, so
-            # the X step and the Y row-return still overlap in flight.
-            pending_moves = []
+        pending = PendingSettle()
 
-            if x_val is not None and stage_params.get(0, {}).get('type') == 'apt_stage':
-                stage.move_absolute('x', x_val, counts_per_mm)
-                pending_moves.append(('x', x_val))
+        def acquire_here():
+            """Everything that happens at one coordinate.
 
-            for y_val in axis_1_pos:
-                if y_val is not None and stage_params.get(1, {}).get('type') == 'apt_stage':
-                    stage.move_absolute('y', y_val, counts_per_mm)
-                    pending_moves.append(('y', y_val))
+            Called by walk_axes() at the innermost level, after every
+            commanded move has arrived.
+            """
+            nonlocal master_trace_idx
 
-                # Wait on the encoder instead of guessing. The old blind 0.2s
-                # was fine for a single 5um step but far too short for Y
-                # traversing a whole row back to its start, so the first point
-                # of every row after the first was taken mid-flight.
-                for ax_name, ax_target in pending_moves:
-                    reached = stage.wait_for_move(
-                        ax_name, ax_target, counts_per_mm,
-                        tolerance_mm=SETTLE_TOLERANCE_MM,
-                        timeout_s=SETTLE_TIMEOUT_S,
-                        dwell_s=SETTLE_DWELL_S,
-                    )
-                    if not reached:
-                        settle_timeouts += 1
-                        if settle_timeouts == 3:
-                            print(
-                                f"[WARNING] Repeated settle timeouts. If the "
-                                f"stage is actually arriving, "
-                                f"SETTLE_TOLERANCE_MM "
-                                f"({SETTLE_TOLERANCE_MM} mm) may be tighter "
-                                f"than the controller's deadband - loosen it "
-                                f"rather than let every point burn "
-                                f"{SETTLE_TIMEOUT_S:.0f}s."
-                            )
-                pending_moves = []
+            # The first coordinate gets extra time for everything to stabilise,
+            # but only if something actually moved to get there.
+            moved = any(ax.current is not None for ax in axes)
+            if moved and master_trace_idx == 0:
+                time.sleep(INITIAL_SETTLE_S)
 
-                for z_val in axis_99_pos:
-                    if z_val is not None and piezo:
-                        piezo.set_position_um(z_val)
-                        # Open-loop: there is no position to poll back.
-                        time.sleep(PIEZO_SETTLE_S)
+            for _ in range(count_val):
+                if timer_mode:
+                    t_trace_start = time.perf_counter()
 
-                    moved = (x_val is not None or y_val is not None
-                             or z_val is not None)
-                    if moved and master_trace_idx == 0:
-                        time.sleep(INITIAL_SETTLE_S)
+                call_state['current_trace_idx'] = master_trace_idx
 
-                    for c_val in range(count_val):
-                        if timer_mode:
-                            t_trace_start = time.perf_counter()
-                        
-                        call_state['current_trace_idx'] = master_trace_idx
-                        current_num = master_trace_idx + 1
-                        
-                        x_str = f"{x_val:7.4f} mm" if x_val is not None else "Static"
-                        y_str = f"{y_val:7.4f} mm" if y_val is not None else "Static"
-                        z_str = f"{z_val:7.2f} um" if z_val is not None else "Static"
-                        
-                        print(
-                            f" -> Pos: X={x_str}, Y={y_str}, Z={z_str} "
-                            f"| Trace {current_num}/{global_total_traces}..."
-                        )
-                        
-                        run_pipeline_sequence(
-                            acquisition_pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
-                            total_a2d_blocks, global_total_traces, call_state, 
-                            silent_acq=True, timer_mode=timer_mode
-                        )
-                        
-                        if timer_mode:
-                            t_trace_end = time.perf_counter()
-                            print(f"      [Timer] Total trace time: {t_trace_end - t_trace_start:.4f}s\n")
-                        
-                        master_trace_idx += 1
-                
-            if 1 in stage_params and stage_params[1].get('restore'):
-                y_start = stage_params[1]['start_pos']
-                stage.move_absolute('y', y_start, counts_per_mm)
-                stage.wait_for_move(
-                    'y', y_start, counts_per_mm,
-                    tolerance_mm=SETTLE_TOLERANCE_MM,
-                    timeout_s=SETTLE_TIMEOUT_S,
-                    dwell_s=SETTLE_DWELL_S,
+                print(
+                    f" -> Pos: {format_position_line(axes)} "
+                    f"| Trace {master_trace_idx + 1}/{global_total_traces}..."
                 )
 
-        if 0 in stage_params and stage_params[0].get('restore'):
-            x_start = stage_params[0]['start_pos']
-            stage.move_absolute('x', x_start, counts_per_mm)
-            # Wait here too, so the process does not exit mid-travel.
-            stage.wait_for_move(
-                'x', x_start, counts_per_mm,
-                tolerance_mm=SETTLE_TOLERANCE_MM,
-                timeout_s=SETTLE_TIMEOUT_S,
-                dwell_s=SETTLE_DWELL_S,
-            )
+                run_pipeline_sequence(
+                    acquisition_pipeline, scope, ixon, tucsen, base_filename,
+                    total_a2d_blocks, global_total_traces, call_state,
+                    silent_acq=True, timer_mode=timer_mode
+                )
+
+                if timer_mode:
+                    t_trace_end = time.perf_counter()
+                    print(f"      [Timer] Total trace time: {t_trace_end - t_trace_start:.4f}s\n")
+
+                master_trace_idx += 1
+
+        # One nest over however many axes the config declared, innermost last.
+        # Restores happen inside the walk, at the end of each axis's own loop,
+        # which is where the hardcoded version put them.
+        if axes:
+            walk_axes(axes, 0, pending, acquire_here)
+        else:
+            acquire_here()
 
         if teardown_pipeline:
             print("\nExecuting Post-Scan Teardown Commands...")
             run_pipeline_sequence(
-                teardown_pipeline, scope, ni_daq, ixon, tucsen, base_filename, 
-                total_a2d_blocks, global_total_traces, call_state, 
+                teardown_pipeline, scope, ixon, tucsen, base_filename,
+                total_a2d_blocks, global_total_traces, call_state,
                 timer_mode=timer_mode
             )
 
@@ -799,6 +864,12 @@ def main():
         aborted = True
         print("\n\n[WARNING] Sequence Aborted by User (Ctrl+C)!")
     except AcquisitionAborted as e:
+        aborted = True
+        print(f"\n\n[ABORTED] {e}")
+    except AxisCommandFailed as e:
+        # An axis that would not move is the same category of problem as a
+        # desynchronised file: everything written from here on would carry a
+        # coordinate it was not measured at.
         aborted = True
         print(f"\n\n[ABORTED] {e}")
     except Exception as e:
@@ -830,10 +901,15 @@ def main():
 
         if scope: safe_teardown("Scope disconnect", scope.disconnect)
         if stage: safe_teardown("Stage disconnect", stage.disconnect)
-        if piezo: safe_teardown("Piezo close", piezo.close)
         if ixon: safe_teardown("iXon shutdown", ixon.shutdown)
         if tucsen: safe_teardown("Tucsen shutdown", tucsen.shutdown)
-        if ni_daq: safe_teardown("A2D disconnect", ni_daq.disconnect)
+
+        # Closes every DAQ session opened for an a2d block or a d2a axis,
+        # flushing each one's trace writer first. Analog outputs are left
+        # energized, as the Phidget piezo path always did - a scan ending
+        # should not slam a mirror or a piezo back to zero.
+        if daq.open_sessions():
+            safe_teardown("DAQ disconnect", daq.close_all)
 
         if call_state.get('webcam') is not None:
             safe_teardown("Webcam release", call_state['webcam'].release)

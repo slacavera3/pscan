@@ -9,7 +9,7 @@ class D2APhidgetDriver:
         self.um_per_volt = um_per_volt
         self.min_volts = 0.0
         self.max_volts = 5.0
-        
+
         try:
             self.phidget21 = ctypes.CDLL("libphidget21.so")
         except OSError:
@@ -25,29 +25,29 @@ class D2APhidgetDriver:
         self.phidget21.CPhidget_close.argtypes = [ctypes.c_void_p]
 
         self.handle = ctypes.c_void_p()
-        
+
         try:
             print("[Phidget D2A] Connecting to Analog Output board...")
-            
+
             if self.phidget21.CPhidgetAnalog_create(ctypes.byref(self.handle)) != 0:
                 raise RuntimeError("Failed to create Phidget handle.")
-                
+
             if self.phidget21.CPhidget_open(self.handle, -1) != 0:
                 raise RuntimeError("Failed to open Phidget connection.")
-                
+
             if self.phidget21.CPhidget_waitForAttachment(self.handle, 5000) != 0:
                 raise RuntimeError("Hardware failed to attach within 5 seconds.")
-                
+
             # Enable channel 0 (PTRUE = 1)
             self.phidget21.CPhidgetAnalog_setEnabled(self.handle, 0, 1)
-            
+
             # Read current voltage to confirm connection without altering the piezo state
             current_v = ctypes.c_double()
             if self.phidget21.CPhidgetAnalog_getVoltage(self.handle, 0, ctypes.byref(current_v)) == 0:
                 print(f"[Phidget D2A] Connected. Current piezo state: {current_v.value:.3f}V.")
             else:
                 print("[Phidget D2A] Connected. (State unknown until first scan step).")
-                
+
         except RuntimeError as e:
             print(f"[Phidget D2A] Connection failed: {e}")
             raise
@@ -56,14 +56,14 @@ class D2APhidgetDriver:
         """Converts microns to voltage, clamps it safely, and applies it."""
         target_v = target_um / self.um_per_volt
         safe_v = max(self.min_volts, min(self.max_volts, target_v))
-        
+
         if safe_v != target_v:
             print(f"[WARNING] Requested {target_um}um ({target_v:.3f}V) is out of bounds! Clamping to {safe_v:.3f}V.")
-            
+
         if self.phidget21.CPhidgetAnalog_setVoltage(self.handle, 0, float(safe_v)) != 0:
             print("[Phidget D2A] Error setting voltage.")
             return False
-            
+
         time.sleep(0.05) # Settle time for the piezo
         return True
 

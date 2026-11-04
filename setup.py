@@ -24,6 +24,18 @@ setup(
         'standard-xdrlib'
         # Phidget22 removed: using ctypes + libphidget21.so instead
     ],
+    extras_require={
+        # NI-DAQmx, for the cards comedi cannot reach - every NI X Series
+        # board, the PCIe-6351 included. Deliberately optional: the rigs
+        # running comedi cards have no use for it, and the Python package is
+        # useless without NI's driver installed system-wide anyway, so making
+        # it a hard requirement would mean a failing install on machines where
+        # nothing needs it. pscan.daq imports it lazily and says exactly what
+        # to install when a config asks for the daqmx backend without it.
+        #
+        #   pip install '.[daqmx]'
+        'daqmx': ['nidaqmx>=0.9'],
+    },
     entry_points={
         'console_scripts': [
             # Every command carries the -dev suffix so that running one is
@@ -36,6 +48,8 @@ setup(
             'pystage-dev=pscan.control_stages:main',
             # Links the terminal command 'pypiezo-dev' to main() in control_piezo.py
             'pypiezo-dev=pscan.control_piezo:main',
+            # Links the terminal command 'pydaq-dev' to main() in control_daq.py
+            'pydaq-dev=pscan.control_daq:main',
             # Links the terminal command 'flyscan-dev' to main() in flyscan/cli.py
             'flyscan-dev=flyscan.cli:main',
         ],
