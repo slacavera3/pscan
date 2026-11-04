@@ -162,16 +162,16 @@ one, use it to confirm pscan sees the card, under which backend, with which
 channels and ranges - and to check there is actually a signal on the input.
 
    pydaq-dev list                          what pscan can see, and what it can't
-   pydaq-dev list --all                    also the by-name-only backends
+   pydaq-dev list --all                    also the Phidget, which auto-detect skips
    pydaq-dev read --channel 0              acquire a trace, print its statistics
    pydaq-dev read --channel 0 --v-min -1 --v-max 1
    pydaq-dev set 1.5 --channel 0           hold an output at 1.5 V
    pydaq-dev set +0.1 --channel 0          step it relative to where it is
 
 `list` prints the exact `backend` and `device` lines to paste into a .con
-block, so pinning a config to a specific card is copy-and-paste. It never
-opens the Phidget board: that board may be holding a piezo at a position, and
-enumerating hardware is not a good enough reason to disturb it.
+block, so pinning a config to a specific card is copy-and-paste. Without
+`--all` it never opens the Phidget board, for the reason given under DAQ CARDS
+AND BACKENDS below.
 
 `read` writes its trace in the same float32-volts format a scan's .d file
 uses, through the same acquisition path, so it tests the real code and not a
@@ -210,20 +210,32 @@ a script once at startup, put it above every core block.
 
 ### DAQ CARDS AND BACKENDS
 
-pscan reaches DAQ hardware through one of four backends, and picks for you
-unless you say otherwise:
+`action a2d` grabs DC photovoltage off a detector; `action d2a` applies an
+analog voltage to something. Both reach hardware through one of three
+backends, one driver file each, and pscan picks for you unless you say
+otherwise:
 
-  comedi    The incumbent. libcomedi, on a /dev/comedi* node. Covers the NI E
+  comedi    pscan/a2d_driver.py        (NIDriver)
+            The incumbent. libcomedi, on a /dev/comedi* node. Covers the NI E
             and M series (PCI-625x/628x, PCIe-6251/6259) and the cards already
             in service. Analog in and out.
-  daqmx     NI-DAQmx. The ONLY way to reach an NI X Series card - comedi's
+
+  daqmx     pscan/daqmx_driver.py      (DaqmxDriver)
+            NI-DAQmx. The ONLY way to reach an NI X Series card - comedi's
             ni_pcimio driver has no X Series support at all, so a PCIe-6351 is
-            invisible to it and always will be. Analog in and out.
-  phidget   The Phidget analog board that has always driven the piezo.
-            Outputs only; never auto-detected (see below).
-  sim       A simulated card, for working on a config without the rig. Never
-            auto-detected. Every trace it produces is a synthesised sine and
-            is labelled as such in the log.
+            invisible to it and always will be. Also drives the M Series cards
+            comedi handles, so a PCIe-6251 is reachable either way. Analog in
+            and out.
+
+  phidget   pscan/d2aphidget_driver.py (D2APhidgetDriver)
+            The Phidget analog board that has always driven the piezo.
+            Outputs only, channel 0 only; never auto-detected (see below).
+
+pscan/daq.py holds what none of them should repeat: the acquisition contract,
+the output format, range resolution, and the choice of which card a block
+means. A driver never touches the output file - it returns volts, and daq.py
+packs them. That is the only place the .d format is decided, which is what
+keeps a DAQmx trace and a comedi trace byte-identical in layout.
 
 HOW A CARD IS CHOSEN
 
@@ -249,10 +261,10 @@ Device names differ by backend: comedi uses device nodes (/dev/comedi0),
 DAQmx uses the names NI assigns (Dev1). Giving `device` alone is enough -
 the backend is inferred from the form of the address.
 
-The Phidget board and the simulator are never auto-detected. Opening the
-Phidget claims it and it may be holding a piezo somewhere; a simulated card
-standing in for a real one silently would be the worst failure mode this
-program has. Name them explicitly if you mean them.
+The Phidget board is never auto-detected: opening it claims the board, and it
+may be holding a piezo at a position right now, which is not something to
+disturb while merely answering "what hardware is here?". Name it explicitly if
+you mean it - which `action d2a_phidget` does for you.
 
 RANGES: INDEX VS VOLTS
 
@@ -273,15 +285,43 @@ thing on every card and every backend. Giving only one side mirrors it, so
 
 INSTALLING NI-DAQMX (Linux)
 
-Not done by install.sh: it is a large system package with kernel modules, so
-it is your call, not an installer's.
+`bash install.sh` does it. There is nothing to download by hand.
 
-  # NI's apt repository, then:
-  sudo apt install ni-daqmx
-  sudo dkms autoinstall          # rebuild for the running kernel
-  # then re-run install-dev.sh, which adds the nidaqmx Python package
+That is worth spelling out, because the obvious command does not work:
+`ni-daqmx` is NOT in Ubuntu's archives, so `sudo apt install ni-daqmx` fails
+with "Unable to locate package" on a clean machine. NI ships a small (~31 KB)
+registration .deb that adds their apt feed, and the driver itself comes from
+that feed. install.sh does both: it finds the newest NI release, takes the
+registration package for your Ubuntu version out of it, installs the driver,
+and builds the kernel modules.
 
-Two things that bite on Linux:
+It will not pull a large vendor driver onto a machine with no NI card in it.
+If `lspci` shows no National Instruments device it says so and skips, so a
+comedi-only rig is unaffected. Three env vars steer it:
+
+  PSCAN_SKIP_DAQMX=1    never install it
+  PSCAN_FORCE_DAQMX=1   install even with no card currently seated
+  NI_RELEASE=2025Q1     pin which release's registration package is used
+
+A REBOOT IS REQUIRED afterwards - the kernel modules are not loaded until
+then, and no card is visible however well-seated it is. install.sh says so at
+the end when it installed the driver that run.
+
+After rebooting, `sudo dkms status` should list ni-daqmx against your running
+kernel. If it does not, the modules did not build and that is the thing to fix
+before looking at anything else.
+
+WHAT IS SUPPORTED ON LINUX
+
+PCIe and PXI DAQ cards are the supported category - a PCIe-6351 is in scope.
+USB DAQ devices largely are NOT supported on Linux Desktop (USB cDAQ chassis
+excepted), so do not assume a USB device will work just because a PCIe one
+does. Check the specific model against NI's compatibility page.
+
+NI also published a security notice affecting driver software 2026 Q2 and
+earlier - see ni.com/ni-pal-update before settling on a release.
+
+Two further things that bite on Linux:
 
   * The kernel modules must be rebuilt after every kernel upgrade. A card that
     worked yesterday and is invisible today is almost always this - check
@@ -293,13 +333,21 @@ Two things that bite on Linux:
 
 ### RUNNING THE TESTS
 
-Everything in tests/ runs on a laptop with no hardware attached: the backends
-are exercised through the simulated card and the axis walk through fake axes.
-
    python -m unittest discover -s tests -t .
+
+No hardware needed. The acquisition path is exercised through tests/fake_card.py
+and the axis walk through fake axes that only record what they were told to do.
+The fake card deliberately lives in tests/ rather than pscan/: source holds one
+driver file per real piece of hardware, and a simulated card that could be
+auto-selected during a scan would produce a full set of plausible .d files
+containing nothing but a synthesised sine.
 
 Worth running after any change to the scan loop, the config parser or the
 output format - those three are where a mistake is silent rather than loud.
+
+On a machine without the full install the axis-walk module skips, because the
+grid lives in main.py alongside the camera and scope imports. The other three
+modules run anywhere.
 
 ### Configuration File (.con) Template
 
@@ -420,11 +468,30 @@ end
 
 ## 6e. THE ORIGINAL PIEZO BLOCK - still works, unchanged
 ## 'action d2a_phidget' is now shorthand for a d2a axis with the Phidget
-## backend pinned, um as its unit, 20 um/V and a 0.25s settle - which is
-## exactly what it always did. Existing config files need no edits.
+## backend pinned, um as its unit, 20 um/V and the settle it always had.
+## Existing config files need no edits.
+##
+## It is on its way out, though: everything it hardcodes is now sayable in a
+## confile. Prefer the longhand below for new configs - it hides nothing. Once
+## no .con file in the lab uses the short form, the block can be deleted.
 ## action d2a_phidget
 ## scan 0 100 25
 ## limits 0 100
+## end
+##
+## 6f. THE SAME THING, SPELLED OUT - identical behaviour to 6e
+## 'settle 0.20' rather than 0.25 because d2aphidget_driver.set_position_um()
+## sleeps a further 0.05s inside itself, and that driver is still the one
+## doing the write.
+## action d2a
+## axis 99
+## backend phidget
+## channel 0
+## units um
+## um_per_volt 20.0
+## scan 0 100 25
+## limits 0 100
+## settle 0.20
 ## end
 
 ## 7. LECROY OSCILLOSCOPE ACQUISITION

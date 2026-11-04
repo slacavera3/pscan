@@ -1,8 +1,10 @@
-"""NI-DAQmx backend, for the cards comedi cannot reach.
+"""NI-DAQmx cards: the PCIe-6351 and anything else comedi cannot reach.
 
-The PCIe-6351 is X Series. comedi's ni_pcimio driver covers the E and M series
-and no X Series board, so this is the only way to that card on Linux, and it
-will be the only way to essentially every NI card bought from here on.
+comedi's ni_pcimio driver covers the NI E and M series and no X Series board,
+so this is the only route to a PCIe-6351 on Linux - and will be the only route
+to essentially every NI card bought from here on. It also drives the M Series
+cards comedi handles (a PCIe-6251 is reachable either way), which is worth
+knowing: it means one driver can cover a mixed rig if you pin the blocks.
 
 Performance notes, because this runs once per coordinate and a scan is
 thousands of coordinates:
@@ -15,8 +17,10 @@ thousands of coordinates:
     Python binding, is what would make this slower than the comedi path.
 
   * Samples are read through a stream reader into a preallocated float64
-    array. `task.read()` returns a Python list, which is N float objects per
-    trace - unnoticeable at 100 samples, expensive at 100k.
+    array. task.read() returns a Python list, which is N float objects per
+    trace - unnoticeable at 100 samples, expensive at 100k. The buffer is
+    handed straight back to pscan.daq, which packs it to float32 on this
+    thread before the next trace can touch it, so no defensive copy is made.
 
   * No DAQmx property is read inside the acquisition loop. Property access on
     a task is a real Get call into the driver, so everything needed per trace
@@ -24,18 +28,14 @@ thousands of coordinates:
 
 nidaqmx-python is itself a ctypes wrapper over the same libnidaqmx, so this
 costs nothing in call overhead against hand-rolled ctypes; it just saves
-owning the task and error machinery. It is imported lazily and declared as an
-optional extra, because the rigs still running comedi cards have no reason to
-install it and a module-level import would break them.
+owning the task and error machinery. It is imported lazily because a rig with
+only comedi cards has no reason to have it installed, and a module-level
+import would break those rigs outright.
 """
 
 import numpy as np
 
-from pscan.daq.base import (
-    DAQBackend,
-    DeviceInfo,
-    resolve_range,
-)
+from pscan.daq import DAQBackend, DeviceInfo, resolve_range
 
 # Populated by _load(). Module-level so repeated calls are free and so
 # enumeration does not need a session.
@@ -44,13 +44,24 @@ _constants = None
 _stream_readers = None
 _load_error = None
 
+#: Spellings each terminal configuration has had across nidaqmx releases.
+#: Resolved per terminal rather than all at once, so a version that renamed
+#: one does not break the others - asking for 'rse' must not fail because
+#: 'pseudodiff' could not be found.
+_TERMINAL_ALIASES = {
+    'rse': ('RSE',),
+    'nrse': ('NRSE',),
+    'diff': ('DIFF', 'DIFFERENTIAL'),
+    'pseudodiff': ('PSEUDO_DIFF', 'PSEUDO_DIFFERENTIAL', 'PSEUDODIFFERENTIAL'),
+}
+
 
 def _load():
     """Import nidaqmx on first use, remembering why it failed if it did.
 
-    Two distinct failures look the same to a user and need different fixes:
+    Two distinct failures look the same from outside and need different fixes:
     the Python package being absent (pip) and the NI-DAQmx driver itself being
-    absent (NI's apt repository, plus a kernel module rebuild). The error text
+    absent (NI's repository, plus a kernel module build). The error text
     distinguishes them.
     """
     global _nidaqmx, _constants, _stream_readers, _load_error
@@ -65,23 +76,20 @@ def _load():
         from nidaqmx import constants, stream_readers
     except ImportError as e:
         _load_error = (
-            "the 'nidaqmx' Python package is not installed. Install it with "
-            "'pip install nidaqmx' (or 'pip install .[daqmx]' from the pscan "
-            "checkout)."
+            "the 'nidaqmx' Python package is not installed. Re-run "
+            "'bash install.sh' (or 'bash install-dev.sh'), which installs it "
+            "once the NI-DAQmx driver is present."
         )
         raise RuntimeError(_load_error) from e
     except Exception as e:
         # Not just OSError: depending on the version, nidaqmx raises its own
-        # DaqNotFoundError (or DaqFunctionNotSupportedError) at import time
-        # when the C library is absent or too old. Catching the base class
-        # means a missing driver gives the actionable message below rather
+        # DaqNotFoundError at import time when the C library is absent. The
+        # base class means a missing driver gives the message below rather
         # than an unhandled exception from inside the package.
         _load_error = (
             f"the 'nidaqmx' package is installed but the NI-DAQmx driver "
-            f"library could not be loaded ({type(e).__name__}: {e}). Install "
-            f"the driver from NI's apt repository ('sudo apt install "
-            f"ni-daqmx') and rebuild its kernel modules with 'sudo dkms "
-            f"autoinstall'."
+            f"library could not be loaded ({type(e).__name__}: {e}). Run "
+            f"'bash install.sh' to install the driver, then reboot."
         )
         raise RuntimeError(_load_error) from e
 
@@ -89,18 +97,6 @@ def _load():
     _constants = constants
     _stream_readers = stream_readers
     return _nidaqmx
-
-
-#: Spellings each terminal configuration has had across nidaqmx releases,
-#: most recent first. Resolved per terminal rather than all at once, so a
-#: version that has renamed one of them does not break the other three -
-#: asking for 'rse' must not fail because 'pseudodiff' could not be found.
-_TERMINAL_ALIASES = {
-    'rse': ('RSE',),
-    'nrse': ('NRSE',),
-    'diff': ('DIFF', 'DIFFERENTIAL'),
-    'pseudodiff': ('PSEUDO_DIFF', 'PSEUDO_DIFFERENTIAL', 'PSEUDODIFFERENTIAL'),
-}
 
 
 def _terminal_constant(terminal):
@@ -132,11 +128,7 @@ def _pair_ranges(flat):
 
 
 def _describe(dev):
-    """DeviceInfo for one nidaqmx Device object.
-
-    Every property here is read once, at enumeration or connect, never per
-    trace.
-    """
+    """DeviceInfo for one nidaqmx Device. Read once, never per trace."""
     def safe(fn, default=None):
         try:
             return fn()
@@ -144,7 +136,7 @@ def _describe(dev):
             return default
 
     return DeviceInfo(
-        backend=DaqmxBackend.name,
+        backend=DaqmxDriver.name,
         address=dev.name,
         model=safe(lambda: dev.product_type, "unknown"),
         n_ai=len(safe(lambda: dev.ai_physical_chans, []) or []),
@@ -171,7 +163,7 @@ class _A2DTask:
             pass
 
 
-class DaqmxBackend(DAQBackend):
+class DaqmxDriver(DAQBackend):
     name = "daqmx"
 
     def __init__(self, address=None):
@@ -211,9 +203,9 @@ class DaqmxBackend(DAQBackend):
             system = nidaqmx.system.System.local()
             return [_describe(dev) for dev in system.devices]
         except Exception:
-            # A driver that is installed but not functioning - the usual cause
-            # on Linux is the kernel modules not being rebuilt after a kernel
-            # upgrade - should not take enumeration of other backends down.
+            # A driver installed but not functioning - usually the kernel
+            # modules not rebuilt after a kernel upgrade - must not take
+            # enumeration of the other backends down with it.
             return []
 
     # ------------------------------------------------------------------
@@ -247,8 +239,8 @@ class DaqmxBackend(DAQBackend):
         if self.address not in names:
             raise RuntimeError(
                 f"NI-DAQmx has no device named '{self.address}'. It sees: "
-                f"{', '.join(names)}. Device names come from NI MAX / "
-                f"nidaqmx and are not the /dev nodes comedi uses."
+                f"{', '.join(names)}. Device names come from NI MAX / nidaqmx "
+                f"and are not the /dev nodes comedi uses."
             )
 
         self._info = _describe(system.devices[self.address])
@@ -260,9 +252,9 @@ class DaqmxBackend(DAQBackend):
         self._tasks.clear()
 
         # Output tasks are closed but the voltage is deliberately not zeroed.
-        # DAQmx leaves the DAC holding its last value, which matches what the
-        # Phidget piezo path has always done: a scan that ends should not
-        # slam a mirror or a piezo back to 0V on the way out.
+        # DAQmx leaves the DAC holding its last value, matching what the
+        # Phidget piezo path has always done: a scan ending should not slam a
+        # mirror or a piezo back to 0V.
         for task in self._ao_tasks.values():
             try:
                 task.close()
@@ -312,10 +304,9 @@ class DaqmxBackend(DAQBackend):
         reader = _stream_readers.AnalogSingleChannelReader(task.in_stream)
         buffer = np.zeros(config.n_samples, dtype=np.float64)
 
-        # The acquisition itself takes n/rate seconds; the margin covers a
-        # trace that is waiting on an external clock or a slow start. Floor of
-        # 5s so a very short trace still has a sane timeout rather than one
-        # measured in milliseconds.
+        # The acquisition takes n/rate seconds; the margin covers a trace
+        # waiting on an external clock or a slow start. Floor of 5s so a very
+        # short trace still gets a sane timeout rather than a millisecond one.
         physical = config.n_samples / float(config.sample_rate or 1)
         timeout = max(5.0, 2.0 * physical + 1.0)
 
@@ -353,10 +344,10 @@ class DaqmxBackend(DAQBackend):
             except Exception:
                 pass
 
-        # The reader filled the buffer in place. Copy, because the same buffer
-        # is reused by the next trace and the caller's float32 pack happens on
-        # the writer thread.
-        return entry.buffer.copy()
+        # Returned without copying. pscan.daq packs it to float32 on this
+        # thread before returning, so the buffer is free to be reused by the
+        # next trace.
+        return entry.buffer
 
     # ------------------------------------------------------------------
     # d2a
@@ -370,9 +361,7 @@ class DaqmxBackend(DAQBackend):
         nidaqmx = _load()
         ranges = self._info.ao_ranges
         if not ranges:
-            raise RuntimeError(
-                f"{self.address} reports no analog output ranges"
-            )
+            raise RuntimeError(f"{self.address} reports no analog output ranges")
 
         lo = min(r[0] for r in ranges)
         hi = max(r[1] for r in ranges)
@@ -393,6 +382,5 @@ class DaqmxBackend(DAQBackend):
         return task
 
     def _write_ao(self, channel, volts):
-        task = self._ensure_ao_task(channel)
-        task.write(float(volts))
+        self._ensure_ao_task(channel).write(float(volts))
         return True

@@ -1,4 +1,4 @@
-"""Config parsing for the new a2d keys and the d2a block.
+﻿"""Config parsing for the new a2d keys and the d2a block.
 
 The property that matters most here is the last class: an existing .con file
 written against the Phidget piezo has to compile to exactly the same scan it
@@ -11,6 +11,9 @@ import tempfile
 import textwrap
 import unittest
 
+# Registers the 'fake' backend, so a test config can name a backend that
+# exists without naming a real card. Imported for that side effect.
+from tests import fake_card  # noqa: F401
 from pscan.config_parser import (
     DEFAULT_D2A_AXIS,
     DEFAULT_D2A_SETTLE_S,
@@ -22,6 +25,11 @@ from pscan.config_parser import (
     parse_flat_con_file,
     validate_blocks,
 )
+
+# What d2aphidget_driver.set_position_um() sleeps inside itself. Hardcoded
+# there, so it is restated rather than imported - importing the driver would
+# try to load libphidget21.so.
+LEGACY_DRIVER_SETTLE_S = 0.05
 
 
 def compile_con(text):
@@ -72,8 +80,8 @@ class TestD2ABlock(unittest.TestCase):
         axes, _, _ = compile_con("""
             action d2a
             axis 98
-            backend sim
-            device sim0
+            backend fake
+            device fake0
             channel 1
             scan -2 2 1
             limits -5 5
@@ -83,8 +91,8 @@ class TestD2ABlock(unittest.TestCase):
         """)
         params = axes[98]
         self.assertEqual(params['positions'], [-2.0, -1.0, 0.0, 1.0, 2.0])
-        self.assertEqual(params['backend'], 'sim')
-        self.assertEqual(params['device'], 'sim0')
+        self.assertEqual(params['backend'], 'fake')
+        self.assertEqual(params['device'], 'fake0')
         self.assertEqual(params['channel'], 1)
         self.assertEqual(params['settle'], 0.002)
         self.assertTrue(params['restore'])
@@ -234,8 +242,8 @@ class TestA2DKeys(unittest.TestCase):
         _, actions, _ = compile_con("""
             action a2d
             channel 3
-            backend sim
-            device sim0
+            backend fake
+            device fake0
             terminal diff
             v_min -1.5
             v_max 1.5
@@ -245,8 +253,8 @@ class TestA2DKeys(unittest.TestCase):
         """)
         p = actions[0]['params']
         self.assertEqual(p['channel'], 3)
-        self.assertEqual(p['backend'], 'sim')
-        self.assertEqual(p['device'], 'sim0')
+        self.assertEqual(p['backend'], 'fake')
+        self.assertEqual(p['device'], 'fake0')
         self.assertEqual(p['terminal'], 'diff')
         self.assertEqual(p['v_min'], -1.5)
         self.assertEqual(p['v_max'], 1.5)
@@ -337,11 +345,15 @@ class TestLegacyPiezoUnchanged(unittest.TestCase):
         self.assertEqual(self.params['um_per_volt'], 20.0)
 
     def test_total_settle_time_is_preserved(self):
-        # main() slept 0.20s after the move and the driver slept 0.05s inside
-        # set_position_um(). The backend no longer sleeps, so the axis has to
-        # carry the whole 0.25s.
+        # main() slept 0.20s after the move and d2aphidget_driver slept a
+        # further 0.05s inside set_position_um(). That driver still does the
+        # write, so its 0.05s is still in the path and the axis carries only
+        # the 0.20s - totalling the 0.25s a piezo config always waited.
         self.assertEqual(self.params['settle'], PHIDGET_SETTLE_S)
-        self.assertAlmostEqual(self.params['settle'], 0.25)
+        self.assertAlmostEqual(self.params['settle'], 0.20)
+        self.assertAlmostEqual(
+            self.params['settle'] + LEGACY_DRIVER_SETTLE_S, 0.25
+        )
 
     def test_does_not_restore_by_default(self):
         # The old piezo path had no restore at all.

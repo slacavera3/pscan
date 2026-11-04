@@ -15,7 +15,10 @@ setup(
     description='Experimental build of pscan: flyscan plus untested hardware changes',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    packages=find_packages(),
+    # tests/ carries an __init__.py so unittest can discover it, which would
+    # otherwise make find_packages() install a top-level 'tests' package into
+    # site-packages and collide with every other project that has one.
+    packages=find_packages(exclude=['tests', 'tests.*', 'dev', 'dev.*']),
     install_requires=[
         'pyserial>=3.5',
         'opencv-python>=4.5',

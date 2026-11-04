@@ -23,7 +23,7 @@ import sys
 import numpy as np
 
 from pscan import daq
-from pscan.daq.base import DEFAULT_TERMINAL, TERMINALS
+from pscan.daq import DEFAULT_TERMINAL, TERMINALS
 
 
 def cmd_list(args):
@@ -31,7 +31,8 @@ def cmd_list(args):
     print("BACKENDS")
     for name, reason in sorted(daq.available_backends().items()):
         mark = "ok " if reason == "available" else "-- "
-        hidden = "" if daq.BACKENDS[name].discoverable() else "  (by name only)"
+        hidden = ("" if daq.backend_class(name).discoverable()
+                  else "  (by name only)")
         print(f"  {mark}{name:<9}{hidden}")
         if reason != "available":
             print(f"      {reason}")
@@ -166,7 +167,7 @@ def build_parser():
 
     def add_target(sub):
         sub.add_argument(
-            '--backend', choices=sorted(daq.BACKENDS),
+            '--backend', choices=daq.backend_names(),
             help="which driver to use. Omit to auto-detect, which refuses to "
                  "guess when more than one card could serve the request.",
         )

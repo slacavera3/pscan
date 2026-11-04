@@ -72,9 +72,13 @@ if ldconfig -p 2>/dev/null | grep -q libnidaqmx; then
 else
     echo " -> [INFO] libnidaqmx not found. Only needed for NI X Series cards"
     echo " ->        (PCIe-635x/636x, e.g. the PCIe-6351); comedi cards are"
-    echo " ->        unaffected. To install:"
-    echo " ->          https://www.ni.com/en/support/documentation/supplemental/18/downloading-and-installing-ni-driver-software-on-linux-desktop.html"
-    echo " ->          sudo apt install ni-daqmx && sudo dkms autoinstall"
+    echo " ->        unaffected."
+    echo " ->        NI-DAQmx is a shared system driver, so it is installed by"
+    echo " ->        install.sh like Comedi and libphidget21, not here:"
+    echo " ->          bash install.sh      # from your stable checkout"
+    echo " ->        That registers NI's apt feed, installs the driver and"
+    echo " ->        builds its kernel modules. Reboot, then re-run this"
+    echo " ->        script to pick up the Python binding."
     NEED_DAQMX_PY=0
 fi
 

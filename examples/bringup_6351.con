@@ -1,0 +1,84 @@
+## =====================================================================
+## PCIe-6351 bring-up - a2d and d2a through the NI-DAQmx backend
+## =====================================================================
+##
+## A deliberately tiny scan (5 traces, a couple of seconds) for proving a
+## new card end to end before trusting it with a real measurement.
+##
+## BEFORE RUNNING THIS, CHECK WHAT IS WIRED TO ao0. The d2a block below
+## drives a real voltage out of it. If a mirror, piezo or amplifier is
+## connected, confirm -1..+1 V is safe for it, or comment the block out -
+## the a2d half of this file is useful on its own.
+##
+## Run it in this order:
+##
+##   pydaq-dev list                 -> does pscan see the card at all?
+##   pscan-dev --dry-run examples/bringup_6351.con
+##   pscan-dev --timer  examples/bringup_6351.con
+##
+## --timer is the point of this file. It breaks each trace down so you can
+## see what the committed DAQmx task actually costs per coordinate on your
+## kernel, rather than taking an estimate for it.
+##
+## Expected output: bringup_6351_a2d1_1f.d, 5 traces x 1000 samples of
+## float32 volts = 20000 bytes. Reload in MATLAB the same way as any other
+## .d file; the backend makes no difference to the format.
+
+## ---------------------------------------------------------------------
+## One trace per coordinate. Raise this to average at a point.
+## ---------------------------------------------------------------------
+action count
+count 1
+end
+
+## ---------------------------------------------------------------------
+## The output axis: sweeps ao0 over -1..+1 V in 0.5 V steps (5 points).
+##
+## 'device Dev1' is whatever 'pydaq-dev list' reported - NI assigns the
+## name, it is not a /dev node. Drop the line to auto-detect, which works
+## as long as only one card can serve the block.
+##
+## 'settle 0.01' is a guess. A galvo settles in about a millisecond, a
+## piezo in tens. Find the real number by raising it until the trace stops
+## changing, then leave a little margin.
+##
+## 'restore' puts ao0 back to -1 V when the sweep finishes.
+##
+## Axis 98 rather than the default 99 for two reasons: 99 prints as
+## "Z/piezo" in the log, which would be misleading here, and leaving 99
+## free means the real piezo can be added later as the inner axis without
+## renumbering this one.
+## ---------------------------------------------------------------------
+action d2a
+axis 98
+backend daqmx
+device Dev1
+channel 0
+units volts
+scan -1.0 1.0 0.5
+limits -2.0 2.0
+settle 0.01
+restore
+end
+
+## ---------------------------------------------------------------------
+## The input: 1000 samples at 10 kHz off ai0, at every coordinate.
+##
+## 'v_min'/'v_max' rather than 'range <index>': the volts resolve to the
+## narrowest range the card offers that contains them, and mean the same
+## thing if this config is ever pointed at the old comedi card.
+##
+## 'terminal rse' is single-ended against ground. Use 'diff' if the
+## photodiode is wired differentially - on a 6351 that halves the usable
+## channel count, ai0 pairing with ai8.
+## ---------------------------------------------------------------------
+action a2d
+channel 0
+backend daqmx
+device Dev1
+v_min -1.0
+v_max 1.0
+terminal rse
+sample_rate 10000
+n_samples 1000
+end

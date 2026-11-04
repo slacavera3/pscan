@@ -1,4 +1,4 @@
-"""The .d file format, which must not depend on which backend wrote it.
+﻿"""The .d file format, which must not depend on which backend wrote it.
 
 A trace acquired through DAQmx and a trace acquired through comedi land in the
 same file, and the MATLAB side downstream has no idea which produced it. If
@@ -14,7 +14,7 @@ import unittest
 
 import numpy as np
 
-from pscan.daq.sim_backend import SimBackend
+from tests.fake_card import FakeCard
 
 
 class TraceFileTestCase(unittest.TestCase):
@@ -22,7 +22,7 @@ class TraceFileTestCase(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "trace.d")
-        self.session = SimBackend()
+        self.session = FakeCard()
         self.session.connect()
 
     def tearDown(self):
@@ -185,7 +185,7 @@ class TestAcquisitionGuards(TraceFileTestCase):
             )
 
     def test_acquiring_without_connecting_returns_false(self):
-        session = SimBackend()
+        session = FakeCard()
         try:
             self.assertFalse(session.acquire_a2d(
                 channel=0, range_val=0, n_samples=8, sample_rate=1000,
@@ -198,7 +198,7 @@ class TestAcquisitionGuards(TraceFileTestCase):
 class TestOutputChannels(unittest.TestCase):
 
     def setUp(self):
-        self.session = SimBackend()
+        self.session = FakeCard()
         self.session.connect()
 
     def tearDown(self):

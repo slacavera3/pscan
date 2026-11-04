@@ -9,7 +9,7 @@ scale on every sample of every trace.
 
 import unittest
 
-from pscan.daq.base import clamp_volts, resolve_range
+from pscan.daq import clamp_volts, resolve_range
 
 # Shaped after a PCIe-6351's AI range list.
 RANGES = ((-10.0, 10.0), (-5.0, 5.0), (-1.0, 1.0), (-0.2, 0.2))

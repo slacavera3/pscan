@@ -1,13 +1,39 @@
 import re
 
-from pscan.daq import BACKENDS as _DAQ_BACKEND_CLASSES
-from pscan.daq.base import DEFAULT_TERMINAL as DEFAULT_DAQ_TERMINAL
-from pscan.daq.base import TERMINALS as DAQ_TERMINALS
+# Names only, so validating a config imports no driver and touches no
+# hardware. Taken from pscan.daq rather than restated here, so adding a
+# backend cannot leave the validator rejecting it.
+from pscan import daq as _daq
+from pscan.daq import DEFAULT_TERMINAL as DEFAULT_DAQ_TERMINAL
+from pscan.daq import TERMINALS as DAQ_TERMINALS
 
-# Backend names a .con file may ask for by name. Taken from the registry
-# rather than restated here, so adding a backend cannot leave the validator
-# rejecting it.
-DAQ_BACKENDS = tuple(sorted(_DAQ_BACKEND_CLASSES))
+
+def _check_backend(body, label, allow_input=True):
+    """Validate a block's 'backend' line, if it has one.
+
+    Asks pscan.daq for the names at call time rather than freezing them at
+    import: a backend registered at runtime - the tests' fake card - is a
+    legitimate name, and in a real install only the shipped drivers exist.
+    """
+    if 'backend' not in _block_keys(body):
+        return None
+
+    backend = _field(body, 'backend', r'(\S+)').group(1).lower()
+    known = _daq.backend_names()
+
+    if backend != 'auto' and backend not in known:
+        raise ValueError(
+            f"{label} backend '{backend}' is not known. Use one of: auto, "
+            f"{', '.join(known)}"
+        )
+
+    if backend == 'phidget' and allow_input:
+        raise ValueError(
+            f"{label} cannot use the phidget backend: the Phidget analog "
+            f"board has outputs only and no analog input."
+        )
+
+    return backend
 
 # Keys each action block understands. Anything else is a typo - which used to
 # fall straight through to a silent default, so a misspelled 'sweep' left the
@@ -109,11 +135,13 @@ D2A_UNITS = ('volts', 'um')
 #: Default settle time for a new 'action d2a' block, in seconds.
 DEFAULT_D2A_SETTLE_S = 0.05
 
-# What 'action d2a_phidget' settles for, preserving the original total exactly:
-# main() slept PIEZO_SETTLE_S (0.20s) after the move and the Phidget driver
-# slept a further 0.05s inside set_position_um(). The backend no longer sleeps
-# at all, so the whole 0.25s now lives on the axis.
-PHIDGET_SETTLE_S = 0.25
+# What 'action d2a_phidget' settles for, preserving the original total exactly.
+# main() slept PIEZO_SETTLE_S (0.20s) after the move, and d2aphidget_driver's
+# set_position_um() slept a further 0.05s inside itself. That driver is still
+# the one doing the write - pscan.daq adapts it rather than replacing it - so
+# its 0.05s is still in the path and only the 0.20s belongs on the axis.
+# 0.20 + 0.05 = the 0.25s a piezo config has always waited.
+PHIDGET_SETTLE_S = 0.20
 
 #: The Phidget piezo's scaling, from the original driver's um_per_volt.
 PHIDGET_UM_PER_VOLT = 20.0
@@ -487,13 +515,9 @@ def validate_blocks(all_blocks):
                 axis = _d2a_axis(body, label, present)
                 unit = _d2a_units(body, label, present)[0]
 
-                if 'backend' in present:
-                    backend = _field(body, 'backend', r'(\S+)').group(1).lower()
-                    if backend not in DAQ_BACKENDS and backend != 'auto':
-                        raise ValueError(
-                            f"{label} backend '{backend}' is not known. Use "
-                            f"one of: auto, {', '.join(sorted(DAQ_BACKENDS))}"
-                        )
+                # A d2a block may name the phidget backend - that board is
+                # outputs only, which is exactly what this block wants.
+                _check_backend(body, label, allow_input=False)
 
                 if 'channel' in present:
                     channel = _require_number(body, 'channel', label, int)
@@ -618,18 +642,9 @@ def validate_blocks(all_blocks):
                         f"{v_max:g}"
                     )
 
-            if 'backend' in present:
-                backend = _field(body, 'backend', r'(\S+)').group(1).lower()
-                if backend not in DAQ_BACKENDS and backend != 'auto':
-                    raise ValueError(
-                        f"{label} backend '{backend}' is not known. Use one "
-                        f"of: auto, {', '.join(DAQ_BACKENDS)}"
-                    )
-                if backend == 'phidget':
-                    raise ValueError(
-                        f"{label} cannot use the phidget backend: the Phidget "
-                        f"analog board has outputs only and no analog input."
-                    )
+            # allow_input=True: an a2d block reads, so the outputs-only
+            # Phidget board is refused here with a reason.
+            _check_backend(body, label, allow_input=True)
 
             if 'terminal' in present:
                 term = _field(body, 'terminal', r'(\S+)').group(1).lower()

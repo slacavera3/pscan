@@ -47,6 +47,142 @@ else
     fi
 fi
 
+# --- 1.7 Setup NI-DAQmx (the only route to NI X Series cards) ---
+echo -e "\n[1.7/6] Checking NI-DAQmx..."
+
+# comedi's ni_pcimio driver covers the NI E and M series and no X Series board,
+# so a PCIe-6351 - or any 635x/636x - is unreachable through comedi and needs
+# NI's own driver.
+#
+# 'ni-daqmx' is NOT in Ubuntu's archives, which is why 'apt install ni-daqmx'
+# fails with "Unable to locate package" on a clean machine. NI ships a small
+# (~31 KB) registration .deb that adds their apt feed, and the real driver
+# comes from that feed. Both halves are automated here so this stays the
+# one-liner it is supposed to be.
+#
+# Env overrides:
+#   PSCAN_SKIP_DAQMX=1    never install it
+#   PSCAN_FORCE_DAQMX=1   install even with no NI card currently seated
+#   NI_RELEASE=2025Q1     pin the release whose zip is fetched
+
+install_nidaqmx() {
+    if ldconfig -p 2>/dev/null | grep -q libnidaqmx; then
+        echo " -> NI-DAQmx is already installed. Skipping."
+        return 0
+    fi
+
+    if [ -n "${PSCAN_SKIP_DAQMX:-}" ]; then
+        echo " -> PSCAN_SKIP_DAQMX is set. Skipping."
+        return 0
+    fi
+
+    # Don't pull a large vendor driver with kernel modules onto a machine that
+    # has no NI card in it. A comedi-only rig needs none of this.
+    if [ -z "${PSCAN_FORCE_DAQMX:-}" ]; then
+        if ! lspci 2>/dev/null | grep -qi "National Instruments"; then
+            echo " -> No NI PCI/PCIe card found by lspci, so NI-DAQmx is not"
+            echo " -> being installed. comedi cards are unaffected."
+            echo " -> Seat the card and re-run this script, or force it with:"
+            echo " ->   PSCAN_FORCE_DAQMX=1 bash install.sh"
+            return 0
+        fi
+        echo " -> NI card detected by lspci:"
+        lspci 2>/dev/null | grep -i "National Instruments" | sed 's/^/ ->   /'
+    fi
+
+    local distro release ubu
+    distro=$(lsb_release -is 2>/dev/null || echo unknown)
+    release=$(lsb_release -rs 2>/dev/null || echo unknown)
+    ubu=$(echo "$release" | tr -d .)
+
+    if [ "$distro" != "Ubuntu" ]; then
+        echo " -> [WARNING] NI ships .deb registration packages for Ubuntu only"
+        echo " ->           (.rpm for RHEL and openSUSE). This machine is"
+        echo " ->           '$distro $release', so install NI-DAQmx by hand:"
+        echo " ->   https://www.ni.com/en/support/downloads/drivers/download.ni-linux-device-drivers.html"
+        return 1
+    fi
+
+    sudo apt install -y curl unzip
+
+    # Every release's zip carries a '-stream' registration package pointing at
+    # NI's rolling feed, so even an older zip yields current drivers. Probed
+    # newest-first, so this keeps working as NI publishes new releases without
+    # anyone editing this list.
+    local candidates="${NI_RELEASE:-}"
+    if [ -z "$candidates" ]; then
+        candidates="2026Q4 2026Q3 2026Q2 2026Q1 2025Q4 2025Q3 2025Q2 2025Q1"
+        candidates="$candidates 2024Q4 2024Q3 2024Q2 2024Q1 2023Q4 2023Q3 2023Q2"
+    fi
+
+    local base="https://download.ni.com/support/softlib/MasterRepository"
+    local url="" found_rel="" rel="" try=""
+
+    echo " -> Looking for the newest NI Linux driver release..."
+    for rel in $candidates; do
+        try="$base/LinuxDrivers$rel/NILinux${rel}DeviceDrivers.zip"
+        # A one-byte range request rather than HEAD: more widely honoured,
+        # and enough to prove the file is there.
+        if curl -fsL --max-time 20 -r 0-0 -o /dev/null "$try" 2>/dev/null; then
+            url="$try"
+            found_rel="$rel"
+            break
+        fi
+    done
+
+    if [ -z "$url" ]; then
+        echo " -> [ERROR] Could not reach any NI driver release at $base."
+        echo " ->         Check network access, or download the registration"
+        echo " ->         package by hand from:"
+        echo " ->   https://www.ni.com/en/support/downloads/drivers/download.ni-linux-device-drivers.html"
+        return 1
+    fi
+    echo " -> Found release $found_rel."
+
+    # Its own directory, and nothing is executed out of it - the zip is
+    # third-party content and only the one .deb we name is taken from it.
+    local workdir
+    workdir=$(mktemp -d)
+
+    if ! curl -fsL --max-time 300 -o "$workdir/ni.zip" "$url"; then
+        echo " -> [ERROR] Download failed: $url"
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    local deb="ni-ubuntu${ubu}-drivers-stream.deb"
+    if ! unzip -l "$workdir/ni.zip" | grep -q "$deb"; then
+        echo " -> [ERROR] Release $found_rel has no registration package for"
+        echo " ->         Ubuntu $release. It contains:"
+        unzip -l "$workdir/ni.zip" | grep -o 'ni-ubuntu[0-9]*' | sort -u | sed 's/^/ ->           /'
+        echo " ->         Pin a newer release with NI_RELEASE=<rel>, or"
+        echo " ->         install by hand."
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    echo " -> Registering NI's apt feed ($deb)..."
+    unzip -j -o "$workdir/ni.zip" "$deb" -d "$workdir" >/dev/null
+    sudo apt install -y "$workdir/$deb"
+
+    echo " -> Installing the driver from NI's feed..."
+    sudo apt update
+    sudo apt install -y ni-daqmx
+
+    echo " -> Building kernel modules for the running kernel..."
+    sudo dkms autoinstall
+
+    rm -rf "$workdir"
+
+    echo " ->"
+    echo " -> NI-DAQmx installed. A REBOOT IS REQUIRED before the card is"
+    echo " -> usable. After rebooting, check it with:  pydaq-dev list"
+    NI_DAQMX_NEEDS_REBOOT=1
+    return 0
+}
+
+install_nidaqmx || echo " -> [WARNING] NI-DAQmx setup did not complete; see above."
+
 # --- 2. Setup Tucsen SDK Drivers ---
 echo -e "\n[2/6] Setting up Tucsen Dhyana SDK..."
 TUCSEN_DIR="/opt/tucsen/sdk/lib"
@@ -99,6 +235,25 @@ sudo rm -f /usr/local/bin/pscan
 echo -e "\n[6/6] Compiling and installing pscan..."
 sudo pip install --force-reinstall --no-deps --no-cache-dir . $FLAG
 
+# The install above is --no-deps, so the [daqmx] extra would never be pulled
+# in. Install the Python binding explicitly, and only when the driver it wraps
+# is actually present - 'pydaq-dev list' reporting the backend as available
+# when there is no driver underneath it would be worse than reporting nothing.
+if ldconfig -p 2>/dev/null | grep -q libnidaqmx; then
+    echo " -> NI-DAQmx driver present: installing the nidaqmx Python package."
+    sudo pip install --no-cache-dir 'nidaqmx>=0.9' $FLAG
+fi
+
 echo -e "\n======================================================="
-echo " DONE! You can now run 'pscan' | 'pystage' | 'pypiezo' from anywhere."
+echo " DONE! You can now run 'pscan' | 'pystage' | 'pypiezo' |"
+echo " 'pydaq' from anywhere."
+echo ""
+echo " 'pydaq list' shows which DAQ cards pscan can reach and"
+echo " under which backend - start there when bringing up a card."
+if [ -n "${NI_DAQMX_NEEDS_REBOOT:-}" ]; then
+    echo ""
+    echo " *** REBOOT REQUIRED: NI-DAQmx was installed this run and its"
+    echo " *** kernel modules are not loaded yet. No NI X Series card will"
+    echo " *** be visible until you reboot."
+fi
 echo "======================================================="

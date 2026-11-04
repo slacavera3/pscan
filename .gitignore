@@ -6,9 +6,14 @@ __pycache__/
 *.d
 *.jpg
 *.con
-# Real run configs stay out of the repo, but the worked example is
-# documentation and has to travel with the code.
+# Real run configs stay out of the repo, but the worked examples are
+# documentation and have to travel with the code.
 !flyscan/example_flyscan.con
+!examples/*.con
+
+# Local notes to Claude. Design philosophy and standing instructions for this
+# checkout - useful to have in the working tree, not something to push.
+context.md
 build/
 dist/
 *.egg-info/
