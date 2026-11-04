@@ -43,42 +43,62 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_DIR" rev-parse --git-dir >/de
     echo " -> Branch: $(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD) ($(git -C "$REPO_DIR" rev-parse --short HEAD))"
 fi
 
-# --- 2. Check the shared system drivers ---
-# These are installed system-wide by install.sh and are not duplicated here:
-# both builds load the same .so files through ctypes. Missing ones are only
-# a problem for the hardware that needs them, so warn rather than exit.
-echo -e "\n[2/5] Checking shared system drivers..."
-if [ -f "/usr/local/lib/libphidget21.so" ] || [ -f "/usr/lib/libphidget21.so" ]; then
-    echo " -> libphidget21.so found."
+# --- 2. Install the shared system drivers ---
+# These are shared - both builds load the same .so files through ctypes - so
+# they are installed by install.sh, which this script calls with
+# --drivers-only. That flag stops install.sh before its pip step, which is the
+# part that must not run here: both builds ship a top-level 'pscan' package,
+# so a full install.sh would drop this branch's copy over a stable one.
+#
+# This used to only WARN and tell you to run install.sh from a stable
+# checkout. On an experimental rig with no stable checkout that was
+# impossible, and the result was a machine where every DAQ backend reported
+# itself unavailable.
+echo -e "\n[2/5] Installing shared system drivers..."
+
+drivers_present() {
+    local missing=0
+    ldconfig -p 2>/dev/null | grep -q libcomedi || missing=1
+    [ -f "/usr/local/lib/libphidget21.so" ] || [ -f "/usr/lib/libphidget21.so" ] || missing=1
+    [ -f "/opt/tucsen/sdk/lib/libTUCam.so" ] || missing=1
+    return $missing
+}
+
+if drivers_present; then
+    echo " -> All shared drivers already present. Skipping."
 else
-    echo " -> [WARNING] libphidget21.so not found. The piezo D2A will not work."
-    echo " -> Run 'bash install.sh' once to install the shared system drivers."
+    echo " -> One or more shared drivers are missing; running install.sh"
+    echo " -> --drivers-only (this needs sudo)."
+    # In a subshell with the repo as CWD: install.sh resolves ./libs/ and its
+    # libTUCam.so search relative to the working directory, so calling it from
+    # anywhere else would silently fail to find the bundled tarballs.
+    ( cd "$REPO_DIR" && bash install.sh --drivers-only ) || \
+        echo " -> [WARNING] Driver install did not complete cleanly; see above."
 fi
 
-if [ -f "/opt/tucsen/sdk/lib/libTUCam.so" ]; then
-    echo " -> libTUCam.so found."
-else
-    echo " -> [WARNING] libTUCam.so not found at /opt/tucsen/sdk/lib."
-    echo " -> The Tucsen camera will not work until install.sh has been run."
-fi
+# Report what is actually usable, after the attempt above.
+ldconfig -p 2>/dev/null | grep -q libcomedi \
+    && echo " -> libcomedi found." \
+    || echo " -> [WARNING] libcomedi not found. comedi cards will not work."
 
-# NI-DAQmx is the only way to reach an NI X Series card - comedi's ni_pcimio
-# driver covers the E and M series and no X Series board, so a PCIe-6351 is
-# invisible to it. Not installed here: the driver is a large system package
-# with kernel modules, which is the user's call, not an installer's.
+{ [ -f "/usr/local/lib/libphidget21.so" ] || [ -f "/usr/lib/libphidget21.so" ]; } \
+    && echo " -> libphidget21.so found." \
+    || echo " -> [WARNING] libphidget21.so not found. The piezo D2A will not work."
+
+[ -f "/opt/tucsen/sdk/lib/libTUCam.so" ] \
+    && echo " -> libTUCam.so found." \
+    || echo " -> [WARNING] libTUCam.so not found. The Tucsen camera will not work."
+
 if ldconfig -p 2>/dev/null | grep -q libnidaqmx; then
     echo " -> libnidaqmx found (NI-DAQmx driver installed)."
     NEED_DAQMX_PY=1
 else
     echo " -> [INFO] libnidaqmx not found. Only needed for NI X Series cards"
     echo " ->        (PCIe-635x/636x, e.g. the PCIe-6351); comedi cards are"
-    echo " ->        unaffected."
-    echo " ->        NI-DAQmx is a shared system driver, so it is installed by"
-    echo " ->        install.sh like Comedi and libphidget21, not here:"
-    echo " ->          bash install.sh      # from your stable checkout"
-    echo " ->        That registers NI's apt feed, installs the driver and"
-    echo " ->        builds its kernel modules. Reboot, then re-run this"
-    echo " ->        script to pick up the Python binding."
+    echo " ->        unaffected. install.sh skips it when lspci sees no NI"
+    echo " ->        card - seat the card and re-run, or force it with:"
+    echo " ->          PSCAN_FORCE_DAQMX=1 bash install.sh --drivers-only"
+    echo " ->        A reboot is needed after it installs, then re-run this."
     NEED_DAQMX_PY=0
 fi
 
@@ -87,10 +107,32 @@ fi
 # half-removed earlier build is the failure mode worth spending 20 seconds to
 # rule out, and this script is expected to be re-run on every update.
 echo -e "\n[3/5] Creating an isolated virtualenv..."
-if ! python3 -m venv --help >/dev/null 2>&1; then
-    echo " -> [ERROR] python3-venv is missing. Install it with:"
-    echo " ->   sudo apt install -y python3-venv"
-    exit 1
+# `python3 -m venv --help` is NOT a usable check: the venv module ships with
+# Python, so --help succeeds on a machine where creating a venv still fails
+# with "ensurepip is not available". Debian and Ubuntu split ensurepip into a
+# separate package, so test for what is actually needed.
+venv_ready() {
+    python3 -c 'import venv, ensurepip' >/dev/null 2>&1
+}
+
+if ! venv_ready; then
+    # The package name is version-specific (python3.13-venv on a 3.13
+    # machine), and the generic metapackage does not always pull the right
+    # one. Install both names and let apt sort it out.
+    PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    echo " -> python3-venv is missing (ensurepip unavailable). Installing"
+    echo " -> python${PYVER}-venv. This is the one step here that needs sudo."
+    sudo apt install -y "python${PYVER}-venv" || true
+    if ! venv_ready; then
+        sudo apt install -y python3-venv || true
+    fi
+
+    if ! venv_ready; then
+        echo " -> [ERROR] Could not make python3-venv work. Install it by hand:"
+        echo " ->   sudo apt install -y python${PYVER}-venv"
+        exit 1
+    fi
+    echo " -> python3-venv is ready."
 fi
 mkdir -p "$(dirname "$VENV_DIR")"
 python3 -m venv --clear "$VENV_DIR"

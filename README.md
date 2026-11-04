@@ -49,8 +49,12 @@ git clone https://github.com/slacavera3/pscan.git pscan-dev
 cd pscan-dev
 git checkout test/working-snapshot
 
-# Step 2: Run the dev installer (no sudo, nothing installed system-wide)
+# Step 2: Run the dev installer (nothing installed system-wide)
 bash install-dev.sh
+
+# It asks for sudo in exactly one case: python3-venv missing. Debian and
+# Ubuntu split ensurepip into its own package, so a virtualenv cannot be
+# created without it. Once it is there, re-runs use no sudo at all.
 
 # TO UPDATE LATER:
 cd /path/to/pscan-dev
@@ -70,14 +74,15 @@ If they come back "command not found", ~/.local/bin is not on your PATH:
 Debian and Ubuntu add that directory for you, but only if it already exists
 when you log in - so the first install, which creates it, needs this once.
 
-The shared system drivers (Comedi, libphidget21, libTUCam) are NOT installed
-by install-dev.sh. Both builds load the same .so files, so run the normal
-`bash install.sh` once from your stable checkout to put them in place;
-install-dev.sh only checks for them and warns.
+install-dev.sh installs the shared system drivers too (Comedi, libphidget21,
+libTUCam, NI-DAQmx), so it is sufficient on its own on a fresh machine. It
+does that by calling `install.sh --drivers-only`, which stops before
+install.sh's pip step - the part that must not run on this branch, since it
+would drop this build's `pscan` package over a stable one.
 
-NI-DAQmx is also not installed for you - see "DAQ CARDS AND BACKENDS" below.
-install-dev.sh checks whether it is present and, if it is, adds the `nidaqmx`
-Python package to this build automatically.
+It skips the whole step when all the drivers are already present, so a re-run
+costs nothing. NI-DAQmx is skipped when `lspci` reports no NI card; see "DAQ
+CARDS AND BACKENDS" below for the override.
 
 # TO REMOVE THE EXPERIMENTAL BUILD:
 rm -f ~/.local/bin/{pscan-dev,pystage-dev,pypiezo-dev,pydaq-dev,flyscan-dev}

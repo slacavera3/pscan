@@ -4,10 +4,36 @@ echo "======================================================="
 echo "        PSCAN LAB - AUTOMATED INSTALL & UPDATE         "
 echo "======================================================="
 
+# --drivers-only installs the shared system drivers (sections 1 to 2) and
+# stops before touching Python packages.
+#
+# That matters because install-dev.sh needs these drivers but must NOT run
+# the pip install below - both builds ship a top-level 'pscan' package, so
+# that would drop this branch's copy on top of a stable install. The split
+# used to be documented as "run install.sh from your stable checkout", which
+# is two commands in two checkouts and impossible on an experimental rig that
+# has no stable checkout at all. The result was a machine where every backend
+# reported itself unavailable and the fix was a paragraph of prose.
+#
+# Every driver step is idempotent, so re-running this costs seconds.
+DRIVERS_ONLY=0
+if [ "${1:-}" = "--drivers-only" ]; then
+    DRIVERS_ONLY=1
+    echo " MODE: shared system drivers only (no Python packages)"
+fi
+
 # --- 1. Install System Dependencies ---
 echo -e "\n[1/6] Checking OS-level C-drivers (Comedi)..."
 sudo apt update
-sudo apt install -y curl libcomedi0 libcomedi-dev
+# python3-venv is here for install-dev.sh's benefit: Debian and Ubuntu split
+# ensurepip out, so creating a virtualenv fails without it. The versioned name
+# is the one that actually matters (python3.13-venv on a 3.13 machine); the
+# metapackage does not always pull it.
+PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "")
+sudo apt install -y curl unzip libcomedi0 libcomedi-dev python3-venv
+if [ -n "$PYVER" ]; then
+    sudo apt install -y "python${PYVER}-venv" 2>/dev/null || true
+fi
 
 # --- 1.5 Setup Phidgets OS Drivers (Legacy C Library) ---
 echo -e "\n[1.5/6] Setting up Phidget21 C Library from local tarball..."
@@ -202,6 +228,18 @@ else
         echo " -> [WARNING] libTUCam.so not found!"
         echo " -> Please extract your Tucsen driver archive inside this folder, or manually copy libTUCam.so to $TUCSEN_DIR."
     fi
+fi
+
+if [ "$DRIVERS_ONLY" -eq 1 ]; then
+    echo -e "\n======================================================="
+    echo " Shared system drivers done."
+    if [ -n "${NI_DAQMX_NEEDS_REBOOT:-}" ]; then
+        echo ""
+        echo " *** REBOOT REQUIRED: NI-DAQmx was installed this run and its"
+        echo " *** kernel modules are not loaded yet."
+    fi
+    echo "======================================================="
+    exit 0
 fi
 
 # --- 3. Automated PEP 668 Flag Detection ---

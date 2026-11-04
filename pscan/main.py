@@ -791,12 +791,14 @@ def print_dry_run(con_filepath, base_filename, setup_pipeline,
                   f"{scaling}"
                   f"{', restores to start' if params.get('restore') else ''}")
 
-    factors = " x ".join(
-        str(len(stage_params[a]['positions'])) for a in axis_order
-    )
-    factors = f"{factors} x " if factors else ""
+    factors = [str(len(stage_params[a]['positions'])) for a in axis_order]
+    factors.append(str(count_val))
     print(f"\n  Repeats per coordinate (count): {count_val}")
-    print(f"  Total traces: {factors}{count_val} = {global_total_traces}")
+    if len(factors) > 1:
+        print(f"  Total traces: {' x '.join(factors)} = {global_total_traces}")
+    else:
+        # Nothing to multiply out, so showing "1 = 1" would just be noise.
+        print(f"  Total traces: {global_total_traces}")
 
     if total_a2d_blocks or any(p.get('type') == 'd2a'
                                for p in stage_params.values()):
