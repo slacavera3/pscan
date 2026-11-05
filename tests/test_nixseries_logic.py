@@ -18,6 +18,7 @@ from pscan.nixseries_driver import (
     AO_RANGES,
     MAX_RATE_HZ,
     TERMINAL_CODES,
+    X_SERIES_BY_SUBSYSTEM,
     NIXSeriesDriver,
     _resource_string,
 )
@@ -111,6 +112,44 @@ class TestRangeTables(unittest.TestCase):
     def test_a_request_beyond_full_scale_is_refused(self):
         with self.assertRaises(ValueError):
             resolve_range(AI_RANGES, v_min=-20.0, v_max=20.0)
+
+
+class TestDeviceTable(unittest.TestCase):
+    """Models are identified by PCI SUBSYSTEM id, not device id.
+
+    Every X Series board reports the same generic PCI device id, which is why
+    lspci calls a PCIe-6351 a "PXIe/PCIe Device". Reading the wrong attribute
+    makes every card look identical and unidentifiable.
+    """
+
+    def test_the_6351_is_listed_with_its_real_channel_counts(self):
+        self.assertEqual(
+            X_SERIES_BY_SUBSYSTEM[0x742F], ("PCIe-6351", 16, 2)
+        )
+
+    def test_the_generic_device_id_is_not_in_the_table(self):
+        # 0xc4c4 is what sysfs 'device' reports for the whole family. If it
+        # ever appears here, someone has wired the lookup to the wrong
+        # attribute.
+        self.assertNotIn(0xC4C4, X_SERIES_BY_SUBSYSTEM)
+
+    def test_table_matches_the_ddk(self):
+        # Spot checks across the families in Examples/devices.cpp.
+        self.assertEqual(X_SERIES_BY_SUBSYSTEM[0x7425], ("PCIe-6320", 16, 0))
+        self.assertEqual(X_SERIES_BY_SUBSYSTEM[0x7431], ("PCIe-6353", 32, 4))
+        self.assertEqual(X_SERIES_BY_SUBSYSTEM[0x74DE], ("PXIe-6378", 16, 4))
+
+    def test_every_entry_is_well_formed(self):
+        for subsystem, (name, n_ai, n_ao) in X_SERIES_BY_SUBSYSTEM.items():
+            self.assertTrue(0x7000 <= subsystem <= 0x7FFF,
+                            f"{name}: implausible subsystem id")
+            self.assertRegex(name, r'^(PCIe|PXIe)-6\d{3}$')
+            self.assertGreater(n_ai, 0, f"{name}: no AI channels")
+            self.assertGreaterEqual(n_ao, 0)
+
+    def test_the_6320_has_no_analog_output(self):
+        # The one entry with zero DACs, so a d2a block must not pick it.
+        self.assertEqual(X_SERIES_BY_SUBSYSTEM[0x7425][2], 0)
 
 
 class TestTerminalCodes(unittest.TestCase):

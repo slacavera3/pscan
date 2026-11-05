@@ -88,6 +88,40 @@ TERMINAL_CODES = {
 #: device, which caps a single-channel sample rate at 100 MHz / 400.
 MAX_RATE_HZ = 250000.0
 
+# X Series models by PCI SUBSYSTEM device id, transcribed from the DDK's
+# Examples/devices.cpp, as (name, AI channels, AO channels).
+#
+# The PCI device id is useless for identification: every X Series board
+# reports the same generic value (0xc4c4), which is why lspci calls a
+# PCIe-6351 a "PXIe/PCIe Device". The model is in the subsystem id, and that
+# is readable from sysfs - so enumeration can name the card accurately
+# without opening it, mapping registers or needing root.
+#
+# Only used for display before connect(); once open, the card is asked
+# directly via the DDK and that answer wins.
+X_SERIES_BY_SUBSYSTEM = {
+    0x7425: ("PCIe-6320", 16, 0),
+    0x7427: ("PCIe-6321", 16, 2),
+    0x7429: ("PCIe-6323", 32, 4),
+    0x7428: ("PXIe-6323", 32, 4),
+    0x742B: ("PCIe-6341", 16, 2),
+    0x742D: ("PCIe-6343", 32, 4),
+    0x742A: ("PXIe-6341", 16, 2),
+    0x742C: ("PXIe-6343", 32, 4),
+    0x742F: ("PCIe-6351", 16, 2),
+    0x7431: ("PCIe-6353", 32, 4),
+    0x7436: ("PXIe-6356", 8, 2),
+    0x7437: ("PXIe-6358", 16, 4),
+    0x7433: ("PCIe-6361", 16, 2),
+    0x7435: ("PCIe-6363", 32, 4),
+    0x7432: ("PXIe-6361", 16, 2),
+    0x7434: ("PXIe-6363", 32, 4),
+    0x7438: ("PXIe-6366", 8, 2),
+    0x7439: ("PXIe-6368", 16, 4),
+    0x74DD: ("PXIe-6376", 8, 2),
+    0x74DE: ("PXIe-6378", 16, 4),
+}
+
 
 class _DeviceInfoStruct(ctypes.Structure):
     """Mirrors xseries_device_info in the shim. Field order must match."""
@@ -175,16 +209,20 @@ def _pci_devices():
     if not os.path.isdir(root):
         return found
 
+    def attribute(entry, name):
+        with open(os.path.join(root, entry, name)) as f:
+            return int(f.read().strip(), 16)
+
     for entry in sorted(os.listdir(root)):
         try:
-            with open(os.path.join(root, entry, "vendor")) as f:
-                if int(f.read().strip(), 16) != 0x1093:
-                    continue
-            with open(os.path.join(root, entry, "device")) as f:
-                device_id = int(f.read().strip(), 16)
+            if attribute(entry, "vendor") != 0x1093:
+                continue
+            # The subsystem id is what identifies the model; the device id is
+            # the same generic value across the whole X Series.
+            subsystem = attribute(entry, "subsystem_device")
         except (OSError, ValueError):
             continue
-        found.append((entry, device_id))
+        found.append((entry, subsystem))
     return found
 
 
@@ -244,16 +282,24 @@ class NIXSeriesDriver(DAQBackend):
             return []
 
         found = []
-        for slot, device_id in _pci_devices():
+        for slot, subsystem in _pci_devices():
+            known = X_SERIES_BY_SUBSYSTEM.get(subsystem)
+            if known is not None:
+                model, n_ai, n_ao = known
+            else:
+                # An NI card this table does not list. Still offered, because
+                # connect() asks the card itself and may well identify it -
+                # the table is only for naming it beforehand. One of each
+                # channel so a block looking for either still considers it.
+                model = f"NI card, subsystem 0x{subsystem:04x} (unrecognised)"
+                n_ai, n_ao = 1, 1
+
             found.append(DeviceInfo(
                 backend=cls.name,
                 address=slot,
-                model=f"NI PCI device 0x{device_id:04x} (not probed)",
-                # Not yet known - the card has to be opened to ask. Declared
-                # as capable of both so a block looking for either considers
-                # it, rather than being filtered out before it can be tried.
-                n_ai=1,
-                n_ao=1,
+                model=model,
+                n_ai=n_ai,
+                n_ao=n_ao,
                 ai_ranges=AI_RANGES,
                 ao_ranges=AO_RANGES,
                 max_ai_rate=MAX_RATE_HZ,
