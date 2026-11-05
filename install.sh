@@ -50,15 +50,21 @@ mkdir -p "$VENDOR_DIR" 2>/dev/null || true
 VENDOR_MISSING=0
 VENDOR_REQUESTS=""
 
-# First file under libs/vendor/ matching a glob, or empty.
+# First file the USER dropped under libs/vendor/ matching a glob, or empty.
 #
 # maxdepth 6 because a vendor SDK extracted in place is several levels deep -
 # the Tucsen tarball lands its library at
 # TUCamSample_ubuntu22.04_.../sdk/lib/libTUCam.so.1.0.0, which is four levels
 # down. A shallower limit silently fails to find a file that is sitting right
 # there, which is worse than not looking.
+#
+# libs/vendor/build/ is excluded because it is OUR extraction output, not a
+# user drop, and it gets wiped at the start of every build. Without this
+# exclusion the search finds last run's unpacked copy, the wipe deletes it,
+# and the build then reports that it cannot find what it just found.
 vendor_find() {
-    find "$VENDOR_DIR" -maxdepth 6 -iname "$1" -print 2>/dev/null | head -n 1
+    find "$VENDOR_DIR" -maxdepth 6 -path "$VENDOR_DIR/build" -prune -o \
+         -iname "$1" -print 2>/dev/null | head -n 1
 }
 
 # request_vendor <label> <expected-filename> <url> <what-it-is-for>
@@ -363,14 +369,26 @@ echo -e "\n[1.8/6] Checking NI X Series DDK..."
 #
 # Two downloads, both free but licence-restricted, so neither is vendored.
 # The OS interface arrives under several names depending on which flavour was
-# downloaded, so look for the header that identifies any of them as well as
-# the likely archive names.
+# downloaded. An ARCHIVE is looked for first and a pre-extracted directory
+# only as a fallback, because the two are handled differently below: an
+# archive is unpacked into build/, a directory is used where it sits.
+# Conflating them is what broke this before.
 XSERIES_TARBALL="$(vendor_find 'nixseries*.tar.gz')"
-XSERIES_OSI="$(vendor_find 'osiBus.h')"
-[ -n "$XSERIES_OSI" ] || XSERIES_OSI="$(vendor_find '*linux*kernel*module*')"
-[ -n "$XSERIES_OSI" ] || XSERIES_OSI="$(vendor_find '*nirlpk*')"
-[ -n "$XSERIES_OSI" ] || XSERIES_OSI="$(vendor_find '*osinterface*')"
-[ -n "$XSERIES_OSI" ] || XSERIES_OSI="$(vendor_find '*Linux26*')"
+
+XSERIES_OSI_ARCHIVE="$(vendor_find '*kernelmodule*.tar.gz')"
+[ -n "$XSERIES_OSI_ARCHIVE" ] || XSERIES_OSI_ARCHIVE="$(vendor_find '*osinterface*.tar.gz')"
+[ -n "$XSERIES_OSI_ARCHIVE" ] || XSERIES_OSI_ARCHIVE="$(vendor_find '*nimhddk*.tar.gz')"
+[ -n "$XSERIES_OSI_ARCHIVE" ] || XSERIES_OSI_ARCHIVE="$(vendor_find '*Linux*Kernel*.tar.gz')"
+
+# Only if no archive: a tree the user unpacked themselves, identified by the
+# one header every flavour has.
+XSERIES_OSI_DIR=""
+if [ -z "$XSERIES_OSI_ARCHIVE" ]; then
+    _osi_header="$(vendor_find 'osiBus.h')"
+    [ -n "$_osi_header" ] && XSERIES_OSI_DIR="${_osi_header%/osiBus.h}"
+fi
+
+XSERIES_OSI="${XSERIES_OSI_ARCHIVE:-$XSERIES_OSI_DIR}"
 
 if [ -z "$XSERIES_TARBALL" ]; then
     echo " -> X Series DDK source not found; will request it below."
@@ -406,13 +424,20 @@ if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
     XS_DDK="$(find "$XS_BUILD" -maxdepth 3 -type d -name ChipObjects -print -quit 2>/dev/null)"
     XS_DDK="${XS_DDK%/ChipObjects}"
 
-    # The OS interface may be a tarball or an already-extracted directory.
-    case "$XSERIES_OSI" in
-        *.tar.gz|*.tgz) tar -xzf "$XSERIES_OSI" -C "$XS_BUILD" || true ;;
-        *.zip)          unzip -q -o "$XSERIES_OSI" -d "$XS_BUILD" || true ;;
-    esac
-    XS_OSI="$(find "$XS_BUILD" "$VENDOR_DIR" -maxdepth 4 -name osiBus.h -print -quit 2>/dev/null)"
-    XS_OSI="${XS_OSI%/osiBus.h}"
+    # An archive is unpacked into build/; a directory the user extracted
+    # themselves is used in place and never copied, so nothing here can
+    # delete it.
+    if [ -n "$XSERIES_OSI_ARCHIVE" ]; then
+        echo " -> Extracting the OS interface..."
+        case "$XSERIES_OSI_ARCHIVE" in
+            *.tar.gz|*.tgz) tar -xzf "$XSERIES_OSI_ARCHIVE" -C "$XS_BUILD" || true ;;
+            *.zip)          unzip -q -o "$XSERIES_OSI_ARCHIVE" -d "$XS_BUILD" || true ;;
+        esac
+        XS_OSI="$(find "$XS_BUILD" -maxdepth 4 -name osiBus.h -print -quit 2>/dev/null)"
+        XS_OSI="${XS_OSI%/osiBus.h}"
+    else
+        XS_OSI="$XSERIES_OSI_DIR"
+    fi
 
     if [ -z "$XS_DDK" ] || [ -z "$XS_OSI" ]; then
         echo " -> [WARNING] Could not locate the DDK and OS interface after"
