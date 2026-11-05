@@ -1,7 +1,15 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Native build output. install.sh compiles the X Series shim in place, so
+# these land beside their sources in libs/xseries_shim/ - and a 'git add -A'
+# on a rig that has just run the installer will otherwise commit them.
 *.so
+*.so.*
+*.o
+*.a
+libs/xseries_shim/libpscan_xseries.so*
 *.dat
 *.d
 *.jpg
