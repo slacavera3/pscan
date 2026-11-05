@@ -23,6 +23,13 @@ What it needs from the system:
     targets kernel 2.4.
   * ROOT. The card's PCI BARs are mapped directly and the kernel does not let
     an unprivileged process do that.
+  * KERNEL LOCKDOWN OFF. Lockdown blocks userspace BAR mapping outright
+    (LOCKDOWN_PCI_ACCESS -> EPERM), and root does not override it. Secure
+    Boot enables lockdown automatically, and it cannot be lowered at
+    runtime, so this means Secure Boot off in the BIOS. Check with
+    'cat /sys/kernel/security/lockdown' - a bracketed mode is the active
+    one, and "none" has to be the bracketed one for this backend to work.
+    dev/check_bar_mmap.py diagnoses all of this without opening the card.
 
 NO KERNEL MODULE. Although the download is the kernel-module flavour, only
 its osiBus.cpp and headers are used; libs/xseries_shim/osiUserCode_sysfs.cpp

@@ -179,10 +179,10 @@ void* xseries_open(const char* resource)
    s->bus = acquireBoard(const_cast<tChar*>(resource));
    if (s->bus == NULL)
    {
-      // Almost always a permissions problem: the LinuxDevMem interface mmaps
-      // /dev/mem, which needs root.
-      set_err(s, "acquireBoard('%s') failed - no such device, or no "
-                 "permission to map its registers (this needs root)",
+      // acquireBoard() has already printed the specific reason, with errno
+      // where there was one. Repeating a guess here - this message used to
+      // assert it was a permissions problem - only buries the real answer.
+      set_err(s, "acquireBoard('%s') failed; see the reason printed above",
               resource);
       return s;
    }

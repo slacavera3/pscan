@@ -45,6 +45,7 @@
 
 #include "osiBus.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -212,13 +213,18 @@ iBus* acquireBoard(tChar* brdLocation)
    snprintf(resourcePath, sizeof(resourcePath), "%s/%s/resource0",
             kPciDevices, slot);
 
-   // O_SYNC so the mapping is not write-buffered: these are device
-   // registers, and a deferred write would reorder against a status read.
-   const int fd = open(resourcePath, O_RDWR | O_SYNC);
+   // O_SYNC asks for an unbuffered mapping, which is what device registers
+   // want. Not every kernel accepts it on a sysfs resource file though, so a
+   // plain O_RDWR open is tried as well before giving up - failing over a
+   // flag the mapping does not strictly need would be a silly way to lose
+   // the card.
+   int fd = open(resourcePath, O_RDWR | O_SYNC);
+   if (fd < 0) fd = open(resourcePath, O_RDWR);
    if (fd < 0)
    {
-      printf("could not open %s - mapping a PCI BAR needs root\n",
-             resourcePath);
+      printf("could not open %s: %s\n", resourcePath, strerror(errno));
+      if (errno == EACCES || errno == EPERM)
+         printf("   mapping a PCI BAR needs root\n");
       return NULL;
    }
 
@@ -227,7 +233,45 @@ iBus* acquireBoard(tChar* brdLocation)
    void* mem0 = mmap(NULL, bar0Size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
    if (mem0 == MAP_FAILED)
    {
-      printf("could not mmap %s (%lu bytes)\n", resourcePath, bar0Size);
+      const int mmapErrno = errno;
+      printf("could not mmap %s (%lu bytes): %s\n",
+             resourcePath, bar0Size, strerror(mmapErrno));
+
+      // The errno distinguishes causes that need completely different fixes,
+      // so say which is which rather than leaving it to be guessed at.
+      switch (mmapErrno)
+      {
+         case EINVAL:
+            printf("   EINVAL usually means the kernel is refusing userspace\n"
+                   "   access to this BAR. Either a driver has claimed the\n"
+                   "   region (check 'lspci -ks %s' for a bound driver), or\n"
+                   "   the kernel was built with CONFIG_IO_STRICT_DEVMEM and\n"
+                   "   needs 'iomem=relaxed' on the kernel command line.\n",
+                   slot);
+            break;
+         case EPERM:
+            // Root is not enough here, so saying "needs root" - which this
+            // used to - sends you looking in the wrong place.
+            printf("   EPERM, which root does NOT fix. Kernel lockdown is\n"
+                   "   almost certainly on: it blocks userspace PCI BAR\n"
+                   "   mapping outright (LOCKDOWN_PCI_ACCESS). Check with\n"
+                   "     cat /sys/kernel/security/lockdown\n"
+                   "   A bracketed [integrity] or [confidentiality] means\n"
+                   "   active, and Secure Boot turns it on automatically.\n"
+                   "   Lockdown cannot be lowered at runtime - either turn\n"
+                   "   Secure Boot off in the BIOS, or reach the card\n"
+                   "   through vfio-pci instead.\n");
+            break;
+         case EACCES:
+            printf("   Permission denied - this needs root.\n");
+            break;
+         case ENODEV:
+            printf("   The device went away, or its BAR is not assigned.\n");
+            break;
+         default:
+            break;
+      }
+
       close(fd);
       return NULL;
    }
