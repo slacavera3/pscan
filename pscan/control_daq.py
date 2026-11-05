@@ -1,4 +1,4 @@
-"""pydaq - inspect and poke the DAQ cards directly, outside a scan.
+﻿"""pydaq - inspect and poke the DAQ cards directly, outside a scan.
 
 This is the bring-up tool. Before writing a .con file against a new card you
 want to know: does pscan see it, under which backend, what are its channels
@@ -6,10 +6,10 @@ and ranges, is there actually a signal on the photodiode input, and does the
 mirror move when told to. Doing that through a scan config means editing a
 file and reading a log; doing it here is one command.
 
-  pydaq-dev list                       what pscan can see, and what it can't
-  pydaq-dev read --channel 0           acquire a short trace, print its stats
-  pydaq-dev set 1.5 --channel 0        hold an output at 1.5 V
-  pydaq-dev set +0.1 --channel 0       step it, relative to where it is
+  pydaq list                       what pscan can see, and what it can't
+  pydaq read --channel 0           acquire a short trace, print its stats
+  pydaq set 1.5 --channel 0        hold an output at 1.5 V
+  pydaq set +0.1 --channel 0       step it, relative to where it is
 
 `list` opens nothing it does not have to, and never opens the Phidget board -
 that board may be holding a piezo at a position right now, and enumerating
@@ -42,8 +42,8 @@ def cmd_list(args):
     if not devices:
         print("  (none)")
         if not args.all:
-            print("  Try 'pydaq-dev list --all' to include the Phidget board "
-                  "and the simulator.")
+            print("  Try 'pydaq list --all' to include the Phidget board."
+                  "")
         return 0
 
     for info in devices:
@@ -160,7 +160,7 @@ def cmd_set(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog='pydaq-dev',
+        prog='pydaq',
         description="Inspect and drive the DAQ cards pscan can reach.",
     )
     subs = parser.add_subparsers(dest='command', required=True)
@@ -181,7 +181,7 @@ def build_parser():
     p_list.add_argument(
         '--all', action='store_true',
         help="also list the backends auto-detection skips (the Phidget "
-             "analog board and the simulator).",
+             "analog board).",
     )
     p_list.set_defaults(func=cmd_list)
 

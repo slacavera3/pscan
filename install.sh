@@ -1,19 +1,18 @@
-#!/bin/bash
+﻿#!/bin/bash
 
 echo "======================================================="
 echo "        PSCAN LAB - AUTOMATED INSTALL & UPDATE         "
 echo "======================================================="
 
-# --drivers-only installs the shared system drivers (sections 1 to 2) and
-# stops before touching Python packages.
+# This is now the ONLY installer. There is no separate experimental build, no
+# second package name, no virtualenv and no install-dev.sh - that arrangement
+# produced a different failure mode for every combination of build, venv and
+# partial install, which cost far more than the isolation was worth.
 #
-# That matters because install-dev.sh needs these drivers but must NOT run
-# the pip install below - both builds ship a top-level 'pscan' package, so
-# that would drop this branch's copy on top of a stable install. The split
-# used to be documented as "run install.sh from your stable checkout", which
-# is two commands in two checkouts and impossible on an experimental rig that
-# has no stable checkout at all. The result was a machine where every backend
-# reported itself unavailable and the fix was a paragraph of prose.
+# --drivers-only installs just the shared system drivers (sections 1 to 2) and
+# stops before touching Python packages. Useful on its own after a kernel
+# upgrade, when NI-DAQmx's modules need rebuilding but nothing in Python has
+# changed.
 #
 # Every driver step is idempotent, so re-running this costs seconds.
 DRIVERS_ONLY=0
@@ -22,17 +21,56 @@ if [ "${1:-}" = "--drivers-only" ]; then
     echo " MODE: shared system drivers only (no Python packages)"
 fi
 
+# ldconfig lives in /sbin, which is NOT on a normal user's PATH on Debian and
+# Ubuntu. Calling it bare makes every "is this library installed?" check come
+# back false for a library that is installed - which is exactly what happened:
+# libcomedi was present, apt said so, pscan loaded it fine, and this script
+# reported it missing. Always go through this.
+# Several steps cd into extracted source trees; this is what they come back to.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT" || exit 1
+
+ldconfig_p() {
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig -p 2>/dev/null
+    elif [ -x /sbin/ldconfig ]; then
+        /sbin/ldconfig -p 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+have_lib() {
+    ldconfig_p | grep -q "$1"
+}
+
 # --- 1. Install System Dependencies ---
 echo -e "\n[1/6] Checking OS-level C-drivers (Comedi)..."
 sudo apt update
-# python3-venv is here for install-dev.sh's benefit: Debian and Ubuntu split
+# python3-venv is here only so anyone who wants their own venv can make one:
+# pscan itself no longer uses one. Debian and Ubuntu split
 # ensurepip out, so creating a virtualenv fails without it. The versioned name
 # is the one that actually matters (python3.13-venv on a 3.13 machine); the
 # metapackage does not always pull it.
 PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "")
-sudo apt install -y curl unzip libcomedi0 libcomedi-dev python3-venv
+
+# libusb is a HARD requirement for libphidget21: its configure aborts with
+# "Missing libusb!" without it. Both flavours are listed because the configure
+# probes for libusb-1.0 (libusb_init) and falls back to libusb-0.1
+# (usb_find_busses). This was the missing piece that made the Phidget build
+# fail while the script still announced success.
+#
+# dkms, build-essential and the running kernel's headers are here for
+# NI-DAQmx: its kernel modules are built on this machine, and DKMS cannot
+# build anything without headers matching `uname -r`.
+sudo apt install -y \
+    curl unzip \
+    libcomedi0 libcomedi-dev \
+    libusb-1.0-0-dev libusb-dev \
+    build-essential dkms "linux-headers-$(uname -r)" \
+    python3-pip
 if [ -n "$PYVER" ]; then
-    sudo apt install -y "python${PYVER}-venv" 2>/dev/null || true
+    sudo apt install -y "python${PYVER}-venv" python3-venv 2>/dev/null || true
 fi
 
 # --- 1.5 Setup Phidgets OS Drivers (Legacy C Library) ---
@@ -53,19 +91,47 @@ else
         # Navigate into the extracted directory
         cd ./libs/libphidget-2.1.9.20190409 || { echo " -> [ERROR] Failed to navigate into extracted Phidget directory."; exit 1; }
         
+        # Each step is checked. Without this, a configure that aborted with
+        # "Missing libusb!" was followed by "No targets specified and no
+        # makefile found", then "No rule to make target 'install'", and the
+        # script still printed "installed successfully" - so the real failure
+        # scrolled past three screens above a success message.
         echo " -> Configuring and compiling (with JNI disabled)..."
-        ./configure --disable-jni
-        make
-        
-        echo " -> Installing to system and updating dynamic linker bindings..."
-        sudo make install
+        if ! ./configure --disable-jni; then
+            echo " -> [ERROR] Phidget configure failed. The usual cause is a"
+            echo " ->         missing libusb; this script installs"
+            echo " ->         libusb-1.0-0-dev and libusb-dev in step 1, so if"
+            echo " ->         that step was skipped or failed, fix it first."
+            cd "$REPO_ROOT" || exit 1
+            PHIDGET_OK=0
+        elif ! make; then
+            echo " -> [ERROR] Phidget compile failed. See the output above."
+            cd "$REPO_ROOT" || exit 1
+            PHIDGET_OK=0
+        else
+            echo " -> Installing to system and updating dynamic linker bindings..."
+            if sudo make install; then
+                PHIDGET_OK=1
+            else
+                echo " -> [ERROR] 'make install' failed for libphidget21."
+                PHIDGET_OK=0
+            fi
+        fi
         # Force the absolute path to ldconfig so it correctly links the new library
-        sudo /sbin/ldconfig 
-        
+        sudo /sbin/ldconfig
+
         # Clean up the extracted source folder to keep the repo tidy
-        cd ../../
+        cd "$REPO_ROOT" || exit 1
         rm -rf ./libs/libphidget-2.1.9.20190409
-        echo " -> libphidget21.so installed successfully."
+
+        # Claim success only if the library is actually there now.
+        if [ "${PHIDGET_OK:-0}" -eq 1 ] && \
+           { [ -f "/usr/local/lib/libphidget21.so" ] || [ -f "/usr/lib/libphidget21.so" ]; }; then
+            echo " -> libphidget21.so installed successfully."
+        else
+            echo " -> [WARNING] libphidget21.so was NOT installed. The piezo"
+            echo " ->           D2A will not work. Everything else is fine."
+        fi
     else
         echo " -> [ERROR] Tarball not found at $TAR_PATH!"
         echo " -> Please ensure libphidget_2.1.9.20190409.tar.gz is placed in the ./libs/ directory."
@@ -92,7 +158,7 @@ echo -e "\n[1.7/6] Checking NI-DAQmx..."
 #   NI_RELEASE=2025Q1     pin the release whose zip is fetched
 
 install_nidaqmx() {
-    if ldconfig -p 2>/dev/null | grep -q libnidaqmx; then
+    if have_lib libnidaqmx; then
         echo " -> NI-DAQmx is already installed. Skipping."
         return 0
     fi
@@ -121,12 +187,37 @@ install_nidaqmx() {
     release=$(lsb_release -rs 2>/dev/null || echo unknown)
     ubu=$(echo "$release" | tr -d .)
 
+    # NI supports Ubuntu, RHEL and openSUSE. Debian is NOT supported, and
+    # installing the Ubuntu feed on Debian is a real risk, not a formality:
+    # the feed targets jammy, so apt can later try to satisfy Debian packages
+    # from it and damage the system. That is a decision for a person, not an
+    # installer, so it needs an explicit opt-in.
     if [ "$distro" != "Ubuntu" ]; then
-        echo " -> [WARNING] NI ships .deb registration packages for Ubuntu only"
-        echo " ->           (.rpm for RHEL and openSUSE). This machine is"
-        echo " ->           '$distro $release', so install NI-DAQmx by hand:"
-        echo " ->   https://www.ni.com/en/support/downloads/drivers/download.ni-linux-device-drivers.html"
-        return 1
+        if [ -z "${PSCAN_FORCE_DAQMX:-}" ]; then
+            echo " -> [WARNING] This machine is '$distro $release'. NI supports"
+            echo " ->           Ubuntu, RHEL and openSUSE - NOT Debian - and"
+            echo " ->           there is no Debian registration package."
+            echo " ->"
+            echo " ->           NI-DAQmx is therefore NOT installed, which"
+            echo " ->           means NI X Series cards (your PCIe-6351) cannot"
+            echo " ->           be reached on this OS. comedi cards are fine."
+            echo " ->"
+            echo " ->           The supported fix is Ubuntu 22.04 or 24.04 on"
+            echo " ->           this machine. To try the Ubuntu packages here"
+            echo " ->           anyway - unsupported, and it can leave apt"
+            echo " ->           pulling jammy libraries over Debian ones:"
+            echo " ->             PSCAN_FORCE_DAQMX=1 bash install.sh"
+            echo " ->           Pin the feed to NI packages only if you do."
+            return 1
+        fi
+
+        echo " -> [WARNING] '$distro $release' is not supported by NI."
+        echo " ->           PSCAN_FORCE_DAQMX is set, so trying the Ubuntu"
+        echo " ->           22.04 packages. If apt starts proposing to replace"
+        echo " ->           system libraries, abort and remove"
+        echo " ->           /etc/apt/sources.list.d/ni-*.list."
+        # Closest supported Ubuntu LTS to a Debian base.
+        ubu="2204"
     fi
 
     sudo apt install -y curl unzip
@@ -202,7 +293,7 @@ install_nidaqmx() {
 
     echo " ->"
     echo " -> NI-DAQmx installed. A REBOOT IS REQUIRED before the card is"
-    echo " -> usable. After rebooting, check it with:  pydaq-dev list"
+    echo " -> usable. After rebooting, check it with:  pydaq list"
     NI_DAQMX_NEEDS_REBOOT=1
     return 0
 }
@@ -273,35 +364,99 @@ find . -name '__pycache__' -type d -prune -exec sudo rm -rf {} + 2>/dev/null || 
 
 # --- 5. Exorcise Ghost Installations ---
 echo -e "\n[5/6] Removing existing or broken installations..."
-# Ask pip nicely first
-sudo pip uninstall -y pscan-lab $FLAG 2>/dev/null
-pip uninstall -y pscan-lab $FLAG 2>/dev/null
+# Both package names: 'pscan-lab-dev' was the separate experimental build,
+# which no longer exists. Leaving it installed would put a second copy of the
+# 'pscan' package in site-packages, and whichever pip wrote last would own the
+# files - the exact fragmentation this consolidation removes.
+for pkg in pscan-lab pscan-lab-dev; do
+    sudo pip uninstall -y "$pkg" $FLAG 2>/dev/null
+    pip uninstall -y "$pkg" $FLAG 2>/dev/null
+done
 
-# Brute-force delete any lingering files
+# Brute-force delete any lingering files, including the old venv and its
+# -dev command symlinks.
 rm -rf ~/.local/lib/python*/site-packages/pscan*
-rm -f ~/.local/bin/pscan
+rm -rf ~/.local/share/pscan
+rm -f ~/.local/bin/pscan ~/.local/bin/pscan ~/.local/bin/pystage \
+      ~/.local/bin/pypiezo ~/.local/bin/pydaq ~/.local/bin/flyscan
 sudo rm -rf /usr/local/lib/python*/dist-packages/pscan*
 sudo rm -f /usr/local/bin/pscan
 
 # --- 6. Clean Installation ---
 echo -e "\n[6/6] Compiling and installing pscan..."
+
+# Two passes, deliberately.
+#
+# The first installs the dependencies (numpy, opencv, pyserial, vxi11 ...).
+# This step used to be --no-deps only, which meant those were never installed
+# at all - they happened to be present because the retired venv pulled them,
+# so a system install would come up and then fail on 'import cv2'.
+#
+# The second forces just pscan itself, so a code change always takes even when
+# the version number has not moved. Forcing everything would reinstall 90 MB
+# of wheels on every run for no reason.
+sudo pip install --no-cache-dir . $FLAG
 sudo pip install --force-reinstall --no-deps --no-cache-dir . $FLAG
 
-# The install above is --no-deps, so the [daqmx] extra would never be pulled
-# in. Install the Python binding explicitly, and only when the driver it wraps
-# is actually present - 'pydaq-dev list' reporting the backend as available
-# when there is no driver underneath it would be worse than reporting nothing.
-if ldconfig -p 2>/dev/null | grep -q libnidaqmx; then
+# The nidaqmx Python binding, only when the driver it wraps is actually
+# present - 'pydaq list' reporting the backend as available when there is no
+# driver underneath it would be worse than reporting nothing.
+if have_lib libnidaqmx; then
     echo " -> NI-DAQmx driver present: installing the nidaqmx Python package."
     sudo pip install --no-cache-dir 'nidaqmx>=0.9' $FLAG
 fi
 
+# --- Verify, from a directory that is NOT the repo ---
+#
+# `python -c` prepends the working directory to sys.path, so run from here
+# `import pscan` would resolve to ./pscan/ in the source tree and this would
+# validate the code it just installed from rather than the installation. That
+# mistake made an earlier version of this check pass against a site-packages
+# that was broken. Hence the cd.
+echo -e "\nVerifying the installation..."
+if ( cd / && python3 -c '
+import sys
+import pscan, pscan.daq as daq
+
+print(f"    pscan      -> {pscan.__file__}")
+print(f"    pscan.daq  -> {daq.__file__}")
+
+problems = []
+if not (daq.__file__ or "").endswith("daq.py"):
+    problems.append("pscan.daq is a package directory, not daq.py - a stale "
+                    "pscan/daq/ is shadowing it")
+for attr in ("backend_names", "open_device", "close_all", "resolve_range"):
+    if not hasattr(daq, attr):
+        problems.append(f"pscan.daq is missing {attr}()")
+for mod in ("pscan.main", "pscan.a2d_driver", "pscan.daqmx_driver",
+            "pscan.control_daq", "pscan.config_parser", "flyscan.cli"):
+    try:
+        __import__(mod)
+    except Exception as e:
+        problems.append(f"{mod}: {type(e).__name__}: {e}")
+
+for p in problems:
+    print(f" -> [ERROR] {p}")
+sys.exit(1 if problems else 0)
+' ); then
+    echo " -> Installation verified."
+    INSTALL_OK=1
+else
+    echo " -> [ERROR] The installation is not usable (see above)."
+    INSTALL_OK=0
+fi
+
 echo -e "\n======================================================="
-echo " DONE! You can now run 'pscan' | 'pystage' | 'pypiezo' |"
-echo " 'pydaq' from anywhere."
-echo ""
-echo " 'pydaq list' shows which DAQ cards pscan can reach and"
-echo " under which backend - start there when bringing up a card."
+if [ "${INSTALL_OK:-0}" -eq 1 ]; then
+    echo " DONE! Run 'pscan' | 'pystage' | 'pypiezo' | 'pydaq' |"
+    echo " 'flyscan' from anywhere."
+    echo ""
+    echo " 'pydaq list' shows which DAQ cards pscan can reach and"
+    echo " under which backend - start there when bringing up a card."
+else
+    echo " INSTALL FAILED - see the errors above. The commands may"
+    echo " exist but will not work."
+fi
 if [ -n "${NI_DAQMX_NEEDS_REBOOT:-}" ]; then
     echo ""
     echo " *** REBOOT REQUIRED: NI-DAQmx was installed this run and its"
@@ -309,3 +464,4 @@ if [ -n "${NI_DAQMX_NEEDS_REBOOT:-}" ]; then
     echo " *** be visible until you reboot."
 fi
 echo "======================================================="
+[ "${INSTALL_OK:-0}" -eq 1 ] || exit 1

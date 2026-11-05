@@ -1,4 +1,4 @@
-"""Which card, reached how - and everything a card driver should not repeat.
+﻿"""Which card, reached how - and everything a card driver should not repeat.
 
 pscan used to have one answer: libcomedi, on /dev/comedi0. That stopped being
 enough. comedi's ni_pcimio driver covers the NI E and M series and no X Series
@@ -92,7 +92,7 @@ class DaqSelectionError(RuntimeError):
 class DeviceInfo:
     """What a driver can say about one card without acquiring from it.
 
-    Printed by `pydaq-dev list` and once at connect time. Months later that
+    Printed by `pydaq list` and once at connect time. Months later that
     log line is the only record of which card and which driver produced a
     given .d file.
     """
@@ -673,7 +673,7 @@ def available_backends():
     """{name: reason} per backend, 'available' when usable.
 
     "No cards found" and "the driver isn't installed" need completely
-    different responses and look identical from the outside, so `pydaq-dev
+    different responses and look identical from the outside, so `pydaq
     list` prints this.
     """
     status = {}
@@ -782,7 +782,7 @@ def select_device(backend=None, address=None, need_ai=False, need_ao=False,
         raise DaqSelectionError(
             f"no card with {wanted} was found for this 'action {role}' "
             f"block.\n  Backend status:\n{detail}\n"
-            f"  Run 'pydaq-dev list' to see everything pscan can find."
+            f"  Run 'pydaq list' to see everything pscan can find."
         )
 
     if len(candidates) == 1:

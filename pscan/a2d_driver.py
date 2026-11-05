@@ -1,4 +1,4 @@
-"""The comedi card: DC photovoltage off a detector, and analog out.
+﻿"""The comedi card: DC photovoltage off a detector, and analog out.
 
 The incumbent, and still the driver for every card already in service. The
 acquisition sequence below is the one that was already running - the same

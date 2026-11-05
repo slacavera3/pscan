@@ -1,4 +1,4 @@
-"""NI-DAQmx cards: the PCIe-6351 and anything else comedi cannot reach.
+﻿"""NI-DAQmx cards: the PCIe-6351 and anything else comedi cannot reach.
 
 comedi's ni_pcimio driver covers the NI E and M series and no X Series board,
 so this is the only route to a PCIe-6351 on Linux - and will be the only route
@@ -77,7 +77,7 @@ def _load():
     except ImportError as e:
         _load_error = (
             "the 'nidaqmx' Python package is not installed. Re-run "
-            "'bash install.sh' (or 'bash install-dev.sh'), which installs it "
+            "'bash install.sh', which installs it "
             "once the NI-DAQmx driver is present."
         )
         raise RuntimeError(_load_error) from e

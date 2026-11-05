@@ -1,4 +1,4 @@
-import re
+﻿import re
 
 # Names only, so validating a config imports no driver and touches no
 # hardware. Taken from pscan.daq rather than restated here, so adding a

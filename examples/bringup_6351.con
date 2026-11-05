@@ -1,4 +1,4 @@
-## =====================================================================
+﻿## =====================================================================
 ## PCIe-6351 bring-up - a2d and d2a through the NI-DAQmx backend
 ## =====================================================================
 ##
@@ -12,9 +12,9 @@
 ##
 ## Run it in this order:
 ##
-##   pydaq-dev list                 -> does pscan see the card at all?
-##   pscan-dev --dry-run examples/bringup_6351.con
-##   pscan-dev --timer  examples/bringup_6351.con
+##   pydaq list                 -> does pscan see the card at all?
+##   pscan --dry-run examples/bringup_6351.con
+##   pscan --timer  examples/bringup_6351.con
 ##
 ## --timer is the point of this file. It breaks each trace down so you can
 ## see what the committed DAQmx task actually costs per coordinate on your
@@ -34,7 +34,7 @@ end
 ## ---------------------------------------------------------------------
 ## The output axis: sweeps ao0 over -1..+1 V in 0.5 V steps (5 points).
 ##
-## 'device Dev1' is whatever 'pydaq-dev list' reported - NI assigns the
+## 'device Dev1' is whatever 'pydaq list' reported - NI assigns the
 ## name, it is not a /dev node. Drop the line to auto-detect, which works
 ## as long as only one card can serve the block.
 ##

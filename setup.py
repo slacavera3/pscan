@@ -6,13 +6,14 @@ this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
 
 setup(
-    # Deliberately distinct from the stable 'pscan-lab' so the two can sit on
-    # one machine without pip treating an install of either as an upgrade of
-    # the other. They still both ship a top-level 'pscan' package, so this
-    # branch must go in its own venv - see install-dev.sh.
-    name='pscan-lab-dev',
-    version='1.0.0.dev0',
-    description='Experimental build of pscan: flyscan plus untested hardware changes',
+    # One build, one name. The separate 'pscan-lab-dev' package and its
+    # virtualenv are gone: having a stable and an experimental install on one
+    # machine meant two package names, two command sets, a venv, two
+    # installers, and a different failure mode in each combination. The
+    # fragmentation cost more than the isolation bought.
+    name='pscan-lab',
+    version='2.0.0',
+    description='Scanning microscope orchestrator: stages, DAQ cards, scopes and cameras',
     long_description=long_description,
     long_description_content_type='text/markdown',
     # tests/ carries an __init__.py so unittest can discover it, which would
@@ -41,20 +42,13 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            # Every command carries the -dev suffix so that running one is
-            # always an explicit choice: there is no name an experimental
-            # build and the stable one both answer to, on PATH or inside an
-            # activated venv.
-            # Links the terminal command 'pscan-dev' to main() in main.py
-            'pscan-dev=pscan.main:main',
-            # Links the terminal command 'pystage-dev' to main() in control_stages.py
-            'pystage-dev=pscan.control_stages:main',
-            # Links the terminal command 'pypiezo-dev' to main() in control_piezo.py
-            'pypiezo-dev=pscan.control_piezo:main',
-            # Links the terminal command 'pydaq-dev' to main() in control_daq.py
-            'pydaq-dev=pscan.control_daq:main',
-            # Links the terminal command 'flyscan-dev' to main() in flyscan/cli.py
-            'flyscan-dev=flyscan.cli:main',
+            # No -dev suffix any more: there is only one build, so there is
+            # nothing to disambiguate from.
+            'pscan=pscan.main:main',            # the scan orchestrator
+            'pystage=pscan.control_stages:main',  # jog the Thorlabs stages
+            'pypiezo=pscan.control_piezo:main',   # drive the Phidget piezo
+            'pydaq=pscan.control_daq:main',       # inspect and poke DAQ cards
+            'flyscan=flyscan.cli:main',           # the fly-scan orchestrator
         ],
     },
 )

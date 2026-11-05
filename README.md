@@ -1,4 +1,4 @@
-================================================================================
+﻿================================================================================
                       PSCAN GITHUB INSTALLATION CHEATSHEET
 ================================================================================
 Target Repository: https://github.com/slacavera3/pscan.git
@@ -11,87 +11,59 @@ Requirements:
     * Windows PowerShell:    `python -m ensurepip --upgrade`
 
 --------------------------------------------------------------------------------
-1. GLOBAL INSTALLATION & UPDATING (LINUX - RECOMMENDED)
+1. INSTALLATION & UPDATING (LINUX)
 --------------------------------------------------------------------------------
-For Debian, Ubuntu, and most Linux distributions, the provided `install.sh` 
-script completely automates the entire setup. It automatically installs required 
-`apt` C-drivers, detects your OS's PEP 668 restrictions, and securely scrubs 
-old "ghost" dependencies before building the new package.
+One build, one installer, one set of commands, no virtualenv. `install.sh`
+does everything: apt C-drivers (Comedi, libusb), libphidget21 from the bundled
+tarball, the Tucsen SDK, NI-DAQmx where the OS supports it, the Python
+dependencies, and pscan itself. It then verifies the install and refuses to
+claim success if the result is unusable.
 
 # Step 1: Download the source code
 git clone https://github.com/slacavera3/pscan.git
 cd pscan
 
-# Step 2: Run the automated installer
+# Step 2: Run the installer
 bash install.sh
 
-# TO UPDATE LATER:
-# Simply navigate back to the folder, pull the latest code, and re-run:
+# TO UPDATE LATER: pull and re-run. Every step is idempotent.
 cd /path/to/pscan
 git pull
 bash install.sh
 
---------------------------------------------------------------------------------
-1b. EXPERIMENTAL BUILD, ALONGSIDE THE STABLE ONE (LINUX)
---------------------------------------------------------------------------------
-This branch is the experimental build. It installs as `pscan-dev` and can sit
-on the same machine as a normal `pscan` install without either disturbing the
-other.
+That gives you five commands:
+  pscan | pystage | pypiezo | pydaq | flyscan
 
-Why it needs its own installer: both builds ship a top-level `pscan` Python
-package, so they cannot share a site-packages directory - whichever was
-installed second would own the files, and uninstalling either would break the
-other. `install-dev.sh` therefore puts this build in its own virtualenv under
-~/.local/share/pscan-dev and links only the -dev commands into ~/.local/bin.
-
-# Step 1: Clone somewhere SEPARATE from your stable pscan checkout
-git clone https://github.com/slacavera3/pscan.git pscan-dev
-cd pscan-dev
-git checkout test/working-snapshot
-
-# Step 2: Run the dev installer (nothing installed system-wide)
-bash install-dev.sh
-
-# It asks for sudo in exactly one case: python3-venv missing. Debian and
-# Ubuntu split ensurepip into its own package, so a virtualenv cannot be
-# created without it. Once it is there, re-runs use no sudo at all.
-
-# TO UPDATE LATER:
-cd /path/to/pscan-dev
-git pull
-bash install-dev.sh
-
-This gives you five commands that shadow nothing:
-  pscan-dev | pystage-dev | pypiezo-dev | pydaq-dev | flyscan-dev
-
-You do NOT need to activate a virtualenv to use them. The venv exists to keep
-this build's `pscan` package away from the stable one's; its scripts hard-code
-their own interpreter, so the commands just work.
-
-If they come back "command not found", ~/.local/bin is not on your PATH:
+If they come back "command not found", ~/.local/bin may not be on your PATH:
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
   source ~/.bashrc
-Debian and Ubuntu add that directory for you, but only if it already exists
-when you log in - so the first install, which creates it, needs this once.
 
-install-dev.sh installs the shared system drivers too (Comedi, libphidget21,
-libTUCam, NI-DAQmx), so it is sufficient on its own on a fresh machine. It
-does that by calling `install.sh --drivers-only`, which stops before
-install.sh's pip step - the part that must not run on this branch, since it
-would drop this build's `pscan` package over a stable one.
+USEFUL FLAGS
 
-It skips the whole step when all the drivers are already present, so a re-run
-costs nothing. NI-DAQmx is skipped when `lspci` reports no NI card; see "DAQ
-CARDS AND BACKENDS" below for the override.
+  bash install.sh --drivers-only
+      Just the system drivers, stopping before anything Python. This is the
+      half worth re-running after a kernel upgrade, when NI-DAQmx's kernel
+      modules need rebuilding but nothing in Python has changed.
 
-# TO REMOVE THE EXPERIMENTAL BUILD:
-rm -f ~/.local/bin/{pscan-dev,pystage-dev,pypiezo-dev,pydaq-dev,flyscan-dev}
-rm -rf ~/.local/share/pscan-dev
+  PSCAN_SKIP_DAQMX=1 bash install.sh
+      Never install NI-DAQmx.
 
-WARNING: do not run `pip install .` on this branch outside the venv. That
-would drop its `pscan` package on top of your stable install's and leave you
-with a mixture of the two.
+  PSCAN_FORCE_DAQMX=1 bash install.sh
+      Install NI-DAQmx even when no NI card is seated, or when the OS is not
+      one NI supports. See the Debian warning under DAQ CARDS AND BACKENDS.
 
+WHY THERE IS NO LONGER A SEPARATE DEV BUILD
+
+There used to be a `pscan-lab-dev` package, a `pscan-dev` command set and an
+`install-dev.sh` that put it in its own virtualenv, so an experimental build
+could sit beside a stable one. In practice that produced a different failure
+mode for every combination of build, environment and partially-completed
+install - stale venvs holding old code, shadowed modules, drivers installed
+for one build and not the other - and diagnosing which combination you were
+in cost more than the isolation ever saved. There is now one of everything.
+
+install.sh removes the old arrangement when it finds it: the `pscan-lab-dev`
+package, ~/.local/share/pscan-dev, and the -dev command symlinks.
 --------------------------------------------------------------------------------
 2. GLOBAL INSTALLATION & UPDATING (WINDOWS)
 --------------------------------------------------------------------------------
@@ -290,7 +262,22 @@ thing on every card and every backend. Giving only one side mirrors it, so
 
 INSTALLING NI-DAQMX (Linux)
 
-`bash install.sh` does it. There is nothing to download by hand.
+READ THIS FIRST IF YOU ARE ON DEBIAN. NI supports Ubuntu, RHEL and openSUSE.
+It does NOT support Debian, and ships no Debian registration package - there
+is nothing for an installer to install. On Debian, install.sh reports that and
+skips NI-DAQmx, which means an NI X Series card (PCIe-635x/636x) cannot be
+reached on that machine at all. comedi cards are unaffected.
+
+The supported fix is Ubuntu 22.04 or 24.04 on the machine holding the card.
+`PSCAN_FORCE_DAQMX=1` will try the Ubuntu 22.04 packages on Debian anyway, but
+understand what that does: it adds an apt feed targeting Ubuntu jammy to a
+Debian system, and apt can later try to satisfy Debian packages from it. Pin
+the feed to NI packages only if you go that way, and be ready to remove
+/etc/apt/sources.list.d/ni-*.list. There is also no guarantee NI's DKMS
+modules build against Debian's kernel.
+
+On a supported OS, `bash install.sh` does it. There is nothing to download by
+hand.
 
 That is worth spelling out, because the obvious command does not work:
 `ni-daqmx` is NOT in Ubuntu's archives, so `sudo apt install ni-daqmx` fails

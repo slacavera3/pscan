@@ -804,7 +804,7 @@ def print_dry_run(con_filepath, base_filename, setup_pipeline,
                                for p in stage_params.values()):
         print("\n  No card was opened to produce this report, so which "
               "backend each")
-        print("  'auto' resolves to is not shown. Run 'pydaq-dev list' to see "
+        print("  'auto' resolves to is not shown. Run 'pydaq list' to see "
               "that.")
 
     print("\nOUTPUT FILES")
