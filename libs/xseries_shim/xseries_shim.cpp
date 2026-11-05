@@ -555,7 +555,9 @@ int xseries_write_ao(void* handle, u32 channel, u32 range_idx, double volts)
 
    std::vector<nNISTC3::aoHelper::tChannelConfiguration> chanConfig(
       1, nNISTC3::aoHelper::tChannelConfiguration());
-   chanConfig[0].channel = static_cast<u16>(channel);
+   // aoHelper's struct takes a u32 channel and a u8 gain, unlike aiHelper's
+   // u16/u16 - hence no cast here and no mismatch with getAO_Gain()'s u8.
+   chanConfig[0].channel = channel;
    chanConfig[0].gain = gain;
    chanConfig[0].updateMode = nAO::kImmediate;
    chanConfig[0].range = range;
@@ -576,10 +578,15 @@ int xseries_write_ao(void* handle, u32 channel, u32 range_idx, double volts)
    }
 
    // Volts to DAC code through the DDK's scaler, so calibration applies.
-   std::vector<f64> voltData(1, volts);
+   //
+   // Note the signature differs from the AI one in dataHelper.h: it takes
+   // f32 (not f64) and does NOT take a tDeviceInfo, because the AO
+   // calibration coefficients are per-DAC and come entirely from the EEPROM
+   // helper. f32 is ample for a 16-bit DAC.
+   std::vector<f32> voltData(1, static_cast<f32>(volts));
    std::vector<i16> codes(1, 0);
    nNISTC3::nAODataHelper::scaleData(
-      voltData, 1, codes, 1, chanConfig, *s->eeprom, *s->info);
+      voltData, 1, codes, 1, chanConfig, *s->eeprom);
 
    s->device->AO.AO_Direct_Data[channel].writeRegister(codes[0], &status);
    if (status.isFatal())
