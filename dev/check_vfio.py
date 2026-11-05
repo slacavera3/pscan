@@ -156,6 +156,7 @@ def probe(slot):
     print(f"\nopening        /dev/vfio/vfio and {group_path}")
     container = os.open("/dev/vfio/vfio", os.O_RDWR)
     group_fd = os.open(group_path, os.O_RDWR)
+    device_fd = None
 
     try:
         version = fcntl.ioctl(container, VFIO_GET_API_VERSION)
@@ -185,8 +186,13 @@ def probe(slot):
         fcntl.ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU)
         print("  container    set, IOMMU enabled")
 
-        device_fd = fcntl.ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD,
-                                slot.encode() + b"\0")
+        # A bytearray, not bytes, and that distinction decides what comes
+        # back. fcntl.ioctl() given an immutable buffer returns the BUFFER
+        # (copied back), while given a mutable one it returns the ioctl's own
+        # result - which here is the device file descriptor. Passing bytes
+        # yielded b'0000:82:00.0\x00' where an int was wanted.
+        name = bytearray(slot.encode() + b"\0")
+        device_fd = fcntl.ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD, name)
         print(f"  device fd    {device_fd}")
 
         # struct vfio_region_info {
@@ -235,6 +241,10 @@ def probe(slot):
             print("  route is closed and Secure Boot is unavoidable.")
         return 1
     finally:
+        # Innermost first: the device fd is held by the group, which is held
+        # by the container.
+        if device_fd is not None:
+            os.close(device_fd)
         os.close(group_fd)
         os.close(container)
 
