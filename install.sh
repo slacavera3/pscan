@@ -419,6 +419,28 @@ if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
         echo " ->           extraction (looked for ChipObjects/ and osiBus.h)."
         echo " ->           The X Series backend will be unavailable."
     else
+        # The kernel-module OS interface needs nirlpk.ko built for the
+        # running kernel and loaded, or acquireBoard() finds no device however
+        # well the shim compiled. NI ships it as BSD-licensed source, so it
+        # builds here rather than coming from a vendor package.
+        XS_NIRLPK="$(find "$XS_BUILD" "$VENDOR_DIR" -maxdepth 5 -type d -name nirlpk -print -quit 2>/dev/null)"
+        if [ -n "$XS_NIRLPK" ]; then
+            if /sbin/lsmod 2>/dev/null | grep -q '^nirlpk'; then
+                echo " -> nirlpk.ko already loaded."
+            else
+                echo " -> Building nirlpk.ko for kernel $(uname -r)..."
+                if make -C "$XS_NIRLPK" && sudo make -C "$XS_NIRLPK" install; then
+                    echo " -> nirlpk.ko installed and loaded."
+                else
+                    echo " -> [WARNING] nirlpk.ko did not build. It is 2011-era"
+                    echo " ->           source against a $(uname -r) kernel, so"
+                    echo " ->           this is the step most likely to need"
+                    echo " ->           patching. It is BSD-licensed, so it can"
+                    echo " ->           be fixed rather than worked around."
+                fi
+            fi
+        fi
+
         echo " -> Building libpscan_xseries.so..."
         echo " ->   DDK: ${XS_DDK#$REPO_ROOT/}"
         echo " ->   OSI: ${XS_OSI#$REPO_ROOT/}"

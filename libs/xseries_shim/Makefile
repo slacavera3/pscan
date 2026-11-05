@@ -29,10 +29,39 @@ INCLUDES = \
 	-I$(NIXSERIES_DIR)/CHInCh \
 	-I$(OSI_DIR)
 
+# Defines the DDK itself requires, taken from nixseries/Makefile:
+#   kBAR0Only    - this card's registers are all in BAR0
+#   k64BitKernel - the DDK's own "Enable 64-bit support" switch
+DDK_DEFINES = -DkBAR0Only=1 -Dk64BitKernel=1
+
+# osiTypes.h refuses to compile without knowing the target platform and
+# endianness:
+#     #error target endianness not specified
+#     #error platform not specified; see osiTypes.h
+#
+# Those selections live in the OS interface's own .mak, which the DDK's
+# Makefile pulls in with `include $(OSINTERFACE_DIR)/$(OSINTERFACE_MAKEFILE)`.
+# Including that file wholesale here would also drag in its build rules and
+# fight ours, so instead the -D flags are harvested out of it. OSI_DEFINES can
+# be set by hand to override the harvest.
+OSI_MAK ?= $(firstword $(wildcard $(OSI_DIR)/*.mak))
+OSI_HARVESTED := $(shell grep -ho -- '-D[A-Za-z_][A-Za-z0-9_]*\(=[^ 	]*\)\?' \
+                    $(OSI_MAK) 2>/dev/null | sort -u | tr '\n' ' ')
+
+# What LinuxKernel.mak actually specifies, used when the harvest finds
+# nothing - a differently named .mak, or one that sets the flags some other
+# way. osiTypes.h tests kLittleEndian/kBigEndian for endianness and
+# kMicrosoft/kApple/kGNU for platform, so this pair is right for any
+# little-endian Linux built with GCC.
+OSI_FALLBACK = -DkLittleEndian=1 -DkGNU=1
+
+OSI_DEFINES ?= $(if $(strip $(OSI_HARVESTED)),$(OSI_HARVESTED),$(OSI_FALLBACK))
+
 # -fPIC because this becomes a shared library. The DDK is 2011-era C++ and
 # trips newer warnings that are not ours to fix, so its noise is quietened
 # while our own file is compiled with warnings on (see shim.o below).
 CXXFLAGS ?= -O2 -fPIC -fvisibility=hidden -w
+CXXFLAGS += $(DDK_DEFINES) $(OSI_DEFINES)
 LDFLAGS  ?= -shared -Wl,-soname,$(SONAME)
 
 # NI's chip objects and the example helpers the shim calls into. The DMA
@@ -51,7 +80,14 @@ DDK_SRC = \
 	$(NIXSERIES_DIR)/Examples/outTimer/aoHelper.cpp \
 	$(NIXSERIES_DIR)/Examples/outTimer/outTimerHelper.cpp
 
-OSI_SRC = $(wildcard $(OSI_DIR)/*.cpp) $(wildcard $(OSI_DIR)/*.c)
+# The OS interface keeps osiBus.cpp at its root and the platform-specific
+# osiUserCode.cpp one level down (LinuxKernel/ for the kernel-module flavour),
+# matching the VPATH in its own .mak. Globbing only the root misses
+# osiUserCode.cpp and the link fails on acquireBoard().
+#
+# Two levels and no deeper, on purpose: LinuxKernel/nirlpk/ holds nirlpk.c,
+# which is KERNEL code and must never be compiled into this userspace library.
+OSI_SRC = $(wildcard $(OSI_DIR)/*.cpp) $(wildcard $(OSI_DIR)/*/*.cpp)
 
 OBJ = $(DDK_SRC:.cpp=.o) xseries_shim.o
 
@@ -71,8 +107,16 @@ check:
 		echo "ERROR: no MHDDK OS interface at $(OSI_DIR)"; \
 		echo "       Expected $(OSI_DIR)/osiBus.h"; \
 		echo "       This is a SEPARATE download from the DDK itself -"; \
-		echo "       take the Linux /dev/mem flavour, which needs no"; \
-		echo "       kernel module."; \
+		echo "       take 'Linux (via kernel module)' VERSION 2.0, the"; \
+		echo "       only 64-bit-capable Linux option."; \
+		exit 1; }
+	@echo "  DDK defines: $(DDK_DEFINES)"
+	@echo "  OSI defines: $(OSI_DEFINES)$(if $(strip $(OSI_HARVESTED)), (from $(notdir $(OSI_MAK))), (fallback - no -D flags found in $(OSI_DIR)/*.mak))"
+	@echo "  OSI sources: $(notdir $(OSI_SRC))"
+	@test -n "$(strip $(OSI_SRC))" || { \
+		echo "ERROR: found no OS interface sources under $(OSI_DIR)"; \
+		echo "       Expected osiBus.cpp there and osiUserCode.cpp one"; \
+		echo "       level down."; \
 		exit 1; }
 
 # Our own file gets warnings on; NI's 2011 sources do not, since their
@@ -83,8 +127,12 @@ xseries_shim.o: xseries_shim.cpp
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
+# CXXFLAGS matters here, not just LDFLAGS: OSI_SRC is handed to g++ as source,
+# so it is compiled by this command. Without the defines it would hit
+# osiTypes.h's "#error target endianness not specified" at link time, having
+# already compiled cleanly everywhere else.
 $(TARGET): $(OBJ) $(OSI_SRC)
-	$(CXX) $(LDFLAGS) -o $@ $(OBJ) $(OSI_SRC) $(INCLUDES)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $(OBJ) $(OSI_SRC)
 
 install: $(TARGET)
 	install -d $(PREFIX)/lib
