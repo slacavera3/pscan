@@ -147,6 +147,21 @@ static bool map_terminal(u32 terminal, nAI::tAI_Config_Channel_Type_t* out)
    }
 }
 
+/*
+ * Everything below is the public API, and must be exported.
+ *
+ * The library is built with -fvisibility=hidden so that NI's several
+ * thousand C++ symbols stay internal and cannot clash with anything else in
+ * the process. That default hides these functions too: without the push
+ * below the library links cleanly, loads cleanly, and then ctypes reports
+ *
+ *     undefined symbol: xseries_open
+ *
+ * A new entry point added inside this block is exported automatically, which
+ * is what we want here - the block IS the API.
+ */
+#pragma GCC visibility push(default)
+
 extern "C" {
 
 /*
@@ -599,3 +614,5 @@ int xseries_write_ao(void* handle, u32 channel, u32 range_idx, double volts)
 }
 
 }  // extern "C"
+
+#pragma GCC visibility pop

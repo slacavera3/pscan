@@ -126,9 +126,24 @@ endif
 
 OBJ = $(DDK_SRC:.cpp=.o) xseries_shim.o
 
-.PHONY: all check install uninstall clean
+.PHONY: all check verify-exports install uninstall clean
 
-all: check $(TARGET)
+all: check $(TARGET) verify-exports
+
+# A library that builds, links and loads but exports nothing is the worst
+# kind of success: everything looks fine until ctypes reports "undefined
+# symbol: xseries_open" at first use, a long way from the cause. Checking
+# here turns that into a build failure naming the likely reason.
+verify-exports: $(TARGET)
+	@nm -D --defined-only $(TARGET) 2>/dev/null | grep -q 'T xseries_open' || { \
+		echo ""; \
+		echo "ERROR: $(TARGET) does not export xseries_open."; \
+		echo "       It built and linked, but nothing can call into it."; \
+		echo "       The usual cause is -fvisibility=hidden without the"; \
+		echo "       '#pragma GCC visibility push(default)' around the"; \
+		echo "       extern \"C\" API block in xseries_shim.cpp."; \
+		exit 1; }
+	@echo "  Exports: $$(nm -D --defined-only $(TARGET) | grep -c 'T xseries_') xseries_* entry points"
 
 # Fail with something actionable rather than 200 lines of "no such file".
 check:
