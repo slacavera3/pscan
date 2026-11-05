@@ -45,8 +45,17 @@ DDK_DEFINES = -DkBAR0Only=1 -Dk64BitKernel=1
 # fight ours, so instead the -D flags are harvested out of it. OSI_DEFINES can
 # be set by hand to override the harvest.
 OSI_MAK ?= $(firstword $(wildcard $(OSI_DIR)/*.mak))
-OSI_HARVESTED := $(shell grep -ho -- '-D[A-Za-z_][A-Za-z0-9_]*\(=[^ 	]*\)\?' \
-                    $(OSI_MAK) 2>/dev/null | sort -u | tr '\n' ' ')
+
+# /dev/null is passed as a second file deliberately, and the whole thing is
+# guarded on OSI_MAK being non-empty.
+#
+# grep with NO file argument reads STDIN and blocks forever. Inside
+# $(shell ...) that hangs make during variable expansion - before it can print
+# a recipe line, so it looks like a silent freeze with no clue as to the
+# cause. That happened whenever OSI_DIR pointed somewhere without a .mak.
+OSI_HARVESTED := $(if $(OSI_MAK),$(shell \
+   grep -ho -- '-D[A-Za-z_][A-Za-z0-9_]*\(=[^ 	]*\)\?' \
+        $(OSI_MAK) /dev/null 2>/dev/null | sort -u | tr '\n' ' '),)
 
 # What LinuxKernel.mak actually specifies, used when the harvest finds
 # nothing - a differently named .mak, or one that sets the flags some other

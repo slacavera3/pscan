@@ -520,10 +520,15 @@ if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
         XS_USE_SYSFS=1
         [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] || XS_USE_SYSFS=0
 
-        if make -C "$REPO_ROOT/libs/xseries_shim" \
-                NIXSERIES_DIR="$XS_DDK" OSI_DIR="$XS_OSI" \
-                USE_SYSFS_BUS="$XS_USE_SYSFS" && \
-           sudo make -C "$REPO_ROOT/libs/xseries_shim" install; then
+        # The SAME variables go to both invocations. Passing them only to the
+        # build left `make install` resolving OSI_DIR to its default, which
+        # pointed at a directory that does not exist - and the define harvest
+        # then ran grep with no file, which reads stdin and hangs make before
+        # it prints anything.
+        XS_MAKEVARS="NIXSERIES_DIR=$XS_DDK OSI_DIR=$XS_OSI USE_SYSFS_BUS=$XS_USE_SYSFS"
+
+        if make -C "$REPO_ROOT/libs/xseries_shim" $XS_MAKEVARS && \
+           sudo make -C "$REPO_ROOT/libs/xseries_shim" $XS_MAKEVARS install; then
             echo " -> libpscan_xseries.so installed."
         else
             echo " -> [WARNING] The X Series shim did not build. The card will"
