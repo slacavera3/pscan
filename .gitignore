@@ -14,6 +14,13 @@ __pycache__/
 # Local notes to Claude. Design philosophy and standing instructions for this
 # checkout - useful to have in the working tree, not something to push.
 context.md
+
+# Proprietary vendor SDKs. install.sh asks for these by name and URL when they
+# are missing; their licences do not permit this public repository to
+# redistribute them, so nothing in here is ever committed.
+#   - NI X Series DDK (nixseries.tar.gz) + its Linux OS interface
+#   - Tucsen Dhyana camera SDK
+libs/vendor/
 build/
 dist/
 *.egg-info/

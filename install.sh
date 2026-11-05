@@ -30,6 +30,48 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT" || exit 1
 
+# ---------------------------------------------------------------------------
+# PROPRIETARY SDK DROP-BOX
+#
+# Some drivers pscan needs cannot live in this repository: NI's X Series DDK
+# and Tucsen's camera SDK are both distributed under vendor licences that do
+# not permit redistribution. The repo stays public, so instead of vendoring
+# them, this script asks for them.
+#
+# Every missing download is COLLECTED and reported together at the end, with
+# its URL and the exact filename to save. Reporting them one at a time would
+# mean a download, a re-run, another request, another download - which is the
+# kind of drip-feed that makes a setup feel endless.
+#
+# Drop files in libs/vendor/ (gitignored) and re-run this script.
+# ---------------------------------------------------------------------------
+VENDOR_DIR="$REPO_ROOT/libs/vendor"
+mkdir -p "$VENDOR_DIR" 2>/dev/null || true
+VENDOR_MISSING=0
+VENDOR_REQUESTS=""
+
+# First file under libs/vendor/ matching a glob, or empty.
+#
+# maxdepth 6 because a vendor SDK extracted in place is several levels deep -
+# the Tucsen tarball lands its library at
+# TUCamSample_ubuntu22.04_.../sdk/lib/libTUCam.so.1.0.0, which is four levels
+# down. A shallower limit silently fails to find a file that is sitting right
+# there, which is worse than not looking.
+vendor_find() {
+    find "$VENDOR_DIR" -maxdepth 6 -iname "$1" -print 2>/dev/null | head -n 1
+}
+
+# request_vendor <label> <expected-filename> <url> <what-it-is-for>
+request_vendor() {
+    VENDOR_MISSING=$((VENDOR_MISSING + 1))
+    VENDOR_REQUESTS="${VENDOR_REQUESTS}
+  [$VENDOR_MISSING] $1
+      Needed for : $4
+      Download   : $3
+      Save as    : libs/vendor/$2
+"
+}
+
 ldconfig_p() {
     if command -v ldconfig >/dev/null 2>&1; then
         ldconfig -p 2>/dev/null
@@ -300,6 +342,100 @@ install_nidaqmx() {
 
 install_nidaqmx || echo " -> [WARNING] NI-DAQmx setup did not complete; see above."
 
+# --- 1.8 Setup NI X Series DDK (the route to X Series cards on any distro) ---
+echo -e "\n[1.8/6] Checking NI X Series DDK..."
+
+# This is how an NI X Series card (PCIe-635x, e.g. the PCIe-6351) is reached
+# on a distro NI-DAQmx does not support - which is every distro but Ubuntu,
+# RHEL and openSUSE.
+#
+# NI's MHDDK documents the DAQ-STC3 registers and ships source for them, and
+# NI describes it as the only Linux support they offer for custom drivers. We
+# build its X Series chip objects into a small shared library and bind that
+# with ctypes, exactly as this repo already does for libcomedi, libphidget21
+# and libTUCam.
+#
+# Crucially it needs NO kernel module: the DDK's "LinuxDevMem" OS interface
+# mmaps the card's PCI BARs from userspace, and the aiex2 example shows
+# hardware-timed finite acquisition read straight out of the AI FIFO. DMA is
+# unavailable that way, which does not matter at pscan's data rate - 1000
+# samples at 10 kHz is 20 KB/s.
+#
+# Two downloads, both free but licence-restricted, so neither is vendored.
+# The OS interface arrives under several names depending on which flavour was
+# downloaded, so look for the header that identifies any of them as well as
+# the likely archive names.
+XSERIES_TARBALL="$(vendor_find 'nixseries*.tar.gz')"
+XSERIES_OSI="$(vendor_find 'osiBus.h')"
+[ -n "$XSERIES_OSI" ] || XSERIES_OSI="$(vendor_find '*linux*kernel*module*')"
+[ -n "$XSERIES_OSI" ] || XSERIES_OSI="$(vendor_find '*nirlpk*')"
+[ -n "$XSERIES_OSI" ] || XSERIES_OSI="$(vendor_find '*osinterface*')"
+[ -n "$XSERIES_OSI" ] || XSERIES_OSI="$(vendor_find '*Linux26*')"
+
+if [ -z "$XSERIES_TARBALL" ]; then
+    echo " -> X Series DDK source not found; will request it below."
+    request_vendor "NI X Series DDK (MHDDK)" "nixseries.tar.gz" \
+        "https://www.ni.com/en/support/downloads/drivers/download.ni-measurement-hardware-ddk.html" \
+        "reading the PCIe-6351 without NI-DAQmx"
+else
+    echo " -> X Series DDK source found: ${XSERIES_TARBALL#$REPO_ROOT/}"
+fi
+
+if [ -z "$XSERIES_OSI" ]; then
+    echo " -> X Series OS interface not found; will request it below."
+    request_vendor "MHDDK Linux OS interface - 'Linux (via kernel module)' VERSION 2.0" \
+        "osinterface-linux-kernelmodule-v2.tar.gz" \
+        "https://www.ni.com/en/support/downloads/drivers/download.ni-measurement-hardware-ddk.html" \
+        "the DDK's PCI access layer. Take the 64-bit-capable kernel-module flavour: the /dev/mem one is 32-bit only"
+else
+    echo " -> X Series OS interface found: ${XSERIES_OSI#$REPO_ROOT/}"
+fi
+
+# Build the shim when both halves are present. Extracted into libs/vendor/ so
+# the vendor source and our one file stay visibly separate, and so a re-run
+# rebuilds against whatever was dropped there rather than a stale tree.
+if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
+    XS_BUILD="$VENDOR_DIR/build"
+    rm -rf "$XS_BUILD"
+    mkdir -p "$XS_BUILD"
+
+    echo " -> Extracting the DDK..."
+    tar -xzf "$XSERIES_TARBALL" -C "$XS_BUILD" || true
+
+    # The tarball may unpack to nixseries/ or straight into the directory.
+    XS_DDK="$(find "$XS_BUILD" -maxdepth 3 -type d -name ChipObjects -print -quit 2>/dev/null)"
+    XS_DDK="${XS_DDK%/ChipObjects}"
+
+    # The OS interface may be a tarball or an already-extracted directory.
+    case "$XSERIES_OSI" in
+        *.tar.gz|*.tgz) tar -xzf "$XSERIES_OSI" -C "$XS_BUILD" || true ;;
+        *.zip)          unzip -q -o "$XSERIES_OSI" -d "$XS_BUILD" || true ;;
+    esac
+    XS_OSI="$(find "$XS_BUILD" "$VENDOR_DIR" -maxdepth 4 -name osiBus.h -print -quit 2>/dev/null)"
+    XS_OSI="${XS_OSI%/osiBus.h}"
+
+    if [ -z "$XS_DDK" ] || [ -z "$XS_OSI" ]; then
+        echo " -> [WARNING] Could not locate the DDK and OS interface after"
+        echo " ->           extraction (looked for ChipObjects/ and osiBus.h)."
+        echo " ->           The X Series backend will be unavailable."
+    else
+        echo " -> Building libpscan_xseries.so..."
+        echo " ->   DDK: ${XS_DDK#$REPO_ROOT/}"
+        echo " ->   OSI: ${XS_OSI#$REPO_ROOT/}"
+        if make -C "$REPO_ROOT/libs/xseries_shim" \
+                NIXSERIES_DIR="$XS_DDK" OSI_DIR="$XS_OSI" && \
+           sudo make -C "$REPO_ROOT/libs/xseries_shim" install; then
+            echo " -> libpscan_xseries.so installed."
+        else
+            echo " -> [WARNING] The X Series shim did not build. The card will"
+            echo " ->           be unreachable; everything else is unaffected."
+            echo " ->           This shim has not yet been compiled anywhere,"
+            echo " ->           so a first-time failure here is expected to"
+            echo " ->           need fixing rather than re-running."
+        fi
+    fi
+fi
+
 # --- 2. Setup Tucsen SDK Drivers ---
 echo -e "\n[2/6] Setting up Tucsen Dhyana SDK..."
 TUCSEN_DIR="/opt/tucsen/sdk/lib"
@@ -308,20 +444,52 @@ sudo mkdir -p $TUCSEN_DIR
 if [ -f "$TUCSEN_DIR/libTUCam.so" ]; then
     echo " -> Tucsen driver already installed at $TUCSEN_DIR."
 else
-    # Search the current directory (and subdirectories) for the driver file
-    LOCAL_LIB=$(find . -name "libTUCam.so" | head -n 1)
+    # libs/vendor/ first, then anywhere in the tree - the latter so an older
+    # checkout that still carries the committed SDK keeps working.
+    LOCAL_LIB="$(vendor_find 'libTUCam.so*')"
+    [ -n "$LOCAL_LIB" ] || LOCAL_LIB=$(find "$REPO_ROOT" -name "libTUCam.so" 2>/dev/null | head -n 1)
+
     if [ -n "$LOCAL_LIB" ]; then
-        echo " -> Found local Tucsen driver at $LOCAL_LIB."
+        echo " -> Found Tucsen driver at ${LOCAL_LIB#$REPO_ROOT/}"
         echo " -> Copying to $TUCSEN_DIR..."
-        sudo cp "$LOCAL_LIB" $TUCSEN_DIR/
+        sudo cp "$LOCAL_LIB" $TUCSEN_DIR/libTUCam.so
         sudo chmod 755 $TUCSEN_DIR/libTUCam.so
     else
-        echo " -> [WARNING] libTUCam.so not found!"
-        echo " -> Please extract your Tucsen driver archive inside this folder, or manually copy libTUCam.so to $TUCSEN_DIR."
+        echo " -> Tucsen SDK not found; will request it below."
+        request_vendor "Tucsen Dhyana camera SDK" \
+            "TUCamSample_ubuntu*.tar.gz (or libTUCam.so on its own)" \
+            "https://www.tucsen.com/download/" \
+            "the Tucsen camera ('action tucsen')"
     fi
 fi
 
+# Printed once, at the end, listing every proprietary download still needed.
+# Called from both exit paths.
+report_vendor_requests() {
+    [ "$VENDOR_MISSING" -eq 0 ] && return 0
+
+    echo ""
+    echo "======================================================="
+    echo " MANUAL STEP: $VENDOR_MISSING PROPRIETARY DOWNLOAD(S) NEEDED"
+    echo "======================================================="
+    echo " These are free but their licences do not allow this"
+    echo " repository to redistribute them, so they cannot be"
+    echo " committed. Download each one, save it under"
+    echo " libs/vendor/ with the filename shown, and re-run:"
+    echo ""
+    echo "     bash install.sh"
+    echo "${VENDOR_REQUESTS}"
+    echo " libs/vendor/ is gitignored, so nothing you put there"
+    echo " will be committed."
+    echo ""
+    echo " Everything NOT dependent on these is already installed."
+    echo " Only the hardware each one drives is unavailable."
+    echo "======================================================="
+    return 0
+}
+
 if [ "$DRIVERS_ONLY" -eq 1 ]; then
+    report_vendor_requests
     echo -e "\n======================================================="
     echo " Shared system drivers done."
     if [ -n "${NI_DAQMX_NEEDS_REBOOT:-}" ]; then
@@ -445,6 +613,8 @@ else
     echo " -> [ERROR] The installation is not usable (see above)."
     INSTALL_OK=0
 fi
+
+report_vendor_requests
 
 echo -e "\n======================================================="
 if [ "${INSTALL_OK:-0}" -eq 1 ]; then

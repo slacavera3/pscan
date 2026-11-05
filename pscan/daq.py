@@ -57,6 +57,7 @@ DEFAULT_TERMINAL = 'rse'
 _BACKEND_SPECS = {
     'comedi': ('pscan.a2d_driver', 'NIDriver'),
     'daqmx': ('pscan.daqmx_driver', 'DaqmxDriver'),
+    'nixseries': ('pscan.nixseries_driver', 'NIXSeriesDriver'),
     'phidget': (__name__, 'PhidgetD2A'),
 }
 
@@ -71,6 +72,9 @@ DEFAULT_ADDRESS = {
     'comedi': '/dev/comedi0',
     'phidget': 'phidget0',
     'daqmx': None,
+    # nixseries addresses are PCI slots from /sys/bus/pci/devices, so there is
+    # nothing sensible to default to; its connect() resolves a lone NI card.
+    'nixseries': None,
 }
 
 # Backends registered at runtime rather than shipped in source - currently

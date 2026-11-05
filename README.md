@@ -52,6 +52,41 @@ USEFUL FLAGS
       Install NI-DAQmx even when no NI card is seated, or when the OS is not
       one NI supports. See the Debian warning under DAQ CARDS AND BACKENDS.
 
+PROPRIETARY SDKs: THE libs/vendor/ DROP-BOX
+
+Two drivers pscan can use cannot be committed here. NI's X Series DDK and
+Tucsen's camera SDK are both free to download but licensed in ways that do not
+permit this public repository to redistribute them.
+
+So install.sh asks. When one is missing it finishes everything that does not
+depend on it, then prints a single block naming every outstanding download,
+its URL, and the exact filename to save:
+
+  =======================================================
+   MANUAL STEP: 2 PROPRIETARY DOWNLOAD(S) NEEDED
+  =======================================================
+    [1] NI X Series DDK (MHDDK)
+        Needed for : reading the PCIe-6351 without NI-DAQmx
+        Download   : https://www.ni.com/...ni-measurement-hardware-ddk.html
+        Save as    : libs/vendor/nixseries.tar.gz
+
+    [2] Tucsen Dhyana camera SDK
+        ...
+
+Drop the files in libs/vendor/ and re-run `bash install.sh`. That directory is
+gitignored, so nothing you put there can be committed.
+
+They are reported together, at the end, on purpose: one at a time would mean
+download, re-run, next request, download again - a drip-feed that makes a
+setup feel endless. Everything not blocked by a missing SDK installs anyway;
+only the hardware that SDK drives is unavailable.
+
+Note: an older checkout may still carry the Tucsen SDK committed under
+libs/TUCamSample_ubuntu22.04_*/. install.sh still finds and uses it, so
+nothing breaks, but it should come out of version control:
+  git rm -r --cached libs/TUCamSample_ubuntu22.04_*
+and then move it to libs/vendor/ locally.
+
 WHY THERE IS NO LONGER A SEPARATE DEV BUILD
 
 There used to be a `pscan-lab-dev` package, a `pscan-dev` command set and an
@@ -188,7 +223,7 @@ a script once at startup, put it above every core block.
 ### DAQ CARDS AND BACKENDS
 
 `action a2d` grabs DC photovoltage off a detector; `action d2a` applies an
-analog voltage to something. Both reach hardware through one of three
+analog voltage to something. Both reach hardware through one of four
 backends, one driver file each, and pscan picks for you unless you say
 otherwise:
 
@@ -203,6 +238,33 @@ otherwise:
             invisible to it and always will be. Also drives the M Series cards
             comedi handles, so a PCIe-6251 is reachable either way. Analog in
             and out.
+
+  nixseries pscan/nixseries_driver.py  (NIXSeriesDriver)
+            NI X Series on ANY Linux distribution, via NI's Measurement
+            Hardware Driver Development Kit. This is the route for a
+            PCIe-6351 on Debian, where NI-DAQmx will not install and comedi
+            has no X Series driver. No NI binaries: libs/xseries_shim/ builds
+            the DDK's register-level source into libpscan_xseries.so and this
+            module binds it with ctypes. Requires ROOT, since the card's PCI
+            BARs are mapped directly. Analog in and out.
+
+            Needs the DDK's "Linux (via kernel module)" OS interface,
+            VERSION 2.0 - the only 64-bit-capable Linux option NI offers.
+            That builds nirlpk.ko, which NI ships as SOURCE UNDER THE BSD
+            LICENCE, so unlike NI-DAQmx's kernel modules it can be read,
+            patched for a newer kernel and redistributed. (The /dev/mem
+            flavour needs no kernel module but is 32-bit only and targets
+            kernel 2.4, so it is no use on amd64.)
+
+            Ranges: +/-10V, 5V, 2V, 1V, 500mV, 200mV, 100mV - finer than
+            comedi offers. No DMA, so a finite trace must fit the card's AI
+            FIFO (thousands of samples), and a single channel caps at
+            250 kHz. Neither limit binds at pscan's usual 1000 samples
+            @ 10 kHz.
+
+            NOT YET VERIFIED ON HARDWARE. The shim is written against the
+            DDK's aiex2 and aoex1 examples but has not been compiled or run
+            against a card.
 
   phidget   pscan/d2aphidget_driver.py (D2APhidgetDriver)
             The Phidget analog board that has always driven the piezo.
