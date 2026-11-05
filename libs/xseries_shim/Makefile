@@ -60,7 +60,18 @@ OSI_DEFINES ?= $(if $(strip $(OSI_HARVESTED)),$(OSI_HARVESTED),$(OSI_FALLBACK))
 # -fPIC because this becomes a shared library. The DDK is 2011-era C++ and
 # trips newer warnings that are not ours to fix, so its noise is quietened
 # while our own file is compiled with warnings on (see shim.o below).
-CXXFLAGS ?= -O2 -fPIC -fvisibility=hidden -w
+#
+# -fpermissive is needed for a real defect in NI's headers, not just noise:
+#
+#   tOutTimer.h:39  ((fieldId) << 27)
+#   tDO.h:1478      kkDIODirection_Pin31Id -> fieldId 32
+#
+# 32 << 27 is 2^32, which overflows a 32-bit int, so that one enumerator is
+# not a constant expression. GCC used to warn and now errors. It has been
+# wrong since 2011 and only affects the DIO direction register's pin 31 field
+# id, which nothing here uses - but tDO.cpp still has to compile, because
+# tXSeries aggregates the DI and DO chip objects.
+CXXFLAGS ?= -O2 -fPIC -fvisibility=hidden -w -fpermissive
 CXXFLAGS += $(DDK_DEFINES) $(OSI_DEFINES)
 LDFLAGS  ?= -shared -Wl,-soname,$(SONAME)
 
@@ -80,14 +91,29 @@ DDK_SRC = \
 	$(NIXSERIES_DIR)/Examples/outTimer/aoHelper.cpp \
 	$(NIXSERIES_DIR)/Examples/outTimer/outTimerHelper.cpp
 
-# The OS interface keeps osiBus.cpp at its root and the platform-specific
-# osiUserCode.cpp one level down (LinuxKernel/ for the kernel-module flavour),
-# matching the VPATH in its own .mak. Globbing only the root misses
-# osiUserCode.cpp and the link fails on acquireBoard().
+# Which implementation of acquireBoard()/releaseBoard() to build against.
 #
-# Two levels and no deeper, on purpose: LinuxKernel/nirlpk/ holds nirlpk.c,
-# which is KERNEL code and must never be compiled into this userspace library.
-OSI_SRC = $(wildcard $(OSI_DIR)/*.cpp) $(wildcard $(OSI_DIR)/*/*.cpp)
+#   USE_SYSFS_BUS=1 (default)
+#     osiUserCode_sysfs.cpp, ours. Maps the card's BAR through
+#     /sys/bus/pci/devices/<slot>/resource0 and needs NO kernel module.
+#
+#   USE_SYSFS_BUS=0
+#     NI's LinuxKernel/osiUserCode.cpp, which talks to nirlpk.ko over ioctl
+#     and so needs that module built and loaded. Available as a fallback if
+#     the sysfs route ever disappoints; it also enables DMA, which ours
+#     cannot do.
+#
+# Either way osiBus.cpp from the OS interface root is used unchanged - it
+# supplies iBus::get() and ~tDMAMemory().
+USE_SYSFS_BUS ?= 1
+
+ifeq ($(USE_SYSFS_BUS),1)
+  OSI_SRC = $(wildcard $(OSI_DIR)/*.cpp) osiUserCode_sysfs.cpp
+else
+  # Two levels and no deeper, on purpose: LinuxKernel/nirlpk/ holds nirlpk.c,
+  # which is KERNEL code and must never reach this userspace library.
+  OSI_SRC = $(wildcard $(OSI_DIR)/*.cpp) $(wildcard $(OSI_DIR)/*/*.cpp)
+endif
 
 OBJ = $(DDK_SRC:.cpp=.o) xseries_shim.o
 
@@ -112,6 +138,7 @@ check:
 		exit 1; }
 	@echo "  DDK defines: $(DDK_DEFINES)"
 	@echo "  OSI defines: $(OSI_DEFINES)$(if $(strip $(OSI_HARVESTED)), (from $(notdir $(OSI_MAK))), (fallback - no -D flags found in $(OSI_DIR)/*.mak))"
+	@echo "  Bus access : $(if $(filter 1,$(USE_SYSFS_BUS)),sysfs resource0 mmap - NO kernel module,NI nirlpk.ko via ioctl)"
 	@echo "  OSI sources: $(notdir $(OSI_SRC))"
 	@test -n "$(strip $(OSI_SRC))" || { \
 		echo "ERROR: found no OS interface sources under $(OSI_DIR)"; \

@@ -248,13 +248,20 @@ otherwise:
             module binds it with ctypes. Requires ROOT, since the card's PCI
             BARs are mapped directly. Analog in and out.
 
-            Needs the DDK's "Linux (via kernel module)" OS interface,
-            VERSION 2.0 - the only 64-bit-capable Linux option NI offers.
-            That builds nirlpk.ko, which NI ships as SOURCE UNDER THE BSD
-            LICENCE, so unlike NI-DAQmx's kernel modules it can be read,
-            patched for a newer kernel and redistributed. (The /dev/mem
-            flavour needs no kernel module but is 32-bit only and targets
-            kernel 2.4, so it is no use on amd64.)
+            NO KERNEL MODULE. Download the DDK's "Linux (via kernel module)"
+            OS interface, VERSION 2.0 - the only 64-bit-capable Linux option
+            NI offers - but only its osiBus.cpp and headers are used.
+            libs/xseries_shim/osiUserCode_sysfs.cpp replaces NI's bus layer
+            and maps the card through /sys/bus/pci/devices/<slot>/resource0
+            instead of through nirlpk.ko.
+
+            That is deliberate and is what makes this future-proof: nirlpk.ko
+            is 2011 source that does not build against a modern kernel, while
+            the PCI sysfs interface is stable kernel ABI. Nothing here needs
+            rebuilding after a kernel upgrade.
+
+            To use NI's nirlpk.ko instead - the only route to DMA - install
+            with PSCAN_XSERIES_USE_NIRLPK=1.
 
             Ranges: +/-10V, 5V, 2V, 1V, 500mV, 200mV, 100mV - finer than
             comedi offers. No DMA, so a finite trace must fit the card's AI

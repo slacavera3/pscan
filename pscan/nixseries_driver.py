@@ -17,17 +17,23 @@ arrangement pscan already uses for libcomedi, libphidget21 and libTUCam.
 What it needs from the system:
 
   * libpscan_xseries.so, built by install.sh from the DDK in libs/vendor/
-  * The DDK's Linux OS interface. Take "Linux (via kernel module)" VERSION
-    2.0 from NI's MHDDK page - that is the only 64-bit-capable Linux option.
-    The "/dev/mem" flavour needs no kernel module but is 32-bit only and
-    targets kernel 2.4, so it is no use on an amd64 machine.
+  * The DDK's Linux OS interface, for osiBus.cpp and its headers. Take
+    "Linux (via kernel module)" VERSION 2.0 from NI's MHDDK page - the only
+    64-bit-capable Linux option, since the "/dev/mem" flavour is 32-bit and
+    targets kernel 2.4.
   * ROOT. The card's PCI BARs are mapped directly and the kernel does not let
     an unprivileged process do that.
 
-The kernel-module interface builds nirlpk.ko for the running kernel. Unlike
-NI-DAQmx's nikal/nipalk, NI distributes it as SOURCE UNDER THE BSD LICENCE,
-so it can be read, patched for a newer kernel, and redistributed - which is
-what keeps this route viable on a distro NI has never heard of.
+NO KERNEL MODULE. Although the download is the kernel-module flavour, only
+its osiBus.cpp and headers are used; libs/xseries_shim/osiUserCode_sysfs.cpp
+replaces NI's bus implementation and maps the card through
+/sys/bus/pci/devices/<slot>/resource0 instead of through nirlpk.ko. That
+matters because nirlpk.ko is 2011 source that does not build against a modern
+kernel, while the PCI sysfs interface is stable kernel ABI that does not rot.
+
+Building nirlpk.ko and using NI's implementation instead remains possible -
+PSCAN_XSERIES_USE_NIRLPK=1 at install time - and is the route to DMA, which
+the sysfs path cannot offer.
 
 DMA is not used either way. A finite trace has to fit in the card's AI FIFO,
 which on a 6351 is several thousand samples against pscan's typical 1000, and

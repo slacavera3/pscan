@@ -115,10 +115,36 @@ sudo apt install -y \
     curl unzip \
     libcomedi0 libcomedi-dev \
     libusb-1.0-0-dev libusb-dev \
-    build-essential dkms "linux-headers-$(uname -r)" \
+    build-essential dkms \
     python3-pip
 if [ -n "$PYVER" ]; then
     sudo apt install -y "python${PYVER}-venv" python3-venv 2>/dev/null || true
+fi
+
+# Kernel headers, in their OWN apt call. Bundled with the line above, a
+# package name that does not exist on this kernel makes apt refuse the whole
+# transaction - so a missing headers package would silently take libcomedi,
+# libusb and build-essential down with it, and the failure would surface
+# somewhere unrelated much later.
+KVER="$(uname -r)"
+if [ -d "/lib/modules/$KVER/build" ]; then
+    echo " -> Kernel build tree present for $KVER."
+else
+    echo " -> Installing kernel headers for $KVER..."
+    sudo apt install -y "linux-headers-$KVER" 2>/dev/null \
+        || sudo apt install -y linux-headers-amd64 2>/dev/null \
+        || true
+    if [ ! -d "/lib/modules/$KVER/build" ]; then
+        echo " -> [WARNING] No kernel build tree at /lib/modules/$KVER/build."
+        echo " ->           Out-of-tree modules cannot be built, which means"
+        echo " ->           nirlpk.ko - and so the NI X Series card - will be"
+        echo " ->           unavailable. Install the headers matching your"
+        echo " ->           RUNNING kernel:"
+        echo " ->             sudo apt install linux-headers-$KVER"
+        echo " ->           If apt has no such package, you are running a"
+        echo " ->           kernel the archive no longer ships headers for;"
+        echo " ->           reboot into the current one first."
+    fi
 fi
 
 # --- 1.5 Setup Phidgets OS Drivers (Legacy C Library) ---
@@ -449,12 +475,34 @@ if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
         # well the shim compiled. NI ships it as BSD-licensed source, so it
         # builds here rather than coming from a vendor package.
         XS_NIRLPK="$(find "$XS_BUILD" "$VENDOR_DIR" -maxdepth 5 -type d -name nirlpk -print -quit 2>/dev/null)"
+        # Only when explicitly asked for. The shim defaults to its own sysfs
+        # bus implementation (libs/xseries_shim/osiUserCode_sysfs.cpp), which
+        # maps the card's BAR through /sys/bus/pci/devices and needs no kernel
+        # module - so building NI's 2011 nirlpk.ko against a modern kernel is
+        # effort spent on something nothing loads. Set
+        # PSCAN_XSERIES_USE_NIRLPK=1 to build it and have the shim use it,
+        # which is the route to DMA if that is ever wanted.
+        if [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ]; then
+            XS_NIRLPK=""
+            echo " -> Using the sysfs bus interface (no kernel module needed)."
+        fi
+
         if [ -n "$XS_NIRLPK" ]; then
             if /sbin/lsmod 2>/dev/null | grep -q '^nirlpk'; then
                 echo " -> nirlpk.ko already loaded."
+            elif [ ! -d "/lib/modules/$(uname -r)/build" ]; then
+                echo " -> [WARNING] Skipping nirlpk.ko: no kernel build tree at"
+                echo " ->           /lib/modules/$(uname -r)/build. Its configure"
+                echo " ->           reports this as 'Unable to find kernel"
+                echo " ->           sources'. See the headers warning in step 1."
             else
                 echo " -> Building nirlpk.ko for kernel $(uname -r)..."
-                if make -C "$XS_NIRLPK" && sudo make -C "$XS_NIRLPK" install; then
+                # KERNELDIR is exported as well as passed: the DDK's configure
+                # is 2011-era and reads it from the environment, while its
+                # Makefile may take it as a variable.
+                if KERNELDIR="/lib/modules/$(uname -r)/build" \
+                   make -C "$XS_NIRLPK" KERNELDIR="/lib/modules/$(uname -r)/build" \
+                   && sudo make -C "$XS_NIRLPK" install; then
                     echo " -> nirlpk.ko installed and loaded."
                 else
                     echo " -> [WARNING] nirlpk.ko did not build. It is 2011-era"
@@ -469,8 +517,12 @@ if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
         echo " -> Building libpscan_xseries.so..."
         echo " ->   DDK: ${XS_DDK#$REPO_ROOT/}"
         echo " ->   OSI: ${XS_OSI#$REPO_ROOT/}"
+        XS_USE_SYSFS=1
+        [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] || XS_USE_SYSFS=0
+
         if make -C "$REPO_ROOT/libs/xseries_shim" \
-                NIXSERIES_DIR="$XS_DDK" OSI_DIR="$XS_OSI" && \
+                NIXSERIES_DIR="$XS_DDK" OSI_DIR="$XS_OSI" \
+                USE_SYSFS_BUS="$XS_USE_SYSFS" && \
            sudo make -C "$REPO_ROOT/libs/xseries_shim" install; then
             echo " -> libpscan_xseries.so installed."
         else
