@@ -140,6 +140,23 @@ python3 -m venv --clear "$VENV_DIR"
 
 # --- 4. Install this branch into it ---
 echo -e "\n[4/5] Installing the experimental build (this pulls its own deps)..."
+
+# Scrub the pre-consolidation layout out of the SOURCE tree first.
+#
+# pscan/daq used to be a package directory; it is now pscan/daq.py. If the old
+# directory survives - git leaves it behind when it still holds untracked
+# files such as __pycache__, and an interrupted pull can leave it intact - then
+# setup.py's find_packages() picks up 'pscan.daq' again and pip installs BOTH.
+# Python resolves a regular package ahead of a module of the same name, so the
+# stale __init__.py wins and every new function in daq.py is invisible. The
+# symptom is an AttributeError on first use, nowhere near the cause.
+for stale in "$REPO_DIR/pscan/daq" "$REPO_DIR/pscan/scan_axes.py"; do
+    if [ -e "$stale" ]; then
+        echo " -> Removing stale $stale (pre-consolidation layout)."
+        rm -rf "$stale"
+    fi
+done
+find "$REPO_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 # The daqmx extra is added only when the system driver is actually present.
 # The nidaqmx Python package is useless without it, and installing it anyway
 # would make 'pydaq-dev list' report the backend as available right up to the
@@ -150,6 +167,55 @@ if [ "${NEED_DAQMX_PY:-0}" -eq 1 ]; then
 else
     "$VENV_DIR/bin/python" -m pip install --no-cache-dir "$REPO_DIR"
 fi
+
+# Prove the install is coherent before handing over commands that use it.
+#
+# This exists because a shadowed pscan.daq produced an AttributeError at first
+# use with nothing in the install output hinting at it. An import check costs
+# a second and turns that into a failure at the point of cause. It also catches
+# a stale pscan/daq/ that reached site-packages some other way, since it checks
+# what Python actually resolves rather than what is on disk.
+echo " -> Verifying the install..."
+if ! "$VENV_DIR/bin/python" - <<'PYCHECK'
+import sys
+import pscan.daq as daq
+
+problems = []
+
+if daq.__file__ is None or not daq.__file__.endswith('daq.py'):
+    problems.append(
+        f"pscan.daq resolved to {daq.__file__!r}, not a daq.py module. A "
+        f"leftover pscan/daq/ package directory is shadowing it."
+    )
+
+for attr in ('backend_names', 'backend_class', 'open_device', 'close_all',
+             'resolve_range', 'DAQBackend'):
+    if not hasattr(daq, attr):
+        problems.append(f"pscan.daq is missing {attr}()")
+
+for module in ('pscan.main', 'pscan.a2d_driver', 'pscan.daqmx_driver',
+               'pscan.control_daq', 'pscan.config_parser'):
+    try:
+        __import__(module)
+    except Exception as e:
+        problems.append(f"{module} will not import: {type(e).__name__}: {e}")
+
+if problems:
+    print("")
+    for p in problems:
+        print(f" -> [ERROR] {p}")
+    sys.exit(1)
+PYCHECK
+then
+    echo " ->"
+    echo " -> [ERROR] The installed package is not coherent (see above)."
+    echo " -> Most often a stale layout. Clear everything and retry:"
+    echo " ->   rm -rf '$VENV_DIR'"
+    echo " ->   git -C '$REPO_DIR' status --porcelain   # check for leftovers"
+    echo " ->   bash install-dev.sh"
+    exit 1
+fi
+echo " -> Install verified."
 
 # --- 5. Expose the -dev commands on PATH ---
 # Symlinks, not copies, so a re-run of step 4 is picked up without reinstalling

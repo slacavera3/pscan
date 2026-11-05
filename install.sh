@@ -257,6 +257,20 @@ fi
 echo -e "\n[4/6] Scrubbing old build artifacts..."
 sudo rm -rf build/ pscan_lab.egg-info/ dist/
 
+# pscan/daq used to be a package directory and is now pscan/daq.py. If the old
+# directory survives - git leaves it behind when it still holds untracked files
+# such as __pycache__ - find_packages() picks up 'pscan.daq' again and pip
+# installs both. Python resolves a regular package ahead of a module of the
+# same name, so the stale __init__.py wins and the new daq.py is invisible,
+# surfacing as an AttributeError nowhere near its cause.
+for stale in pscan/daq pscan/scan_axes.py; do
+    if [ -e "$stale" ]; then
+        echo " -> Removing stale $stale (pre-consolidation layout)."
+        sudo rm -rf "$stale"
+    fi
+done
+find . -name '__pycache__' -type d -prune -exec sudo rm -rf {} + 2>/dev/null || true
+
 # --- 5. Exorcise Ghost Installations ---
 echo -e "\n[5/6] Removing existing or broken installations..."
 # Ask pip nicely first
