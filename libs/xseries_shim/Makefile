@@ -13,6 +13,10 @@
 # same arrangement this repo already uses for libcomedi, libphidget21 and
 # libTUCam.
 
+# A literal comma, for use inside $(if ...) where one would otherwise be
+# read as an argument separator.
+comma := ,
+
 NIXSERIES_DIR ?= ../vendor/nixseries
 OSI_DIR       ?= ../vendor/osinterface
 PREFIX        ?= /usr/local
@@ -102,22 +106,27 @@ DDK_SRC = \
 
 # Which implementation of acquireBoard()/releaseBoard() to build against.
 #
-#   USE_SYSFS_BUS=1 (default)
-#     osiUserCode_sysfs.cpp, ours. Maps the card's BAR through
-#     /sys/bus/pci/devices/<slot>/resource0 and needs NO kernel module.
+#   USE_VFIO=1 (default)
+#     osiUserCode_vfio.cpp, ours. Reaches the card through vfio-pci, which
+#     needs no kernel module of NI's, works under kernel lockdown, and with
+#     a udev rule needs no root.
 #
-#   USE_SYSFS_BUS=0
-#     NI's LinuxKernel/osiUserCode.cpp, which talks to nirlpk.ko over ioctl
-#     and so needs that module built and loaded. Available as a fallback if
-#     the sysfs route ever disappoints; it also enables DMA, which ours
-#     cannot do.
+#   USE_VFIO=0
+#     NI's LinuxKernel/osiUserCode.cpp, which talks to nirlpk.ko over ioctl.
+#     That module is 2011 source, does not build against a modern kernel,
+#     and could not load under lockdown anyway - but it is the only route to
+#     DMA, so the switch stays.
+#
+# A third implementation, mmapping /sys/bus/pci/.../resource0 directly, was
+# written and then removed: kernel lockdown blocks it with EPERM on any
+# Secure Boot machine, and VFIO works everywhere it did.
 #
 # Either way osiBus.cpp from the OS interface root is used unchanged - it
 # supplies iBus::get() and ~tDMAMemory().
-USE_SYSFS_BUS ?= 1
+USE_VFIO ?= 1
 
-ifeq ($(USE_SYSFS_BUS),1)
-  OSI_SRC = $(wildcard $(OSI_DIR)/*.cpp) osiUserCode_sysfs.cpp
+ifeq ($(USE_VFIO),1)
+  OSI_SRC = $(wildcard $(OSI_DIR)/*.cpp) osiUserCode_vfio.cpp
 else
   # Two levels and no deeper, on purpose: LinuxKernel/nirlpk/ holds nirlpk.c,
   # which is KERNEL code and must never reach this userspace library.
@@ -162,7 +171,7 @@ check:
 		exit 1; }
 	@echo "  DDK defines: $(DDK_DEFINES)"
 	@echo "  OSI defines: $(OSI_DEFINES)$(if $(strip $(OSI_HARVESTED)), (from $(notdir $(OSI_MAK))), (fallback - no -D flags found in $(OSI_DIR)/*.mak))"
-	@echo "  Bus access : $(if $(filter 1,$(USE_SYSFS_BUS)),sysfs resource0 mmap - NO kernel module,NI nirlpk.ko via ioctl)"
+	@echo "  Bus access : $(if $(filter 1,$(USE_VFIO)),vfio-pci - no kernel module$(comma) works under lockdown,NI nirlpk.ko via ioctl)"
 	@echo "  OSI sources: $(notdir $(OSI_SRC))"
 	@test -n "$(strip $(OSI_SRC))" || { \
 		echo "ERROR: found no OS interface sources under $(OSI_DIR)"; \

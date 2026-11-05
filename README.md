@@ -248,20 +248,32 @@ otherwise:
             module binds it with ctypes. Requires ROOT, since the card's PCI
             BARs are mapped directly. Analog in and out.
 
-            NO KERNEL MODULE. Download the DDK's "Linux (via kernel module)"
-            OS interface, VERSION 2.0 - the only 64-bit-capable Linux option
-            NI offers - but only its osiBus.cpp and headers are used.
-            libs/xseries_shim/osiUserCode_sysfs.cpp replaces NI's bus layer
-            and maps the card through /sys/bus/pci/devices/<slot>/resource0
-            instead of through nirlpk.ko.
+            NO KERNEL MODULE, NO ROOT, NO BIOS CHANGE. Download the DDK's
+            "Linux (via kernel module)" OS interface, VERSION 2.0 - the only
+            64-bit-capable Linux option NI offers - but only its osiBus.cpp
+            and headers are used. libs/xseries_shim/osiUserCode_vfio.cpp
+            replaces NI's bus layer and reaches the card through vfio-pci.
 
-            That is deliberate and is what makes this future-proof: nirlpk.ko
-            is 2011 source that does not build against a modern kernel, while
-            the PCI sysfs interface is stable kernel ABI. Nothing here needs
-            rebuilding after a kernel upgrade.
+            That matters on any machine with Secure Boot, which turns on
+            kernel lockdown. Lockdown blocks mapping a PCI BAR from
+            userspace (EPERM, and root does not override it) and refuses to
+            load unsigned kernel modules - so NI's nirlpk.ko, NI-DAQmx's
+            kernel modules, and a direct sysfs BAR mmap are all dead ends
+            there. vfio-pci is in-tree, signed, and permitted because the
+            IOMMU contains the device's DMA.
 
-            To use NI's nirlpk.ko instead - the only route to DMA - install
-            with PSCAN_XSERIES_USE_NIRLPK=1.
+            install.sh binds X Series cards to vfio-pci persistently
+            (/etc/modprobe.d) and writes a udev rule giving the 'pscan'
+            group access to /dev/vfio, so running a scan needs no sudo. You
+            must log out and back in once for the group to apply.
+
+            Needs an IOMMU. If /sys/kernel/iommu_groups is empty, add
+            'intel_iommu=on' to GRUB_CMDLINE_LINUX_DEFAULT and update-grub -
+            scriptable, unlike a BIOS visit.
+
+            To use NI's nirlpk.ko instead - the only route to DMA, and only
+            viable without Secure Boot - install with
+            PSCAN_XSERIES_USE_NIRLPK=1.
 
             Ranges: +/-10V, 5V, 2V, 1V, 500mV, 200mV, 100mV - finer than
             comedi offers. No DMA, so a finite trace must fit the card's AI

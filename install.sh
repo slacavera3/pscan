@@ -231,6 +231,94 @@ echo -e "\n[1.7/6] Checking NI-DAQmx..."
 #   PSCAN_FORCE_DAQMX=1   install even with no NI card currently seated
 #   NI_RELEASE=2025Q1     pin the release whose zip is fetched
 
+# Bind NI X Series cards to vfio-pci, persistently, and make /dev/vfio
+# reachable without root.
+#
+# Two pieces, both needed:
+#
+#   modprobe.d  binds any 1093:c4c4 card to vfio-pci at boot. 0xc4c4 is the
+#               generic X Series PCI device id - every 632x/634x/635x/636x/
+#               637x reports it - so this claims X Series cards and nothing
+#               else. comedi cards have different ids and are untouched,
+#               which matters because comedi has no X Series support anyway.
+#
+#   udev        gives the 'pscan' group access to /dev/vfio/*. Without it a
+#               scan needs root, which is a poor thing to require of
+#               everyday use.
+setup_vfio_binding() {
+    echo " -> Setting up vfio-pci binding..."
+
+    if ! modinfo vfio-pci >/dev/null 2>&1; then
+        echo " -> [WARNING] No vfio-pci module on this kernel. The X Series"
+        echo " ->           card cannot be reached without it."
+        return 1
+    fi
+    sudo modprobe vfio-pci 2>/dev/null || true
+
+    # An IOMMU is required: it is what makes lockdown willing to allow
+    # userspace device access at all.
+    if [ ! -d /sys/kernel/iommu_groups ] || \
+       [ -z "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]; then
+        echo " -> [WARNING] No IOMMU groups, so vfio-pci cannot be used."
+        echo " ->           Add 'intel_iommu=on' to GRUB_CMDLINE_LINUX_DEFAULT"
+        echo " ->           in /etc/default/grub, run 'sudo update-grub' and"
+        echo " ->           reboot. (VT-d must also be on in firmware, which"
+        echo " ->           it usually is by default.)"
+        return 1
+    fi
+
+    echo 'options vfio-pci ids=1093:c4c4' \
+        | sudo tee /etc/modprobe.d/pscan-vfio.conf >/dev/null
+    echo " -> /etc/modprobe.d/pscan-vfio.conf written."
+
+    sudo groupadd -f pscan 2>/dev/null || true
+    sudo tee /etc/udev/rules.d/99-pscan-vfio.rules >/dev/null <<'UDEV'
+# pscan: let the 'pscan' group reach VFIO devices, so a scan does not need
+# root. Written by install.sh.
+SUBSYSTEM=="vfio", GROUP="pscan", MODE="0660"
+UDEV
+    sudo udevadm control --reload-rules 2>/dev/null || true
+    sudo udevadm trigger --subsystem-match=vfio 2>/dev/null || true
+    echo " -> udev rule written; /dev/vfio is group 'pscan'."
+
+    # Bind any card that is present now, so a reboot is not required.
+    for dev in /sys/bus/pci/devices/*; do
+        [ -f "$dev/vendor" ] || continue
+        [ "$(cat "$dev/vendor" 2>/dev/null)" = "0x1093" ] || continue
+
+        slot="$(basename "$dev")"
+        current="$(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)"
+
+        if [ "$current" = "vfio-pci" ]; then
+            echo " -> $slot already bound to vfio-pci."
+            continue
+        fi
+        if [ -n "$current" ]; then
+            echo " -> $slot is bound to '$current'; leaving it alone."
+            continue
+        fi
+
+        echo vfio-pci | sudo tee "$dev/driver_override" >/dev/null
+        echo "$slot" | sudo tee /sys/bus/pci/drivers_probe >/dev/null
+        now="$(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)"
+        echo " -> $slot bound to ${now:-nothing}."
+    done
+
+    # Group membership only takes effect at next login, which is a confusing
+    # thing to discover later rather than now.
+    target_user="${SUDO_USER:-$USER}"
+    if id -nG "$target_user" 2>/dev/null | tr ' ' '\n' | grep -qx pscan; then
+        echo " -> $target_user is already in the 'pscan' group."
+    else
+        sudo usermod -aG pscan "$target_user" 2>/dev/null || true
+        echo " -> Added $target_user to the 'pscan' group."
+        echo " -> [NOTE] LOG OUT AND BACK IN for that to take effect. Until"
+        echo " ->        then pydaq and pscan need sudo for this card."
+        VFIO_NEEDS_RELOGIN=1
+    fi
+    return 0
+}
+
 install_nidaqmx() {
     if have_lib libnidaqmx; then
         echo " -> NI-DAQmx is already installed. Skipping."
@@ -475,16 +563,16 @@ if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
         # well the shim compiled. NI ships it as BSD-licensed source, so it
         # builds here rather than coming from a vendor package.
         XS_NIRLPK="$(find "$XS_BUILD" "$VENDOR_DIR" -maxdepth 5 -type d -name nirlpk -print -quit 2>/dev/null)"
-        # Only when explicitly asked for. The shim defaults to its own sysfs
-        # bus implementation (libs/xseries_shim/osiUserCode_sysfs.cpp), which
-        # maps the card's BAR through /sys/bus/pci/devices and needs no kernel
-        # module - so building NI's 2011 nirlpk.ko against a modern kernel is
-        # effort spent on something nothing loads. Set
-        # PSCAN_XSERIES_USE_NIRLPK=1 to build it and have the shim use it,
-        # which is the route to DMA if that is ever wanted.
+        # Only when explicitly asked for. The shim reaches the card through
+        # vfio-pci, an in-tree signed driver, so building NI's 2011 nirlpk.ko
+        # against a modern kernel is effort spent on something nothing loads -
+        # and under kernel lockdown it could not be loaded anyway, being
+        # unsigned. PSCAN_XSERIES_USE_NIRLPK=1 builds it and switches the shim
+        # over, which is the route to DMA if that is ever wanted.
         if [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ]; then
             XS_NIRLPK=""
-            echo " -> Using the sysfs bus interface (no kernel module needed)."
+            echo " -> Using vfio-pci (no kernel module; works under lockdown)."
+            setup_vfio_binding
         fi
 
         if [ -n "$XS_NIRLPK" ]; then
@@ -517,15 +605,15 @@ if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
         echo " -> Building libpscan_xseries.so..."
         echo " ->   DDK: ${XS_DDK#$REPO_ROOT/}"
         echo " ->   OSI: ${XS_OSI#$REPO_ROOT/}"
-        XS_USE_SYSFS=1
-        [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] || XS_USE_SYSFS=0
+        XS_USE_VFIO=1
+        [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] || XS_USE_VFIO=0
 
         # The SAME variables go to both invocations. Passing them only to the
         # build left `make install` resolving OSI_DIR to its default, which
         # pointed at a directory that does not exist - and the define harvest
         # then ran grep with no file, which reads stdin and hangs make before
         # it prints anything.
-        XS_MAKEVARS="NIXSERIES_DIR=$XS_DDK OSI_DIR=$XS_OSI USE_SYSFS_BUS=$XS_USE_SYSFS"
+        XS_MAKEVARS="NIXSERIES_DIR=$XS_DDK OSI_DIR=$XS_OSI USE_VFIO=$XS_USE_VFIO"
 
         if make -C "$REPO_ROOT/libs/xseries_shim" $XS_MAKEVARS && \
            sudo make -C "$REPO_ROOT/libs/xseries_shim" $XS_MAKEVARS install; then
@@ -736,6 +824,12 @@ if [ -n "${NI_DAQMX_NEEDS_REBOOT:-}" ]; then
     echo " *** REBOOT REQUIRED: NI-DAQmx was installed this run and its"
     echo " *** kernel modules are not loaded yet. No NI X Series card will"
     echo " *** be visible until you reboot."
+fi
+if [ -n "${VFIO_NEEDS_RELOGIN:-}" ]; then
+    echo ""
+    echo " *** LOG OUT AND BACK IN: you were added to the 'pscan' group so"
+    echo " *** the NI X Series card can be used without sudo. Group changes"
+    echo " *** only apply to new logins."
 fi
 echo "======================================================="
 [ "${INSTALL_OK:-0}" -eq 1 ] || exit 1

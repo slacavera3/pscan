@@ -21,26 +21,30 @@ What it needs from the system:
     "Linux (via kernel module)" VERSION 2.0 from NI's MHDDK page - the only
     64-bit-capable Linux option, since the "/dev/mem" flavour is 32-bit and
     targets kernel 2.4.
-  * ROOT. The card's PCI BARs are mapped directly and the kernel does not let
-    an unprivileged process do that.
-  * KERNEL LOCKDOWN OFF. Lockdown blocks userspace BAR mapping outright
-    (LOCKDOWN_PCI_ACCESS -> EPERM), and root does not override it. Secure
-    Boot enables lockdown automatically, and it cannot be lowered at
-    runtime, so this means Secure Boot off in the BIOS. Check with
-    'cat /sys/kernel/security/lockdown' - a bracketed mode is the active
-    one, and "none" has to be the bracketed one for this backend to work.
-    dev/check_bar_mmap.py diagnoses all of this without opening the card.
+  * The card bound to vfio-pci, and membership of the 'pscan' group.
+    install.sh arranges both; group membership needs a fresh login. No root
+    and no BIOS change, which is the point - Secure Boot can stay on.
+  * An IOMMU. vfio-pci requires one, and it is also what makes kernel
+    lockdown willing to allow userspace device access.
+
+dev/check_vfio.py diagnoses the whole chain - IOMMU group, lockdown mode,
+binding, container, group viability and the BAR mapping - without going
+through pscan at all.
 
 NO KERNEL MODULE. Although the download is the kernel-module flavour, only
-its osiBus.cpp and headers are used; libs/xseries_shim/osiUserCode_sysfs.cpp
-replaces NI's bus implementation and maps the card through
-/sys/bus/pci/devices/<slot>/resource0 instead of through nirlpk.ko. That
-matters because nirlpk.ko is 2011 source that does not build against a modern
-kernel, while the PCI sysfs interface is stable kernel ABI that does not rot.
+its osiBus.cpp and headers are used; libs/xseries_shim/osiUserCode_vfio.cpp
+replaces NI's bus implementation and reaches the card through vfio-pci
+instead of nirlpk.ko. nirlpk.ko is 2011 source that does not build against a
+modern kernel, and on a Secure Boot machine could not be loaded anyway, being
+unsigned.
+
+VFIO also sidesteps kernel lockdown, which blocks mapping a BAR through
+/sys/bus/pci/devices/<slot>/resource0 with EPERM that root cannot override.
+The IOMMU is what makes lockdown willing to permit device access at all - and
+it means a scan needs no root, given the udev rule install.sh writes.
 
 Building nirlpk.ko and using NI's implementation instead remains possible -
-PSCAN_XSERIES_USE_NIRLPK=1 at install time - and is the route to DMA, which
-the sysfs path cannot offer.
+PSCAN_XSERIES_USE_NIRLPK=1 at install time - and is the only route to DMA.
 
 DMA is not used either way. A finite trace has to fit in the card's AI FIFO,
 which on a 6351 is several thousand samples against pscan's typical 1000, and
