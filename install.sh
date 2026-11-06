@@ -684,6 +684,17 @@ if [ "$DRIVERS_ONLY" -eq 1 ]; then
     report_vendor_requests
     echo -e "\n======================================================="
     echo " Shared system drivers done."
+    echo ""
+    # Said loudly because the failure it prevents is silent and expensive.
+    # pscan is installed as a COPY (pip install .), not in editable mode, so
+    # the pscan that runs is the installed one, never the working tree. After
+    # a git pull, --drivers-only rebuilds the C shim but leaves the Python
+    # exactly as it was - and the resulting half-new system misreports which
+    # code is under test, which is worse than not having updated at all.
+    echo " *** The PYTHON side was NOT touched. 'pscan' and 'pydaq' still run"
+    echo " *** the code from the last full install, whatever git says."
+    echo " ***"
+    echo " *** Pulled a change to a .py file? Run 'bash install.sh' instead."
     if [ -n "${NI_DAQMX_NEEDS_REBOOT:-}" ]; then
         echo ""
         echo " *** REBOOT REQUIRED: NI-DAQmx was installed this run and its"
