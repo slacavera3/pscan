@@ -293,8 +293,17 @@ void xseries_close(void* handle)
     * branch tests an uninitialised value - NI's bug, harmless here only
     * because the loop it guards has nothing to write.)
     *
-    * One small object per process, released when the process exits. That is
-    * a better trade than a glitch on every teardown.
+    * BUT NOTE: this does not make the output survive the process. vfio-pci
+    * resets the device when its last file descriptor closes - deliberately,
+    * so a userspace driver cannot leave hardware running unattended - and
+    * that reset zeroes the DACs regardless of what we do here. Skipping
+    * aoHelper's reset only avoids zeroing the output EARLIER, while the
+    * session is still open and something might still use it.
+    *
+    * Holding a voltage therefore means holding the card open. A scan does
+    * that for its whole duration; 'pydaq set --hold' does it explicitly.
+    *
+    * One small object per process, released when the process exits.
     */
    s->ao = NULL;
 

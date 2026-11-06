@@ -19,6 +19,7 @@ mean it.
 
 import argparse
 import sys
+import time
 
 import numpy as np
 
@@ -152,9 +153,27 @@ def cmd_set(args):
         print("\n[ERROR] The write failed.")
         return 1
 
-    # Left energized on purpose, so the mirror or piezo stays where it was
-    # put - the same reason a scan does not zero its outputs on the way out.
-    print(f"  Done. The output is left holding {target:+.4f} V.")
+    if args.hold:
+        # Keeping the process alive keeps the card open, which is the only
+        # way to hold an output on a VFIO-backed backend: vfio-pci resets
+        # the device when its last file descriptor closes, deliberately, so
+        # a userspace driver cannot leave hardware running unattended. That
+        # reset zeroes the DACs.
+        #
+        # It is also how to MEASURE an output: without it the voltage exists
+        # for the few milliseconds between the write and process exit, which
+        # a handheld meter sees only as a flicker.
+        print(f"\n  Holding {target:+.4f} V on ao{args.channel}.")
+        print("  Measure it now. Ctrl-C to release.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n  Released. The output resets as the card closes.")
+        return 0
+
+    print(f"  Done. Note the output may not survive this process exiting -")
+    print(f"  use --hold to keep it applied, and see 'pydaq set --help'.")
     return 0
 
 
@@ -261,6 +280,11 @@ def build_parser():
                             "the channel is now")
     p_set.add_argument('--channel', type=int, default=0,
                        help="analog output channel (default 0)")
+    p_set.add_argument(
+        '--hold', action='store_true',
+        help="keep the voltage applied until Ctrl-C. Needed to measure it, "
+             "and on the nixseries backend needed at all: vfio-pci resets "
+             "the card when the process exits, which zeroes the outputs.")
     p_set.set_defaults(func=cmd_set)
 
     return parser

@@ -31,6 +31,18 @@ dev/check_vfio.py diagnoses the whole chain - IOMMU group, lockdown mode,
 binding, container, group viability and the BAR mapping - without going
 through pscan at all.
 
+ANALOG OUTPUTS DO NOT OUTLIVE THE PROCESS. vfio-pci resets the card when its
+last file descriptor closes - deliberately, so a userspace driver cannot
+leave hardware running unattended - and that reset zeroes the DACs. There is
+no way to opt out.
+
+A scan is unaffected: the session stays open from the first coordinate to the
+last, so a mirror or piezo holds throughout. But the output WILL drop to zero
+when pscan exits, which differs from the Phidget path. That matters more for
+a sample-positioning piezo than for a scanning mirror, and it is worth
+knowing before moving a piezo onto this card. 'pydaq set --hold' keeps the
+card open so a voltage can be applied and measured.
+
 NO KERNEL MODULE. Although the download is the kernel-module flavour, only
 its osiBus.cpp and headers are used; libs/xseries_shim/osiUserCode_vfio.cpp
 replaces NI's bus implementation and reaches the card through vfio-pci

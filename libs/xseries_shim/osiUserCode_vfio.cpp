@@ -381,9 +381,16 @@ void releaseBoard(iBus*& bus)
       delete specific;
    }
 
-   // The card stays bound to vfio-pci and its outputs keep their last
-   // values. A scan ending must not slam a mirror or piezo through its
-   // range, and rebinding would reset the device.
+   // Closing the device fd makes vfio-pci RESET the card, which zeroes the
+   // analog outputs. That is deliberate on the kernel's part - a userspace
+   // driver must not be able to leave hardware running unattended - and
+   // there is no way to opt out of it.
+   //
+   // So an analog output cannot outlive the process here, unlike the
+   // Phidget path which leaves its piezo energized. Holding a voltage means
+   // holding the card open: a scan does that for its whole duration, and
+   // 'pydaq set --hold' does it explicitly. Worth knowing before putting a
+   // sample-positioning piezo on this card rather than a scanning mirror.
    delete bus;
    bus = NULL;
 }
