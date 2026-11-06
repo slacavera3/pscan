@@ -397,9 +397,11 @@ class NIXSeriesDriver(DAQBackend):
 
     def _close_device(self):
         if self._handle is not None:
-            # The shim leaves the analog outputs where they are rather than
-            # driving them to zero - see its xseries_close() comment, and note
-            # that behaviour is still unverified on hardware.
+            # The outputs drop to 0V here whatever the shim does: vfio-pci
+            # resets the device when its last file descriptor closes, by
+            # design, so a userspace driver cannot leave hardware driving
+            # unattended. An output on this backend lasts as long as the
+            # process does - see `pydaq set --hold`.
             _load().xseries_close(self._handle)
             self._handle = None
 
@@ -512,11 +514,24 @@ class NIXSeriesDriver(DAQBackend):
     # ------------------------------------------------------------------
 
     def _write_ao(self, channel, volts):
-        # Narrowest output range that contains the request, so a small swing
-        # gets the finer DAC resolution.
-        index, _lo, _hi = resolve_range(
-            AO_RANGES, v_min=min(volts, 0.0), v_max=max(volts, 0.0)
-        )
+        # Always full scale, deliberately, and not the narrowest range that
+        # fits the value.
+        #
+        # The range lives in the channel's config bank, and changing it
+        # reprograms that bank - which runs the DDK's aoHelper::reset() and
+        # drops the output through 0V on the way. Choosing per value means an
+        # axis sweeping -6V to +6V crosses the 5V boundary twice a line and
+        # glitches the mirror twice a line, at the same two positions of every
+        # line: an artefact that looks like the sample, not the rig.
+        #
+        # What that would buy is a half-size DAC step, 152uV against 305uV.
+        # On a 20um/V axis that is 3nm against 6nm, both far below anything
+        # the mechanics can hold, so there is nothing here worth a glitch.
+        #
+        # If a use ever does need the finer step, the range belongs to the
+        # axis - from the `limits` of its d2a block, decided once when the
+        # axis is built - not to the individual value.
+        index = 0
 
         rc = _load().xseries_write_ao(
             self._handle, channel, index, float(volts)

@@ -12,6 +12,7 @@ _load()), so these run anywhere.
 
 import unittest
 
+from pscan import nixseries_driver
 from pscan.daq import resolve_range
 from pscan.nixseries_driver import (
     AI_RANGES,
@@ -112,6 +113,83 @@ class TestRangeTables(unittest.TestCase):
     def test_a_request_beyond_full_scale_is_refused(self):
         with self.assertRaises(ValueError):
             resolve_range(AI_RANGES, v_min=-20.0, v_max=20.0)
+
+
+class TestOutputRangeIsFixed(unittest.TestCase):
+    """The AO range must not be chosen per value during a scan.
+
+    The range lives in the channel's config bank, and reprogramming that bank
+    runs the DDK's aoHelper::reset(), dropping the output through 0V. An axis
+    sweeping -6V to +6V crosses the 5V boundary twice a line, so a per-value
+    choice would glitch the mirror twice a line - visible in the data as a
+    repeating artefact at the same two positions of every line, which is the
+    kind of fault that gets blamed on the sample.
+
+    These tests exist because a per-value choice was tried first, and broke
+    0V outright: deriving an interval from a single value gives v_min == v_max,
+    which resolve_range refuses. Every symmetric sweep lands on 0V.
+    """
+
+    def setUp(self):
+        self.written = []
+
+        class FakeLib:
+            @staticmethod
+            def xseries_write_ao(handle, channel, index, volts):
+                self.written.append((channel, index, volts))
+                return 0
+
+            @staticmethod
+            def xseries_close(handle):
+                return None
+
+        driver = nixseries_driver.NIXSeriesDriver(address="0000:82:00.0")
+        driver._handle = object()        # _write_ao only passes it through
+        self.driver = driver
+        self._real_load = nixseries_driver._load
+        nixseries_driver._load = lambda: FakeLib
+
+    def tearDown(self):
+        nixseries_driver._load = self._real_load
+
+    def indices_for(self, volts, channel=0):
+        for value in volts:
+            self.driver._write_ao(channel, value)
+        return [index for _ch, index, _v in self.written]
+
+    def test_zero_volts_is_writable(self):
+        # The regression. Every symmetric sweep with an odd point count passes
+        # through exactly 0V, so this failing means a scan dies mid-line.
+        self.assertEqual(self.indices_for([0.0]), [0])
+
+    def test_a_sweep_across_the_boundary_never_reprograms(self):
+        # The range is identical at every point, so the config bank is
+        # programmed once by the shim and the output never drops to 0V between
+        # steps. -6 and +6 are the values that would have straddled +/-5V.
+        self.assertEqual(self.indices_for([-6.0, -3.0, 0.0, 2.5, 6.0]),
+                         [0, 0, 0, 0, 0])
+
+    def test_the_fixed_range_is_the_cards_full_scale(self):
+        # Which must also be what write_d2a() clamps against, or a request
+        # could be accepted by the clamp and then be unreachable by the DAC.
+        index, lo, hi = resolve_range(AO_RANGES, range_index=0)
+        self.assertEqual((index, lo, hi), (0, -10.0, 10.0))
+        self.assertEqual((lo, hi), (min(l for l, _h in AO_RANGES),
+                                    max(h for _l, h in AO_RANGES)))
+
+    def test_the_voltage_itself_is_passed_through_untouched(self):
+        # The range is fixed; the value must not be quantised or rescaled on
+        # the way. Scaling to a DAC code is the shim's job, through the DDK's
+        # calibrated scaler.
+        self.indices_for([0.0, 2.5, -7.25])
+        self.assertEqual([v for _ch, _idx, v in self.written],
+                         [0.0, 2.5, -7.25])
+
+    def test_channels_are_written_independently(self):
+        self.driver._write_ao(0, 6.0)
+        self.driver._write_ao(1, 2.5)
+        self.assertEqual([(ch, idx) for ch, idx, _v in self.written],
+                         [(0, 0), (1, 0)])
 
 
 class TestDeviceTable(unittest.TestCase):

@@ -874,6 +874,18 @@ int xseries_write_ao(void* handle, u32 channel, u32 range_idx, double volts)
    nNISTC3::nAODataHelper::scaleData(
       voltData, 1, codes, 1, chanConfig, *s->eeprom);
 
+   if (debugEnabled())
+   {
+      // The DAC code, so a disagreement with a meter can be attributed.
+      // boardBringup prints the same calibration intervals, e.g. for this
+      // card "DAC0: Interval 1, Coefficients 1.842e+00 6.487e+03", so the
+      // expected code is checkable by hand: 1.842 + 6487*volts.
+      printf("[xseries] AO%u: %+.4f V, range=%u, gain=%u -> DAC code "
+             "0x%04x (%d)\n",
+             channel, volts, range_idx, gain,
+             static_cast<u16>(codes[0]), static_cast<int>(codes[0]));
+   }
+
    s->device->AO.AO_Direct_Data[channel].writeRegister(codes[0], &status);
    if (status.isFatal())
    {
