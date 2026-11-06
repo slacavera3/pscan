@@ -447,6 +447,33 @@ int xseries_read_ai(void* handle,
    aiHelper.getInTimerHelper(status).programTiming(timingConfig, status);
    aiHelper.programFIFOWidth(nAI::kTwoByteFifo, status);
 
+   /*
+    * Where writeConfiguration_End goes, and why it is switchable.
+    *
+    * NI's own examples disagree. aiex2 programs the channel INSIDE the
+    * configuration window and closes it afterwards. boardBringup's
+    * getCurrentTemp() - a single-channel read, closer to this one, and known
+    * to return a sensible temperature - closes the window FIRST and programs
+    * the channel after.
+    *
+    * Following aiex2 produced a trace of exactly 0x0000 on every sample,
+    * with the FIFO filling and draining correctly and dither enabled. That
+    * is what an unconfigured input mux reads as, which points at the channel
+    * configuration not taking effect.
+    *
+    * getCurrentTemp's order is therefore the default. PSCAN_XSERIES_CFG_IN_WINDOW=1
+    * restores aiex2's, so both can be tried from one build. This switch is a
+    * diagnostic: once the hardware has settled the question, the losing
+    * branch should be deleted.
+    */
+   const bool configInsideWindow =
+      (getenv("PSCAN_XSERIES_CFG_IN_WINDOW") != NULL);
+
+   if (!configInsideWindow)
+   {
+      s->device->AI.AI_Timer.Reset_Register.writeConfiguration_End(kTrue, &status);
+   }
+
    // --- channel --------------------------------------------------------
    aiHelper.getInTimerHelper(status).clearConfigurationMemory(status);
 
@@ -460,7 +487,21 @@ int xseries_read_ai(void* handle,
    aiHelper.programChannel(chanConfig[0], status);
 
    aiHelper.getInTimerHelper(status).primeConfigFifo(status);
-   s->device->AI.AI_Timer.Reset_Register.writeConfiguration_End(kTrue, &status);
+
+   if (configInsideWindow)
+   {
+      s->device->AI.AI_Timer.Reset_Register.writeConfiguration_End(kTrue, &status);
+   }
+
+   if (debugEnabled())
+   {
+      printf("[xseries] config order: channel programmed %s the timing "
+             "window (%s)\n",
+             configInsideWindow ? "INSIDE" : "AFTER",
+             configInsideWindow ? "aiex2" : "getCurrentTemp");
+      printf("[xseries] chan=%u bank=%d type=%d gain=%u dither=on\n",
+             channel, chanConfig[0].bank, chanConfig[0].channelType, gain);
+   }
 
    if (status.isFatal())
    {
