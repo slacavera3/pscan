@@ -64,30 +64,72 @@ fi
 cp "$REPO_ROOT/libs/xseries_shim/osiUserCode_vfio.cpp" "$OSI_USERCODE"
 echo " -> swapped in our VFIO bus layer"
 
-# The DDK's Makefile hardcodes a Windows/VISA OS interface and the CHInCh DMA
-# library; both are overridden here. Its own build rules then apply.
+# The DDK's Makefile hardcodes a Windows/VISA OS interface, which is the one
+# thing overridden here.
+#
+# CXXFLAGS has to be given in FULL, not added to. A variable set on make's
+# command line overrides the makefiles' own assignments - including their
+# '+=' lines - so passing just the extra flags silently dropped
+# LinuxKernel.mak's '-c -DkLittleEndian=1 -DkGNU=1' and the DDK Makefile's
+# '-DkBAR0Only=1 -Dk64BitKernel=1'. Losing -c made it try to LINK each
+# translation unit, and losing the defines brought back osiTypes.h's
+# "#error target endianness not specified".
+#
+# -w -fpermissive are the additions: NI's headers have a genuine 32 << 27
+# overflow in tDO.h that modern GCC rejects outright.
+#
+# DMA_LIBRARY_DIR is left at its default. Emptying it to skip the DMA
+# examples also skipped dma.mak, which is what puts CHInCh on the include
+# path - and streamHelper.h includes CHInCh/dmaProperties.h unconditionally,
+# so even the non-DMA examples need it.
+DDK_CXXFLAGS="-c -O2 -w -fpermissive"
+DDK_CXXFLAGS="$DDK_CXXFLAGS -DkLittleEndian=1 -DkGNU=1"
+DDK_CXXFLAGS="$DDK_CXXFLAGS -DkBAR0Only=1 -Dk64BitKernel=1"
+
 echo " -> building (this takes a minute)..."
+
+# pipefail so the status below is make's, not tail's. Without it this
+# reported success after a failed build - the same mistake install.sh used
+# to make with the Phidget compile.
+set -o pipefail
+
 if make -C "$DDK" \
         OSINTERFACE_DIR="$OSI" \
         OSINTERFACE_MAKEFILE=LinuxKernel.mak \
-        DMA_LIBRARY_DIR= \
-        CXXFLAGS="-O2 -w -fpermissive -DkBAR0Only=1 -Dk64BitKernel=1" \
-        2>&1 | tail -25
+        CXXFLAGS="$DDK_CXXFLAGS" \
+        2>&1 | tail -30
 then
-    echo ""
-    echo "Built. The examples take the PCI bus and device in DECIMAL, so the"
-    echo "card at 82:00.0 is '130 0':"
-    echo ""
-    echo "    cd ${DDK#$REPO_ROOT/}"
-    echo "    sudo ./boardBringup 130 0      # self test: signature, EEPROM, temperature"
-    echo "    sudo ./aiex1 130 0             # simplest possible AI read"
-    echo ""
-    echo "boardBringup is the one that matters. If its temperature is sane,"
-    echo "the card and our bus layer are fine and the bug is ours."
+    # Claim success only for binaries that actually exist. The build can
+    # report 0 while a target is missing, and a "Built." that is not true
+    # wastes the next command.
+    built=""
+    missing=""
+    for exe in boardBringup aiex1 aiex2; do
+        if [ -x "$DDK/$exe" ]; then built="$built $exe"; else missing="$missing $exe"; fi
+    done
+
+    if [ -n "$built" ]; then
+        echo ""
+        echo "Built:$built"
+        [ -n "$missing" ] && echo "NOT built:$missing"
+        echo ""
+        echo "The examples take the PCI bus and device in DECIMAL, so the"
+        echo "card at 82:00.0 is '130 0':"
+        echo ""
+        echo "    cd ${DDK#$REPO_ROOT/}"
+        echo "    sudo ./boardBringup 130 0   # signature, EEPROM, temperature"
+        echo "    sudo ./aiex1 130 0          # simplest possible AI read"
+        echo ""
+        echo "boardBringup is the one that matters. A sane temperature means"
+        echo "the card and our bus layer are fine and the bug is ours."
+    else
+        echo ""
+        echo "make reported success but produced no executables:$missing"
+        echo "Check the output above."
+    fi
 else
     echo ""
-    echo "Build failed - see above. The examples' own Makefile may need"
-    echo "different flags than our shim does."
+    echo "BUILD FAILED - see the errors above. No executables to run."
 fi
 
 echo ""
