@@ -51,6 +51,7 @@
 
 #include <cstdarg>   // va_list, for set_err()
 #include <cstdio>
+#include <cstdlib>   // getenv(), for the debug switch
 #include <cstring>
 #include <cmath>     // llround
 #include <ctime>     // clock(), CLOCKS_PER_SEC
@@ -130,6 +131,21 @@ static void set_err(xseries_session* s, const char* fmt, ...)
    va_start(args, fmt);
    vsnprintf(s->err, sizeof(s->err), fmt, args);
    va_end(args);
+}
+
+/*
+ * PSCAN_XSERIES_DEBUG=1 dumps the acquisition's internal state.
+ *
+ * A trace that comes back as the same value repeated could be the FIFO not
+ * advancing, the timing engine not converting, or the FIFO status register
+ * being misread - and the finished volts cannot tell those apart. This
+ * prints the raw codes and the registers the decisions were made on, so one
+ * run distinguishes them.
+ */
+static bool debugEnabled()
+{
+   static const bool enabled = (getenv("PSCAN_XSERIES_DEBUG") != NULL);
+   return enabled;
 }
 
 // Map pscan's terminal names onto nAI::tAI_Config_Channel_Type_t. The X
@@ -453,8 +469,28 @@ int xseries_read_ai(void* handle,
    }
 
    // --- run ------------------------------------------------------------
+   if (debugEnabled())
+   {
+      printf("[xseries] fifo=%u bytes, samplePeriod=%u, convertPeriod=%u, "
+             "n=%u, gain=%u, range=%u, term=%u, rate=%.0f\n",
+             fifoBytes, samplePeriod, kConvertPeriod, n_samples,
+             gain, range_idx, terminal, rate_hz);
+      printf("[xseries] before arm: SC_TC=%d armed=%d fifoStatus=%u\n",
+             s->device->AI.AI_Timer.Status_1_Register.readSC_TC_St(&status),
+             s->device->AI.AI_Timer.Status_1_Register.readSC_Armed_St(&status),
+             s->device->AI.AI_Data_FIFO_Status_Register.readRegister(&status));
+   }
+
    aiHelper.getInTimerHelper(status).armTiming(timingConfig, status);
    aiHelper.getInTimerHelper(status).strobeStart1(status);
+
+   if (debugEnabled())
+   {
+      printf("[xseries] after strobe: SC_TC=%d armed=%d fifoStatus=%u\n",
+             s->device->AI.AI_Timer.Status_1_Register.readSC_TC_St(&status),
+             s->device->AI.AI_Timer.Status_1_Register.readSC_Armed_St(&status),
+             s->device->AI.AI_Data_FIFO_Status_Register.readRegister(&status));
+   }
 
    // Wait for the scan counter to reach terminal count, i.e. all n_samples
    // clocked. The physical time is n/rate, so the timeout allows for that
@@ -490,10 +526,40 @@ int xseries_read_ai(void* handle,
       }
    }
 
+   if (debugEnabled())
+   {
+      printf("[xseries] FIFO reports %u samples available (wanted %u)\n",
+             available, n_samples);
+   }
+
    std::vector<i16> rawData(n_samples, 0);
    for (u32 i = 0; i < n_samples; ++i)
    {
       rawData[i] = s->device->AI.AI_FIFO_Data_Register16.readRegister();
+   }
+
+   if (debugEnabled())
+   {
+      printf("[xseries] first 8 raw codes:");
+      for (u32 i = 0; i < 8 && i < n_samples; ++i)
+         printf(" 0x%04x", static_cast<u16>(rawData[i]));
+      printf("\n");
+
+      // How many distinct values came back. One, from thousands of samples,
+      // means the FIFO is not advancing rather than that the signal is
+      // quiet - which is the difference between a wiring question and a
+      // driver bug.
+      u32 distinct = 0;
+      for (u32 i = 0; i < n_samples; ++i)
+      {
+         bool seen = false;
+         for (u32 j = 0; j < i && !seen; ++j) if (rawData[j] == rawData[i]) seen = true;
+         if (!seen && ++distinct >= 16) break;
+      }
+      printf("[xseries] distinct raw values in the trace: %s%u\n",
+             distinct >= 16 ? ">=" : "", distinct);
+      printf("[xseries] FIFO status after draining: %u\n",
+             s->device->AI.AI_Data_FIFO_Status_Register.readRegister(&status));
    }
 
    // Acknowledge the trigger and terminal-count events, or the next trace
