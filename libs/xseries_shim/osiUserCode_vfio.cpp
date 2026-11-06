@@ -286,6 +286,29 @@ iBus* acquireBoard(tChar* brdLocation)
       return NULL;
    }
 
+   /*
+    * Put the card into its power-on state before touching it.
+    *
+    * Nothing has ever initialised this device: no NI driver has run on this
+    * machine, and the DDK's examples assume a card in a known state rather
+    * than whatever the BIOS left behind. A function-level reset is the one
+    * initialisation step available to us that the DDK does not perform
+    * itself.
+    *
+    * Failure is not fatal - not every device supports reset, and a card
+    * that is already in a sane state does not need it.
+    */
+   if (ioctl(deviceFd, VFIO_DEVICE_RESET) < 0)
+   {
+      if (getenv("PSCAN_XSERIES_DEBUG") != NULL)
+         printf("[xseries] VFIO_DEVICE_RESET not available: %s\n",
+                strerror(errno));
+   }
+   else if (getenv("PSCAN_XSERIES_DEBUG") != NULL)
+   {
+      printf("[xseries] device reset ok\n");
+   }
+
    struct vfio_region_info region;
    memset(&region, 0, sizeof(region));
    region.argsz = sizeof(region);
