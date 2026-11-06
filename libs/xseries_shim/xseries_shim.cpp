@@ -309,6 +309,141 @@ int xseries_info(void* handle, xseries_device_info* out)
 }
 
 /*
+ * Read the card's INTERNAL temperature sensor.
+ *
+ * This is a diagnostic, and a deliberately faithful transcription of the
+ * DDK's boardBringup.cpp getCurrentTemp() - same periods, same sample count,
+ * same order, nothing of mine added.
+ *
+ * Its value is that the signal is internal to the card. No terminal block,
+ * no umbilical, no wiring: if the AI chain works at all, this returns a
+ * plausible room-ish temperature. So it separates two very different
+ * failures that look identical from outside:
+ *
+ *   plausible temperature -> the ADC, timing and FIFO are all fine, and the
+ *                            problem is in selecting an EXTERNAL channel
+ *   zero, like the external reads -> the ADC is not converting at all, and
+ *                            the fault is below channel selection
+ *
+ * `temperature_c` and `mean_volts` may each be NULL. Returns 0 on success.
+ */
+int xseries_selftest(void* handle, double* temperature_c, double* mean_volts)
+{
+   xseries_session* s = static_cast<xseries_session*>(handle);
+   if (s == NULL || s->device == NULL || s->info == NULL) return -1;
+
+   nMDBG::tStatus2 status;
+
+   if (s->info->isSimultaneous)
+   {
+      // Simultaneous devices have a dedicated sensor rather than reading it
+      // through AI, so this tells us nothing about the AI path. The 6351 is
+      // not one of these.
+      set_err(s, "the temperature self-test only exercises AI on "
+                 "multiplexed devices; this one is simultaneous");
+      return -1;
+   }
+
+   const u32 numSamps = 256;
+   std::vector<i16> rawData(numSamps, 0);
+   std::vector<f32> scaledData(numSamps, 0);
+
+   nNISTC3::aiHelper aiHelper(*s->device, s->info->isSimultaneous, status);
+   aiHelper.reset(status);
+
+   s->device->AI.AI_Timer.Reset_Register.writeConfiguration_Start(kTrue, &status);
+   aiHelper.programExternalGate(nAI::kGate_Disabled,
+                                nAI::kActive_High_Or_Rising_Edge, status);
+   aiHelper.programStart1(nAI::kStart1_SW_Pulse,
+                          nAI::kActive_High_Or_Rising_Edge, kTrue, status);
+   aiHelper.programStart(nAI::kStartCnv_InternalTiming,
+                         nAI::kActive_High_Or_Rising_Edge, kTrue, status);
+   aiHelper.programConvert(nAI::kStartCnv_InternalTiming,
+                           nAI::kActive_Low_Or_Falling_Edge, status);
+
+   nNISTC3::inTimerParams timingConfig;
+   timingConfig.setAcqLevelTimingMode(nNISTC3::kInTimerPostTrigger, status);
+   timingConfig.setUseSICounter(kTrue, status);
+   timingConfig.setSamplePeriod(500, status);
+   timingConfig.setSampleDelay(2, status);
+   timingConfig.setNumberOfSamples(numSamps, status);
+   timingConfig.setUseSI2Counter(kTrue, status);
+   timingConfig.setConvertPeriod(500, status);
+   timingConfig.setConvertDelay(2, status);
+   aiHelper.getInTimerHelper(status).programTiming(timingConfig, status);
+
+   aiHelper.programFIFOWidth(nAI::kTwoByteFifo, status);
+   s->device->AI.AI_Timer.Reset_Register.writeConfiguration_End(kTrue, &status);
+
+   aiHelper.getInTimerHelper(status).clearConfigurationMemory(status);
+   std::vector<nNISTC3::aiHelper::tChannelConfiguration> chanConfig(
+      1, nNISTC3::aiHelper::tChannelConfiguration());
+   chanConfig[0].isLastChannel = kTrue;
+   chanConfig[0].enableDither = nAI::kEnabled;
+   chanConfig[0].gain = s->info->getAI_Gain(nNISTC3::kInput_10V, status);
+   chanConfig[0].range = nNISTC3::kInput_10V;
+   chanConfig[0].channelType = nAI::kInternal;   // not an external pin
+   chanConfig[0].bank = nAI::kBank0;
+   chanConfig[0].channel = 4;                    // the temperature sensor
+   aiHelper.programChannel(chanConfig[0], status);
+   aiHelper.getInTimerHelper(status).primeConfigFifo(status);
+
+   aiHelper.getInTimerHelper(status).armTiming(timingConfig, status);
+   aiHelper.getInTimerHelper(status).strobeStart1(status);
+
+   // Bounded, unlike the DDK's bare spin loops - a wedged card should not
+   // hang the caller forever.
+   const double timeout = 5.0;
+   clock_t begin = clock();
+   while (!s->device->AI.AI_Timer.Status_1_Register.readSC_TC_St(&status))
+   {
+      if (static_cast<double>(clock() - begin) / CLOCKS_PER_SEC > timeout)
+      {
+         set_err(s, "self-test: scan did not complete within %.0fs", timeout);
+         return -1;
+      }
+   }
+
+   begin = clock();
+   while (s->device->AI.AI_Data_FIFO_Status_Register.readRegister(&status)
+          != numSamps)
+   {
+      if (static_cast<double>(clock() - begin) / CLOCKS_PER_SEC > timeout)
+      {
+         set_err(s, "self-test: FIFO never reached %u samples", numSamps);
+         return -1;
+      }
+   }
+
+   for (u32 i = 0; i < numSamps; ++i)
+   {
+      rawData[i] = s->device->AI.AI_FIFO_Data_Register16.readRegister();
+   }
+
+   if (debugEnabled())
+   {
+      printf("[xseries] selftest raw codes:");
+      for (u32 i = 0; i < 8; ++i)
+         printf(" 0x%04x", static_cast<u16>(rawData[i]));
+      printf("\n");
+   }
+
+   nNISTC3::nAIDataHelper::scaleData(rawData, numSamps, scaledData, numSamps,
+                                     chanConfig, *s->eeprom, *s->info);
+
+   double mean = 0.0;
+   for (u32 i = 0; i < numSamps; ++i) mean += scaledData[i];
+   mean /= numSamps;
+
+   aiHelper.reset(status);
+
+   if (mean_volts != NULL) *mean_volts = mean;
+   if (temperature_c != NULL) *temperature_c = ((-1.0 * mean) - 0.5) * 100.0;
+
+   return 0;
+}
+
+/*
  * Acquire one finite hardware-timed trace from one AI channel.
  *
  * `range_idx` indexes nNISTC3::tInputRange: 0=+/-10V, 1=+/-5V, 2=+/-2V,

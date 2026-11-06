@@ -205,6 +205,13 @@ def _load():
     ]
     lib.xseries_write_ao.restype = ctypes.c_int
 
+    lib.xseries_selftest.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_double),  # temperature, degrees C
+        ctypes.POINTER(ctypes.c_double),  # the sensor's mean voltage
+    ]
+    lib.xseries_selftest.restype = ctypes.c_int
+
     _lib = lib
     return _lib
 
@@ -393,6 +400,34 @@ class NIXSeriesDriver(DAQBackend):
         message = (_load().xseries_last_error(self._handle) or b"").decode(
             errors="replace")
         return f"{prefix}: {message}" if message else prefix
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def selftest(self):
+        """Read the card's internal temperature sensor.
+
+        Returns (temperature_c, mean_volts).
+
+        The point of this is that the sensor is INTERNAL: it goes through the
+        same ADC, timing engine and FIFO as a real measurement, but involves
+        no terminal block, umbilical or wiring. So a plausible temperature
+        proves the acquisition chain works end to end and narrows any problem
+        to selecting an external channel, while a reading of zero says the
+        ADC is not converting at all.
+        """
+        lib = _load()
+        temperature = ctypes.c_double(0.0)
+        volts = ctypes.c_double(0.0)
+
+        rc = lib.xseries_selftest(
+            self._handle, ctypes.byref(temperature), ctypes.byref(volts)
+        )
+        if rc != 0:
+            raise RuntimeError(self._error("X Series self-test failed"))
+
+        return temperature.value, volts.value
 
     # ------------------------------------------------------------------
     # a2d

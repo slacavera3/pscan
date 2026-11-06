@@ -158,6 +158,47 @@ def cmd_set(args):
     return 0
 
 
+def cmd_selftest(args):
+    """Exercise the acquisition chain using a signal internal to the card.
+
+    Nothing need be connected. On an X Series card this reads the on-board
+    temperature sensor through the same ADC, timing engine and FIFO a real
+    measurement uses, so it separates "the card cannot acquire at all" from
+    "the card cannot see what is wired to it" - two faults that look
+    identical when every sample comes back as zero.
+    """
+    session = _open(args, need_ai=True)
+
+    if not hasattr(session, 'selftest'):
+        print(f"\nThe '{session.name}' backend has no self-test.")
+        return 1
+
+    try:
+        temperature, volts = session.selftest()
+    except RuntimeError as e:
+        print(f"\n[ERROR] {e}")
+        return 1
+
+    print(f"\n  sensor voltage  {volts:+.6f} V")
+    print(f"  temperature     {temperature:.1f} C")
+
+    if abs(volts) < 1e-6:
+        print("\n  The sensor read 0 V, so the ADC is not converting even an")
+        print("  internal signal. The fault is below channel selection -")
+        print("  nothing to do with what is or is not wired up.")
+        return 1
+
+    if not 5.0 <= temperature <= 90.0:
+        print(f"\n  {temperature:.1f} C is not a plausible board temperature.")
+        print("  The chain runs but the conversion or scaling is wrong.")
+        return 1
+
+    print("\n  Plausible. The ADC, timing engine, FIFO and calibration all")
+    print("  work, so any problem reading a real input is in selecting the")
+    print("  external channel or in the signal itself.")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog='pydaq',
@@ -206,6 +247,12 @@ def build_parser():
     p_read.add_argument('--out', default='pydaq_read.d',
                         help="where to write the trace (default pydaq_read.d)")
     p_read.set_defaults(func=cmd_read)
+
+    p_self = subs.add_parser(
+        'selftest',
+        help="check the acquisition chain with a signal internal to the card")
+    add_target(p_self)
+    p_self.set_defaults(func=cmd_selftest)
 
     p_set = subs.add_parser('set', help="hold an output at a voltage")
     add_target(p_set)
