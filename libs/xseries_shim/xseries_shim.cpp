@@ -277,7 +277,27 @@ void xseries_close(void* handle)
    xseries_session* s = static_cast<xseries_session*>(handle);
    if (s == NULL) return;
 
-   delete s->ao;
+   /*
+    * s->ao is deliberately NOT deleted, and this is not an oversight.
+    *
+    * aoHelper's destructor calls reset() unconditionally, which drops the
+    * analog outputs to zero. Observed on the bench: NI's own aoex1 leaves
+    * AO0 reading 0 V on a meter once it exits. For pscan that is the wrong
+    * behaviour - a scan ending must not slam a mirror or a piezo back
+    * through its range, which is why the Phidget path has always left its
+    * output energized.
+    *
+    * (The destructor's other branch, writing _zeroVolts, cannot reach us:
+    * we never call setZeroVolts, so that vector is empty. Worth knowing
+    * that _resetToZero is not in aoHelper's initialiser list either, so the
+    * branch tests an uninitialised value - NI's bug, harmless here only
+    * because the loop it guards has nothing to write.)
+    *
+    * One small object per process, released when the process exits. That is
+    * a better trade than a glitch on every teardown.
+    */
+   s->ao = NULL;
+
    delete s->eeprom;
    delete s->device;
    if (s->bus != NULL) releaseBoard(s->bus);
