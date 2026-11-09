@@ -78,6 +78,21 @@ from pscan.daq import DAQBackend, DeviceInfo, resolve_range
 
 _LIB_NAME = "libpscan_xseries.so"
 
+#: Every entry point this module binds. Checked as a set the moment the
+#: library loads, so a stale .so is reported once, by name, instead of
+#: surfacing as an AttributeError at whichever call site gets there first.
+_REQUIRED_SYMBOLS = (
+    "xseries_open",
+    "xseries_close",
+    "xseries_is_open",
+    "xseries_last_error",
+    "xseries_info",
+    "xseries_selftest",
+    "xseries_read_ai",
+    "xseries_write_ao",
+    "xseries_ao_shadow",
+)
+
 # nNISTC3::tInputRange, in the DDK's order. The index into this list is what
 # a .con file's `range` line means on this backend, and resolve_range() picks
 # one from explicit volts.
@@ -184,6 +199,23 @@ def _load():
         )
         raise RuntimeError(_load_error) from e
 
+    # A library older than this Python is a real hazard here: the shim and the
+    # driver are built and installed separately, so a part-finished install
+    # leaves them out of step. Binding a symbol that is not there raises a
+    # bare AttributeError from whichever line happens to reach it first, which
+    # says nothing about the cause. Name it instead.
+    missing = [name for name in _REQUIRED_SYMBOLS
+               if not hasattr(lib, name)]
+    if missing:
+        _load_error = (
+            f"{_LIB_NAME} is older than this version of pscan: it does not "
+            f"export {', '.join(missing)}. The shim and the Python package "
+            f"are installed separately, so one can lag the other. Rebuild "
+            f"both with 'bash install.sh' - note that '--drivers-only' does "
+            f"the opposite half and will not fix this."
+        )
+        raise RuntimeError(_load_error)
+
     lib.xseries_open.argtypes = [ctypes.c_char_p]
     lib.xseries_open.restype = ctypes.c_void_p
 
@@ -216,6 +248,15 @@ def _load():
         ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_double
     ]
     lib.xseries_write_ao.restype = ctypes.c_int
+
+    lib.xseries_ao_shadow.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,                  # channel
+        ctypes.POINTER(ctypes.c_uint),    # raw shadow register
+        ctypes.POINTER(ctypes.c_int),     # expected, or -1 if never written
+        ctypes.POINTER(ctypes.c_double),  # volts last requested
+    ]
+    lib.xseries_ao_shadow.restype = ctypes.c_int
 
     lib.xseries_selftest.argtypes = [
         ctypes.c_void_p,
@@ -539,3 +580,57 @@ class NIXSeriesDriver(DAQBackend):
         if rc != 0:
             raise RuntimeError(self._error(f"X Series AO{channel} write failed"))
         return True
+
+    def ao_shadow(self, channel):
+        """What the DAC is holding now, read back from the hardware.
+
+        Returns (shadow, expected, volts, agrees). `shadow` is the raw
+        AO_DacShadow register - offset binary, 16 bits - and `expected` is
+        the offset-binary form of the last code written, or None if nothing
+        has been written to this channel yet.
+
+        The two registers use different encodings: AO_Direct_Data takes the
+        DDK scaler's two's complement, AO_DacShadow reports offset binary, so
+        a healthy channel reads back the written code with bit 15 flipped.
+        Comparing them raw says "mismatch" on a perfectly good DAC.
+        """
+        if self._handle is None:
+            raise RuntimeError("X Series session is not connected")
+
+        shadow = ctypes.c_uint()
+        expected = ctypes.c_int()
+        volts = ctypes.c_double()
+        rc = _load().xseries_ao_shadow(
+            self._handle, channel,
+            ctypes.byref(shadow), ctypes.byref(expected), ctypes.byref(volts),
+        )
+        if rc < 0:
+            raise RuntimeError(self._error(f"X Series AO{channel} readback failed"))
+
+        return (
+            shadow.value,
+            None if expected.value < 0 else expected.value,
+            volts.value,
+            rc == 0,
+        )
+
+    def read_d2a(self, channel):
+        """The voltage ao<channel> is holding, confirmed against the card.
+
+        Unlike the base class's recollection, this checks the DAC shadow
+        register really still holds the code that was written. If it does
+        not, the card has lost the value and reporting the commanded one
+        would be a lie - so None is returned, and callers that need to know
+        where an output is will say they cannot tell rather than guess.
+        """
+        try:
+            _shadow, expected, volts, agrees = self.ao_shadow(channel)
+        except RuntimeError:
+            return self._last_ao.get(channel)
+
+        if expected is None:
+            return None
+        return volts if agrees else None
+
+    def read_d2a_is_measured(self):
+        return self._handle is not None

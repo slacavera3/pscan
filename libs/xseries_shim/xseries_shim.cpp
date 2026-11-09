@@ -104,6 +104,12 @@ struct xseries_session
    nNISTC3::aoHelper* ao;
    bool aoConfigured[32];
    u32 aoConfiguredRange[32];
+   //: Last DAC code written per channel, or -1 if none yet. Kept so the
+   //: shadow register can be checked against it later - see
+   //: xseries_ao_shadow(). memset(0) in xseries_open() would make that look
+   //: like "0 was written", so it is set to -1 explicitly there.
+   i32 aoLastCode[32];
+   double aoLastVolts[32];
 
    char err[512];
 };
@@ -146,6 +152,31 @@ static bool debugEnabled()
 {
    static const bool enabled = (getenv("PSCAN_XSERIES_DEBUG") != NULL);
    return enabled;
+}
+
+/*
+ * Compare a DAC shadow reading against the code that was written.
+ *
+ * The two registers do NOT use the same encoding, and assuming they did cost
+ * a round trip of hardware debugging. AO_Direct_Data takes the DDK scaler's
+ * output, which is two's complement (0x0000 is 0V). AO_DacShadow reports
+ * OFFSET BINARY (0x8000 is 0V), so a correct, settled DAC reads back as the
+ * code written XOR 0x8000.
+ *
+ * Observed: wrote 0x1fb1 for +2.5V, shadow read 0x9fb1 - differing in bit 15
+ * alone - and decoding the shadow as offset binary gives +2.476V, which is
+ * what the meter showed. Three agreeing numbers.
+ *
+ * So bit 15 flipped is the HEALTHY case. Reporting it as a mismatch sends
+ * the reader after a digital fault that is not there.
+ */
+static const char* shadow_verdict(u32 shadow, u16 wrote)
+{
+   if (shadow == static_cast<u32>(wrote ^ 0x8000))
+      return "OK (offset binary; the DAC holds the value written)";
+   if (shadow == wrote)
+      return "OK, but same encoding as written - expected bit 15 flipped";
+   return "MISMATCH - the DAC is not holding what was written";
 }
 
 // Map pscan's terminal names onto nAI::tAI_Config_Channel_Type_t. The X
@@ -191,6 +222,9 @@ void* xseries_open(const char* resource)
 {
    xseries_session* s = new xseries_session();
    memset(s, 0, sizeof(*s));
+   // 0 is a legitimate DAC code, so "nothing written yet" cannot be 0.
+   for (size_t i = 0; i < sizeof(s->aoLastCode) / sizeof(s->aoLastCode[0]); ++i)
+      s->aoLastCode[i] = -1;
 
    s->bus = acquireBoard(const_cast<tChar*>(resource));
    if (s->bus == NULL)
@@ -945,32 +979,79 @@ int xseries_write_ao(void* handle, u32 channel, u32 range_idx, double volts)
       return -1;
    }
 
+   s->aoLastCode[channel] = static_cast<i32>(static_cast<u16>(codes[0]));
+   s->aoLastVolts[channel] = volts;
+
    if (debugEnabled())
    {
-      /*
-       * Read back what the DAC actually took.
-       *
-       * AO_DacShadow is a readable register holding "the last value that has
-       * been updated on the DACi" (the DDK's AO.rbm), masked to the DAC's
-       * resolution - so for a 16-bit DAC, the low 16 bits.
-       *
-       * This is the measurement that splits the problem in two. If the
-       * shadow matches the code we wrote, every digital step is correct -
-       * the write landed, the DAC latched it, the update happened - and
-       * anything wrong at the BNC is in the analog section or its supply.
-       * If it does not match, the fault is still in software and a meter is
-       * not needed to chase it.
-       */
       const u32 shadow =
          s->device->AO.AO_DacShadow[channel].readRegister(&status) & 0xFFFF;
       const u16 wrote = static_cast<u16>(codes[0]);
-      printf("[xseries] AO%u: DAC shadow reads 0x%04x, wrote 0x%04x -> %s\n",
-             channel, shadow, wrote,
-             (shadow == wrote) ? "MATCH (digital path is good)"
-                               : "MISMATCH (the update did not take)");
+      printf("[xseries] AO%u: DAC shadow 0x%04x, wrote 0x%04x -> %s\n",
+             channel, shadow, wrote, shadow_verdict(shadow, wrote));
    }
 
    return 0;
+}
+
+/*
+ * What is the DAC holding right now?
+ *
+ * AO_DacShadow is "the last value that has been updated on the DACi" (the
+ * DDK's AO.rbm), in offset binary and masked to the DAC's 16 bits. Reading
+ * it does not disturb the output.
+ *
+ * This answers a question a meter cannot: whether an output that measures
+ * wrong is wrong because the DAC stopped holding the code (digital, ours to
+ * fix) or because the analog stage is not reproducing a code it still holds
+ * (hardware, not ours). Polled during a hold, it also shows whether the
+ * value DRIFTS - something re-arming the out timer and updating the DACs
+ * from an empty FIFO would show up here as a changing shadow, while a dead
+ * output stage would show a rock-steady one.
+ *
+ * `out_shadow` receives the raw register, `out_expected` the offset-binary
+ * form of the last code written (or -1 if nothing has been written to this
+ * channel), and `out_volts` the volts last requested. All three may be NULL.
+ *
+ * Returns 0 on success, 1 when they disagree, negative on failure.
+ */
+int xseries_ao_shadow(void* handle, u32 channel,
+                      unsigned int* out_shadow,
+                      int* out_expected,
+                      double* out_volts)
+{
+   xseries_session* s = static_cast<xseries_session*>(handle);
+   if (s == NULL || s->device == NULL || s->info == NULL) return -1;
+
+   const size_t kShadows = sizeof(s->device->AO.AO_DacShadow) /
+                           sizeof(s->device->AO.AO_DacShadow[0]);
+   const size_t kTracked = sizeof(s->aoLastCode) / sizeof(s->aoLastCode[0]);
+   if (channel >= kShadows || channel >= kTracked)
+   {
+      set_err(s, "ao%u is beyond this chip's register banks", channel);
+      return -1;
+   }
+
+   nMDBG::tStatus2 status;
+   const u32 shadow =
+      s->device->AO.AO_DacShadow[channel].readRegister(&status) & 0xFFFF;
+   if (status.isFatal())
+   {
+      set_err(s, "AO shadow read failed (%d)", status.statusCode);
+      return -1;
+   }
+
+   const i32 last = s->aoLastCode[channel];
+   const int expected =
+      (last < 0) ? -1 : static_cast<int>((static_cast<u16>(last)) ^ 0x8000);
+
+   if (out_shadow != NULL)   *out_shadow = shadow;
+   if (out_expected != NULL) *out_expected = expected;
+   if (out_volts != NULL)
+      *out_volts = (last < 0) ? 0.0 : s->aoLastVolts[channel];
+
+   if (expected < 0) return 0;
+   return (static_cast<int>(shadow) == expected) ? 0 : 1;
 }
 
 }  // extern "C"

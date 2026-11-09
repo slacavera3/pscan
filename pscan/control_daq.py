@@ -165,9 +165,38 @@ def cmd_set(args):
         # a handheld meter sees only as a flicker.
         print(f"\n  Holding {target:+.4f} V on ao{args.channel}.")
         print("  Measure it now. Ctrl-C to release.")
+
+        # Poll the card while holding, when it can be asked.
+        #
+        # A meter says what the OUTPUT is doing; this says what the DAC is
+        # doing, and the difference is the whole diagnosis. A shadow that
+        # stays put while the meter falls to zero means the digital side is
+        # holding and the analog stage is not reproducing it. A shadow that
+        # changes on its own means something is still driving the DAC -
+        # an out timer re-arming and updating from an empty FIFO, say -
+        # which is ours to fix and needs no meter at all.
+        watch = getattr(session, 'ao_shadow', None)
+        if watch is not None:
+            print("  Watching the DAC register (it should not change):\n")
+
         try:
+            previous = None
+            elapsed = 0
             while True:
+                if watch is not None:
+                    try:
+                        shadow, expected, _v, agrees = watch(args.channel)
+                    except RuntimeError as e:
+                        print(f"    [{elapsed:4d}s] readback failed: {e}")
+                    else:
+                        if shadow != previous:
+                            note = "as written" if agrees else "CHANGED"
+                            want = "?" if expected is None else f"0x{expected:04x}"
+                            print(f"    [{elapsed:4d}s] DAC 0x{shadow:04x} "
+                                  f"(expected {want}) {note}")
+                            previous = shadow
                 time.sleep(1)
+                elapsed += 1
         except KeyboardInterrupt:
             print("\n  Released. The output resets as the card closes.")
         return 0
