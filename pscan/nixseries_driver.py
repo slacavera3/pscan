@@ -95,7 +95,22 @@ _REQUIRED_SYMBOLS = (
     # here means a .so older than this file is refused by name, instead of
     # running happily and producing results for code that is not in it.
     "xseries_build_id",
+    "xseries_snapshot_registers",
 )
+
+
+class _SnapshotStruct(ctypes.Structure):
+    """Mirrors `struct xseries_snapshot` in the shim. Order matters."""
+    _fields_ = [
+        ("chinch_signature", ctypes.c_uint),
+        ("stc3_signature", ctypes.c_uint),
+        ("ao_dac_shadow", ctypes.c_uint),
+        ("ao_config_bank", ctypes.c_uint),
+        ("ao_trigger_select", ctypes.c_uint),
+        ("ao_fifo_status", ctypes.c_uint),
+        ("wdt_state", ctypes.c_uint),
+        ("wdt_expired_count", ctypes.c_uint),
+    ]
 
 # nNISTC3::tInputRange, in the DDK's order. The index into this list is what
 # a .con file's `range` line means on this backend, and resolve_range() picks
@@ -264,6 +279,11 @@ def _load():
 
     lib.xseries_build_id.argtypes = []
     lib.xseries_build_id.restype = ctypes.c_char_p
+
+    lib.xseries_snapshot_registers.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_SnapshotStruct)
+    ]
+    lib.xseries_snapshot_registers.restype = ctypes.c_int
 
     lib.xseries_selftest.argtypes = [
         ctypes.c_void_p,
@@ -684,6 +704,24 @@ class NIXSeriesDriver(DAQBackend):
             volts.value,
             rc == 0,
         )
+
+    def snapshot(self, channel=0):
+        """Key registers read in one pass, as a plain dict.
+
+        For diagnosing an output that changes on its own: the signatures say
+        whether the card was reset, the config bank whether the AO subsystem
+        was reset, and the FIFO and trigger registers whether something is
+        still driving the DAC.
+        """
+        if self._handle is None:
+            raise RuntimeError("X Series session is not connected")
+
+        raw = _SnapshotStruct()
+        if _load().xseries_snapshot_registers(
+                self._handle, channel, ctypes.byref(raw)) != 0:
+            raise RuntimeError(self._error("register snapshot failed"))
+
+        return {name: getattr(raw, name) for name, _t in raw._fields_}
 
     def read_d2a(self, channel):
         """The voltage ao<channel> is holding, confirmed against the card.

@@ -1090,13 +1090,108 @@ int xseries_write_ao(void* handle, u32 channel, u32 range_idx, double volts)
 
    if (debugEnabled())
    {
-      const u32 shadow =
-         s->device->AO.AO_DacShadow[channel].readRegister(&status) & 0xFFFF;
+      // The shadow lags the write. Read back-to-back it returns 0x0000 on
+      // this card and the correct value a moment later, so a single
+      // immediate read reports a MISMATCH on a perfectly good write - which
+      // it did, and which sent the last round of debugging sideways.
+      // Re-read a bounded number of times and say how many it took.
       const u16 wrote = static_cast<u16>(codes[0]);
-      printf("[xseries] AO%u: DAC shadow 0x%04x, wrote 0x%04x -> %s\n",
-             channel, shadow, wrote, shadow_verdict(shadow, wrote));
+      const u32 want = static_cast<u32>(wrote ^ 0x8000);
+      u32 shadow = 0;
+      int tries = 0;
+      for (; tries < 100; ++tries)
+      {
+         shadow = s->device->AO.AO_DacShadow[channel].readRegister(&status)
+                  & 0xFFFF;
+         if (shadow == want) break;
+      }
+      printf("[xseries] AO%u: DAC shadow 0x%04x after %d read(s), "
+             "wrote 0x%04x -> %s\n",
+             channel, shadow, tries + 1, wrote, shadow_verdict(shadow, wrote));
    }
 
+   return 0;
+}
+
+/*
+ * A spread of key registers, read in one go.
+ *
+ * For the question that is actually open: something zeroes the analog
+ * output about eight seconds after it is set, with the card awake, the
+ * watchdog asleep and runtime power management pinned off. Guessing at
+ * mechanisms has not worked, so this reads the state AT the moment it
+ * happens and lets the card say what changed.
+ *
+ * What each field settles:
+ *
+ *   chinch / stc3 signatures  Constant on a healthy card. If these have
+ *                             changed, the card was reset underneath us and
+ *                             the AO is incidental - a whole different fault.
+ *   ao_config_bank            OUR channel configuration: range, update mode,
+ *                             bipolar. If this is intact while the DAC is
+ *                             zeroed, the event touched only the data
+ *                             register. If it has reverted to its 0xBF reset
+ *                             value, the AO subsystem itself was reset.
+ *   ao_trigger_select         Which trigger drives AO updates. Non-zero when
+ *                             we expect zero means something re-armed it.
+ *   ao_fifo_status            Data waiting in the AO FIFO. Non-zero would
+ *                             mean the out timer has something to push into
+ *                             the DAC behind our backs.
+ *   wdt_*                     Proof the watchdog really stayed out of it,
+ *                             read at the moment rather than at open.
+ */
+struct xseries_snapshot
+{
+   unsigned int chinch_signature;
+   unsigned int stc3_signature;
+   unsigned int ao_dac_shadow;
+   unsigned int ao_config_bank;
+   unsigned int ao_trigger_select;
+   unsigned int ao_fifo_status;
+   unsigned int wdt_state;
+   unsigned int wdt_expired_count;
+};
+
+int xseries_snapshot_registers(void* handle, u32 channel,
+                               struct xseries_snapshot* out)
+{
+   xseries_session* s = static_cast<xseries_session*>(handle);
+   if (s == NULL || s->device == NULL || out == NULL) return -1;
+
+   const size_t kShadows = sizeof(s->device->AO.AO_DacShadow) /
+                           sizeof(s->device->AO.AO_DacShadow[0]);
+   const size_t kBanks = sizeof(s->device->AO.AO_Config_Bank) /
+                         sizeof(s->device->AO.AO_Config_Bank[0]);
+   if (channel >= kShadows || channel >= kBanks)
+   {
+      set_err(s, "ao%u is beyond this chip's register banks", channel);
+      return -1;
+   }
+
+   nMDBG::tStatus2 status;
+
+   out->chinch_signature =
+      s->device->CHInCh.CHInCh_Identification_Register.readRegister(&status);
+   out->stc3_signature =
+      s->device->BrdServices.Signature_Register.readRegister(&status);
+   out->ao_dac_shadow =
+      s->device->AO.AO_DacShadow[channel].readRegister(&status) & 0xFFFF;
+   out->ao_config_bank =
+      s->device->AO.AO_Config_Bank[channel].readRegister(&status);
+   out->ao_trigger_select =
+      s->device->AO.AO_Trigger_Select_Register.readRegister(&status);
+   out->ao_fifo_status =
+      s->device->AO.AO_FIFO_Status_Register.readRegister(&status);
+   out->wdt_state =
+      s->device->BrdServices.WatchdogStatusRegister.readWatchdogSM_State(&status);
+   out->wdt_expired_count =
+      s->device->BrdServices.WatchdogStatusRegister.readWatchdogExpiredCnt(&status);
+
+   if (status.isFatal())
+   {
+      set_err(s, "register snapshot failed (%d)", status.statusCode);
+      return -1;
+   }
    return 0;
 }
 

@@ -135,6 +135,40 @@ def _card_power(session):
         return "?"
 
 
+def _dump_snapshot(session, channel):
+    """Print the card's state at the moment an output changed by itself.
+
+    Each line carries what it would mean, because a column of hex read a day
+    later tells nobody anything.
+    """
+    snap = getattr(session, 'snapshot', None)
+    if snap is None:
+        return
+    try:
+        s = snap(channel)
+    except RuntimeError as e:
+        print(f"      (snapshot failed: {e})")
+        return
+
+    # A healthy PCIe-6351 reports these two constants. boardBringup printed
+    # 0xC0107AD0 and 0x08050501/0x08050512 on this rig.
+    alive = (s['chinch_signature'] not in (0x0, 0xFFFFFFFF))
+    print(f"      CHInCh signature   0x{s['chinch_signature']:08x}"
+          f"{'' if alive else '   <- card is GONE, not just the output'}")
+    print(f"      STC3 signature     0x{s['stc3_signature']:08x}")
+    # 0xBF is the config bank's reset value, per the DDK's AO.rbm.
+    bank = s['ao_config_bank']
+    print(f"      AO config bank     0x{bank:02x}"
+          f"{'   <- RESET VALUE: the AO subsystem was reset' if bank == 0xBF else '   (still configured)'}")
+    print(f"      AO trigger select  0x{s['ao_trigger_select']:08x}"
+          f"{'   <- non-zero: something re-armed an AO trigger' if s['ao_trigger_select'] else ''}")
+    print(f"      AO FIFO status     0x{s['ao_fifo_status']:08x}"
+          f"{'   <- data queued: the out timer has something to push' if s['ao_fifo_status'] else ''}")
+    print(f"      watchdog state     {s['wdt_state']}, expired "
+          f"{s['wdt_expired_count']} time(s)"
+          f"{'   <- the watchdog DID fire' if s['wdt_expired_count'] else ''}")
+
+
 def cmd_set(args):
     """Hold an output channel at a voltage, absolutely or relatively."""
     session = _open(args, need_ao=True)
@@ -218,6 +252,9 @@ def cmd_set(args):
                             print(f"    [{elapsed:4d}s] DAC 0x{shadow:04x} "
                                   f"(expected {want}) {note}{extra}")
                             previous = shadow
+
+                            if not agrees:
+                                _dump_snapshot(session, args.channel)
                 time.sleep(1)
                 elapsed += 1
         except KeyboardInterrupt:
