@@ -1,4 +1,4 @@
-﻿import re
+import re
 
 # Names only, so validating a config imports no driver and touches no
 # hardware. Taken from pscan.daq rather than restated here, so adding a
@@ -175,7 +175,13 @@ def generate_positions(start, stop, step):
 
 
 def parse_flat_con_file(filepath):
-    with open(filepath, 'r') as f:
+    # utf-8-sig, not utf-8: a .con file edited in Notepad on Windows starts
+    # with a byte-order mark, which plain utf-8 hands back as a '﻿' glued
+    # to the first directive. The file then fails on line 1 with a message
+    # about a keyword that looks exactly right on screen, because the
+    # character is invisible. utf-8-sig consumes a BOM if present and behaves
+    # identically when there is none.
+    with open(filepath, 'r', encoding='utf-8-sig') as f:
         lines = f.readlines()
 
     all_blocks = []

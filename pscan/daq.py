@@ -1,4 +1,4 @@
-﻿"""Which card, reached how - and everything a card driver should not repeat.
+"""Which card, reached how - and everything a card driver should not repeat.
 
 pscan used to have one answer: libcomedi, on /dev/comedi0. That stopped being
 enough. comedi's ni_pcimio driver covers the NI E and M series and no X Series

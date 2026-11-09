@@ -1,4 +1,4 @@
-﻿"""NI-DAQmx cards: the PCIe-6351 and anything else comedi cannot reach.
+"""NI-DAQmx cards: the PCIe-6351 and anything else comedi cannot reach.
 
 comedi's ni_pcimio driver covers the NI E and M series and no X Series board,
 so this is the only route to a PCIe-6351 on Linux - and will be the only route

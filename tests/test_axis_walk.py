@@ -1,4 +1,4 @@
-﻿"""The axis walk: nesting order, move overlap, and when restores happen.
+"""The axis walk: nesting order, move overlap, and when restores happen.
 
 This is the riskiest part of the multi-axis change, because it replaced three
 hardcoded nested loops whose exact ordering was load-bearing. Each test below

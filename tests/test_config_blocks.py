@@ -1,4 +1,4 @@
-﻿"""Config parsing for the new a2d keys and the d2a block.
+"""Config parsing for the new a2d keys and the d2a block.
 
 The property that matters most here is the last class: an existing .con file
 written against the Phidget piezo has to compile to exactly the same scan it

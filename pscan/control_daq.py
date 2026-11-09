@@ -1,4 +1,4 @@
-﻿"""pydaq - inspect and poke the DAQ cards directly, outside a scan.
+"""pydaq - inspect and poke the DAQ cards directly, outside a scan.
 
 This is the bring-up tool. Before writing a .con file against a new card you
 want to know: does pscan see it, under which backend, what are its channels

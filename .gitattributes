@@ -1,0 +1,23 @@
+# Line endings and byte-order marks.
+#
+# install.sh acquired a UTF-8 BOM from a Windows editor, which made its
+# shebang unrunnable:
+#
+#     install.sh: line 1: ﻿#!/bin/bash: No such file or directory
+#
+# The script still limped along under 'bash install.sh', so the breakage
+# showed up only as a puzzling first line in otherwise normal output - and
+# a .con file caught the same way fails on its first directive with a
+# message about a keyword that looks perfectly correct on screen.
+#
+# Normalise to LF in the repository and in the working tree.
+* text=auto eol=lf
+
+# Except the vendor drops, which are not ours to reformat and include
+# binaries that must not be touched.
+libs/TUCamSample_*/** -text
+libs/vendor/** -text
+*.tar.gz binary
+*.zip binary
+*.so binary
+*.d binary

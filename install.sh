@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 
 echo "======================================================="
 echo "        PSCAN LAB - AUTOMATED INSTALL & UPDATE         "

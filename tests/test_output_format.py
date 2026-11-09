@@ -1,4 +1,4 @@
-﻿"""The .d file format, which must not depend on which backend wrote it.
+"""The .d file format, which must not depend on which backend wrote it.
 
 A trace acquired through DAQmx and a trace acquired through comedi land in the
 same file, and the MATLAB side downstream has no idea which produced it. If
