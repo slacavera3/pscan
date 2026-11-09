@@ -155,6 +155,80 @@ static bool debugEnabled()
 }
 
 /*
+ * Stop the STC3 watchdog timer from touching the outputs.
+ *
+ * THIS IS WHAT WAS DROPPING THE ANALOG OUTPUT.
+ *
+ * The DAQ-STC3 has a watchdog that software is expected to ping with
+ * alternating 0xFEED/0xF00D writes. Nothing in pscan or in the MHDDK's AI/AO
+ * examples pings it, so it runs down and expires - and on expiry it "can
+ * generate a pulse that can be exported to I/O resources (such as AO or DO)
+ * ... placing the outputs on a safe state" (the DDK's BrdServices.rbm).
+ *
+ * Observed on a PCIe-6351: ao0 set to +2.5V held its DAC code 0x9fb1 for
+ * eight seconds and then became 0x8002, which is the calibrated code for
+ * 0.000V. Not drift, not a dead output stage - a deliberate hardware write
+ * of a safe value, on a timer.
+ *
+ * It took so long to find because every AO example in the DDK finishes well
+ * inside the timeout: aoex1 writes 20 updates 10ms apart and exits in 0.2s,
+ * so it never sees this. Only holding an output exposes it, which is exactly
+ * what a scanning mirror does for minutes at a time.
+ *
+ * The sequence is NI's own, from dioex6.cpp, whose comment also warns that
+ * "outstanding Watchdog Timer expirations prevent hardware programming" -
+ * so an expiry does not only drop the outputs, it can make later register
+ * programming silently not take.
+ *
+ * Losing the watchdog costs pscan nothing. Its purpose is to park the
+ * hardware if software stops responding, and vfio-pci already does exactly
+ * that: it resets the card when the last file descriptor closes, so a crash
+ * or a kill drops the outputs anyway. Keeping it would mean pinging the card
+ * every few seconds from Python throughout a scan, for a guarantee we
+ * already have.
+ */
+static void quiet_watchdog(xseries_session* s, nMDBG::tStatus2& status)
+{
+   if (status.isFatal()) return;
+
+   // dioex6.cpp's constants.
+   const u16 kWdtPause = 0x1234;   // stop counting
+   const u16 kWdtReset = 0xACED;   // acknowledge an expiry and restart clean
+
+   if (debugEnabled())
+   {
+      const u32 state =
+         s->device->BrdServices.WatchdogStatusRegister.readWatchdogSM_State(&status);
+      const u32 expired =
+         s->device->BrdServices.WatchdogStatusRegister.readWatchdogExpiredCnt(&status);
+      // State 5 is ExpiredPulse and 6 is Expired, per the RBM's
+      // tBrdSrv_WatchdogTimerStateMachineSt_t.
+      printf("[xseries] watchdog before: state=%u%s, expired %u time(s)\n",
+             state, (state == 5 || state == 6) ? " (EXPIRED)" : "", expired);
+   }
+
+   // No expiry trigger from either source, so even a timer that somehow runs
+   // cannot reach the outputs.
+   s->device->BrdServices.WatchdogConfiguration.writeWatchdogIntTrigEn(
+      kFalse, &status);
+   s->device->BrdServices.WatchdogConfiguration.writeWatchdogExtTrigEn(
+      kFalse, &status);
+
+   // Acknowledge anything already latched BEFORE pausing: an outstanding
+   // expiration blocks programming, and 0xACED is what clears it.
+   s->device->BrdServices.WatchdogControl.writeRegister(kWdtReset, &status);
+   s->device->BrdServices.WatchdogControl.writeRegister(kWdtPause, &status);
+
+   if (debugEnabled())
+   {
+      const u32 state =
+         s->device->BrdServices.WatchdogStatusRegister.readWatchdogSM_State(&status);
+      printf("[xseries] watchdog after:  state=%u (paused, triggers off)\n",
+             state);
+   }
+}
+
+/*
  * Compare a DAC shadow reading against the code that was written.
  *
  * The two registers do NOT use the same encoding, and assuming they did cost
@@ -252,6 +326,13 @@ void* xseries_open(const char* resource)
    {
       set_err(s, "cannot identify device (%d) - is this an X Series board?",
               status.statusCode);
+      return s;
+   }
+
+   quiet_watchdog(s, status);
+   if (status.isFatal())
+   {
+      set_err(s, "could not quiet the watchdog timer (%d)", status.statusCode);
       return s;
    }
 
