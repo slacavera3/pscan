@@ -246,6 +246,44 @@ void* xseries_open(const char* resource)
       return s;
    }
 
+   /*
+    * Reset the AO subsystem once, here, before anything is programmed.
+    *
+    * NI's aoex1 does this and an earlier version of this file did not, which
+    * is why aoex1 drove a meter on this rig and pscan did not. Constructing
+    * an aoHelper does NOT reset anything - the constructor only stores
+    * references - so without this the subsystem is left in whatever state
+    * the VFIO function-level reset happened to produce.
+    *
+    * What it does: clears AO_Trigger_Select_Register, seeds every
+    * AO_Config_Bank, and - the part that matters - resets the AO OUT TIMER.
+    * A stale out timer updates the DACs on its own schedule from whatever is
+    * in the AO FIFO, so an output that was written once creeps and steps
+    * instead of holding, which is exactly what the bench showed.
+    *
+    * Once at open, deliberately. Doing it per write would drop the output
+    * through 0V at every step of a scan.
+    */
+   s->ao->reset(status);
+   if (status.isFatal())
+   {
+      set_err(s, "could not reset the AO subsystem (%d)", status.statusCode);
+      return s;
+   }
+
+   /*
+    * Define aoHelper's reset-to-zero state rather than leaving it to chance.
+    *
+    * _resetToZero is not in aoHelper's constructor initialiser list - an NI
+    * bug - so until this call it holds whatever was on the stack. An empty
+    * vector with kFalse says plainly: on destruction, leave the outputs
+    * where they are. pscan never deletes the helper, so this only matters if
+    * that ever changes, which is precisely when an uninitialised bool would
+    * be hardest to find.
+    */
+   const std::vector<i16> noZeroVolts;
+   s->ao->setZeroVolts(noZeroVolts, kFalse, status);
+
    s->err[0] = '\0';
    return s;
 }
@@ -266,11 +304,11 @@ int xseries_is_open(void* handle)
 /*
  * Release the card.
  *
- * The analog outputs are deliberately NOT driven to zero: a scan ending must
- * not slam a mirror or a piezo back through its range. Whether the DDK's
- * aoHelper destructor honours that is UNVERIFIED - the DDK has a
- * setZeroVolts()/resetToZero mechanism whose default is not documented in the
- * examples. Check on the bench with a meter on the output.
+ * The analog outputs are deliberately not driven to zero here: a scan ending
+ * must not slam a mirror or a piezo back through its range. Note that
+ * vfio-pci zeroes them anyway when the last file descriptor closes - see the
+ * note below - so this only governs what happens while the session is still
+ * up.
  */
 void xseries_close(void* handle)
 {
@@ -287,11 +325,11 @@ void xseries_close(void* handle)
     * through its range, which is why the Phidget path has always left its
     * output energized.
     *
-    * (The destructor's other branch, writing _zeroVolts, cannot reach us:
-    * we never call setZeroVolts, so that vector is empty. Worth knowing
-    * that _resetToZero is not in aoHelper's initialiser list either, so the
-    * branch tests an uninitialised value - NI's bug, harmless here only
-    * because the loop it guards has nothing to write.)
+    * (The destructor's other branch, writing _zeroVolts, cannot reach us
+    * either: xseries_open() calls setZeroVolts() with an empty vector and
+    * kFalse, so there is nothing to write and the flag says not to. That
+    * call also defines _resetToZero, which NI leaves out of aoHelper's
+    * constructor initialiser list.)
     *
     * BUT NOTE: this does not make the output survive the process. vfio-pci
     * resets the device when its last file descriptor closes - deliberately,
@@ -826,7 +864,21 @@ int xseries_write_ao(void* handle, u32 channel, u32 range_idx, double volts)
               channel, s->info->numberOfDACs);
       return -1;
    }
-   if (channel >= 32) { set_err(s, "ao%u out of range", channel); return -1; }
+   // numberOfDACs above is the real limit, and comes from the device table.
+   // This is the backstop: the DDK's register banks are fixed-size arrays
+   // (AO_Config_Bank and AO_DacShadow hold 8 each), so a wrong table entry
+   // for some future card would index past them and corrupt memory rather
+   // than be refused. Taken from the arrays themselves so it cannot drift.
+   const size_t kBanks = sizeof(s->device->AO.AO_Config_Bank) /
+                         sizeof(s->device->AO.AO_Config_Bank[0]);
+   const size_t kShadows = sizeof(s->device->AO.AO_DacShadow) /
+                           sizeof(s->device->AO.AO_DacShadow[0]);
+   const size_t kTracked = sizeof(s->aoConfigured) / sizeof(s->aoConfigured[0]);
+   if (channel >= kBanks || channel >= kShadows || channel >= kTracked)
+   {
+      set_err(s, "ao%u is beyond this chip's register banks", channel);
+      return -1;
+   }
 
    nMDBG::tStatus2 status;
    const nNISTC3::tOutputRange range =
@@ -891,6 +943,31 @@ int xseries_write_ao(void* handle, u32 channel, u32 range_idx, double volts)
    {
       set_err(s, "AO write failed (%d)", status.statusCode);
       return -1;
+   }
+
+   if (debugEnabled())
+   {
+      /*
+       * Read back what the DAC actually took.
+       *
+       * AO_DacShadow is a readable register holding "the last value that has
+       * been updated on the DACi" (the DDK's AO.rbm), masked to the DAC's
+       * resolution - so for a 16-bit DAC, the low 16 bits.
+       *
+       * This is the measurement that splits the problem in two. If the
+       * shadow matches the code we wrote, every digital step is correct -
+       * the write landed, the DAC latched it, the update happened - and
+       * anything wrong at the BNC is in the analog section or its supply.
+       * If it does not match, the fault is still in software and a meter is
+       * not needed to chase it.
+       */
+      const u32 shadow =
+         s->device->AO.AO_DacShadow[channel].readRegister(&status) & 0xFFFF;
+      const u16 wrote = static_cast<u16>(codes[0]);
+      printf("[xseries] AO%u: DAC shadow reads 0x%04x, wrote 0x%04x -> %s\n",
+             channel, shadow, wrote,
+             (shadow == wrote) ? "MATCH (digital path is good)"
+                               : "MISMATCH (the update did not take)");
    }
 
    return 0;
