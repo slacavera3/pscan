@@ -88,6 +88,28 @@ ldconfig_p() {
     fi
 }
 
+# modinfo is in /sbin too, and this one bit harder than ldconfig did.
+#
+# setup_vfio_binding() opened with 'if ! modinfo vfio-pci'. Run by a normal
+# user that is not "no such module", it is "no such COMMAND" - so the function
+# gave up before writing any configuration, and blamed the kernel for a PATH
+# problem. The card then could not be bound, by install.sh or by hand, and the
+# only visible symptom was a missing /dev/vfio/<group> much later.
+#
+# Returns 127 when modinfo itself cannot be found, which callers must
+# distinguish from "the module is not there".
+modinfo_run() {
+    if command -v modinfo >/dev/null 2>&1; then
+        modinfo "$@" 2>/dev/null
+    elif [ -x /sbin/modinfo ]; then
+        /sbin/modinfo "$@" 2>/dev/null
+    elif [ -x /usr/sbin/modinfo ]; then
+        /usr/sbin/modinfo "$@" 2>/dev/null
+    else
+        return 127
+    fi
+}
+
 have_lib() {
     ldconfig_p | grep -q "$1"
 }
@@ -248,7 +270,16 @@ echo -e "\n[1.7/6] Checking NI-DAQmx..."
 setup_vfio_binding() {
     echo " -> Setting up vfio-pci binding..."
 
-    if ! modinfo vfio-pci >/dev/null 2>&1; then
+    modinfo_run vfio-pci >/dev/null
+    local modinfo_rc=$?
+    local can_check_module=1
+    if [ "$modinfo_rc" -eq 127 ]; then
+        # Not a reason to stop: modprobe below settles it for real, and
+        # stopping here is exactly the failure this helper exists to prevent.
+        echo " -> [NOTE] 'modinfo' not found, so the module cannot be checked"
+        echo " ->        in advance. Carrying on - modprobe decides."
+        can_check_module=0
+    elif [ "$modinfo_rc" -ne 0 ]; then
         echo " -> [WARNING] No vfio-pci module on this kernel. The X Series"
         echo " ->           card cannot be reached without it."
         return 1
@@ -262,7 +293,14 @@ setup_vfio_binding() {
     # it. The first install still succeeds, because the first modprobe runs
     # before the file exists, which makes it look like a reboot broke it.
     local ids_supported=0
-    if modinfo -p vfio-pci 2>/dev/null | grep -q '^ids:'; then
+    if [ "$can_check_module" -eq 0 ]; then
+        # Unknown, so write nothing. A wrong 'options' line breaks modprobe at
+        # boot, which is a far worse failure than not auto-binding a card that
+        # gets fitted later - and re-running install.sh fixes that.
+        echo " -> Cannot tell whether 'ids' is supported; not writing"
+        echo " -> /etc/modprobe.d/pscan-vfio.conf. A card fitted later may"
+        echo " -> need 'bash install.sh' re-run to bind."
+    elif modinfo_run -p vfio-pci | grep -q '^ids:'; then
         ids_supported=1
     else
         echo " -> This kernel's vfio-pci has no 'ids' parameter."
@@ -582,6 +620,25 @@ else
     echo " -> X Series OS interface found: ${XSERIES_OSI#$REPO_ROOT/}"
 fi
 
+# Bind the card FIRST, outside the source-code gate below.
+#
+# This used to live inside that gate, so a missing vendor archive meant the
+# card was never bound to vfio-pci either. Those are unrelated: binding is
+# about whether anything can reach the card at all, and has nothing to do
+# with whether NI's source happens to be on this machine. Conflating them
+# produces the worst kind of failure - an unbound card, no /dev/vfio/<group>,
+# and a message about a DDK tarball that explains none of it.
+#
+# Done whenever an NI card is actually seated, so machines without one are
+# not given a vfio-pci binding they have no use for.
+if [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] && \
+   ls /sys/bus/pci/devices/*/vendor >/dev/null 2>&1 && \
+   grep -qls '^0x1093$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+    echo " -> NI card present; using vfio-pci (no kernel module, works"
+    echo " -> under lockdown)."
+    setup_vfio_binding || echo " -> [WARNING] vfio-pci binding did not complete."
+fi
+
 # Build the shim when both halves are present. Extracted into libs/vendor/ so
 # the vendor source and our one file stay visibly separate, and so a re-run
 # rebuilds against whatever was dropped there rather than a stale tree.
@@ -628,10 +685,9 @@ if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
         # and under kernel lockdown it could not be loaded anyway, being
         # unsigned. PSCAN_XSERIES_USE_NIRLPK=1 builds it and switches the shim
         # over, which is the route to DMA if that is ever wanted.
+        # The binding itself already happened above, before this gate.
         if [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ]; then
             XS_NIRLPK=""
-            echo " -> Using vfio-pci (no kernel module; works under lockdown)."
-            setup_vfio_binding
         fi
 
         if [ -n "$XS_NIRLPK" ]; then
