@@ -271,6 +271,19 @@ setup_vfio_binding() {
         | sudo tee /etc/modprobe.d/pscan-vfio.conf >/dev/null
     echo " -> /etc/modprobe.d/pscan-vfio.conf written."
 
+    # modprobe.d only says HOW vfio-pci behaves when something loads it. It
+    # does not load it. Without this second file the binding works until the
+    # first reboot and then silently stops, which is a miserable thing to
+    # debug months later - /dev/vfio/<group> simply is not there, and the
+    # card looks unbound for no visible reason.
+    #
+    # Loading it is enough to bind: the ids= option above goes through
+    # pci_add_dynid(), which attaches the driver to matching devices that are
+    # already present and unbound. No native driver claims an X Series card on
+    # Debian, so it will be unbound and waiting.
+    echo 'vfio-pci' | sudo tee /etc/modules-load.d/pscan-vfio.conf >/dev/null
+    echo " -> /etc/modules-load.d/pscan-vfio.conf written (loads it at boot)."
+
     sudo groupadd -f pscan 2>/dev/null || true
     sudo tee /etc/udev/rules.d/99-pscan-vfio.rules >/dev/null <<'UDEV'
 # pscan: let the 'pscan' group reach VFIO devices, so a scan does not need
@@ -301,7 +314,16 @@ UDEV
         echo vfio-pci | sudo tee "$dev/driver_override" >/dev/null
         echo "$slot" | sudo tee /sys/bus/pci/drivers_probe >/dev/null
         now="$(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)"
-        echo " -> $slot bound to ${now:-nothing}."
+        if [ "$now" = "vfio-pci" ]; then
+            echo " -> $slot bound to vfio-pci."
+        else
+            # Said loudly: an unbound card produces no /dev/vfio/<group>, so
+            # the only symptom later is "No such file or directory" on a path
+            # nobody expects to have to create.
+            echo " -> [WARNING] $slot did NOT bind (driver is now"
+            echo " ->           '${now:-none}'). pscan cannot reach the card."
+            echo " ->           Check: /sbin/lsmod | grep vfio_pci"
+        fi
     done
 
     # Group membership only takes effect at next login, which is a confusing

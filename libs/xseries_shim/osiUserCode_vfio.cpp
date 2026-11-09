@@ -229,11 +229,46 @@ iBus* acquireBoard(tChar* brdLocation)
       printf("could not open %s: %s\n", groupPath, strerror(errno));
       if (errno == ENOENT)
       {
-         printf("   The card is not bound to vfio-pci. install.sh sets this\n"
-                "   up persistently; to do it by hand:\n"
-                "     echo vfio-pci | sudo tee %s/%s/driver_override\n"
+         /*
+          * ENOENT here means no device in this IOMMU group is bound to
+          * vfio-pci, so the kernel never created the group node.
+          *
+          * Report which driver IS bound, because the fix differs: "none"
+          * usually means the vfio-pci MODULE is not loaded, in which case
+          * driver_override and drivers_probe do nothing at all - there is no
+          * driver for them to bind to. That is the case this message used to
+          * send people straight past.
+          */
+         char current[64] = "";
+         char linkPath[256];
+         char target[256];
+         snprintf(linkPath, sizeof(linkPath), "%s/%s/driver",
+                  kPciDevices, slot);
+         const ssize_t len = readlink(linkPath, target, sizeof(target) - 1);
+         if (len > 0)
+         {
+            target[len] = '\0';
+            const char* base = strrchr(target, '/');
+            snprintf(current, sizeof(current), "%s", base ? base + 1 : target);
+         }
+
+         printf("   %s is in IOMMU group %s but bound to: %s\n",
+                slot, group, current[0] ? current : "no driver");
+         printf("   The group node /dev/vfio/%s only exists once the card is\n"
+                "   bound to vfio-pci. To do it by hand:\n", group);
+         printf("     sudo modprobe vfio-pci\n");
+         if (current[0] && strcmp(current, "vfio-pci") != 0)
+         {
+            printf("     echo %s | sudo tee %s/%s/driver/unbind\n",
+                   slot, kPciDevices, slot);
+         }
+         printf("     echo vfio-pci | sudo tee %s/%s/driver_override\n"
                 "     echo %s | sudo tee /sys/bus/pci/drivers_probe\n",
                 kPciDevices, slot, slot);
+         printf("   Then check it took:\n"
+                "     ls -l %s/%s/driver\n", kPciDevices, slot);
+         printf("   'bash install.sh' does all of this, and since the fix for\n"
+                "   this message also makes it survive a reboot.\n");
       }
       else if (errno == EACCES || errno == EPERM)
       {
