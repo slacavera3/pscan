@@ -253,7 +253,42 @@ setup_vfio_binding() {
         echo " ->           card cannot be reached without it."
         return 1
     fi
-    sudo modprobe vfio-pci 2>/dev/null || true
+
+    # Does this kernel's vfio-pci actually take an 'ids' parameter?
+    #
+    # This used to be assumed. If it is wrong, the options file written below
+    # makes EVERY later modprobe fail with "unknown parameter" - including the
+    # one at boot - so the config we wrote to make binding work is what stops
+    # it. The first install still succeeds, because the first modprobe runs
+    # before the file exists, which makes it look like a reboot broke it.
+    local ids_supported=0
+    if modinfo -p vfio-pci 2>/dev/null | grep -q '^ids:'; then
+        ids_supported=1
+    else
+        echo " -> This kernel's vfio-pci has no 'ids' parameter."
+        echo " -> Binding by driver_override instead."
+        sudo rm -f /etc/modprobe.d/pscan-vfio.conf
+    fi
+
+    # NOT silenced. A failure here is the whole story - an unloaded vfio-pci
+    # means driver_override and drivers_probe bind the card to nothing, with
+    # no symptom except a missing /dev/vfio/<group> much later.
+    local modprobe_out
+    if ! modprobe_out="$(sudo modprobe vfio-pci 2>&1)"; then
+        echo " -> [ERROR] 'modprobe vfio-pci' FAILED:"
+        printf ' ->           %s\n' "$modprobe_out"
+        echo " ->"
+        echo " ->           pscan cannot reach an X Series card without it."
+        return 1
+    fi
+
+    # Confirm the driver registered, rather than trusting modprobe's status.
+    if [ ! -d /sys/bus/pci/drivers/vfio-pci ]; then
+        echo " -> [ERROR] vfio-pci loaded but did not register as a PCI"
+        echo " ->         driver (/sys/bus/pci/drivers/vfio-pci is absent)."
+        echo " ->         Nothing can be bound to it."
+        return 1
+    fi
 
     # An IOMMU is required: it is what makes lockdown willing to allow
     # userspace device access at all.
@@ -267,9 +302,11 @@ setup_vfio_binding() {
         return 1
     fi
 
-    echo 'options vfio-pci ids=1093:c4c4' \
-        | sudo tee /etc/modprobe.d/pscan-vfio.conf >/dev/null
-    echo " -> /etc/modprobe.d/pscan-vfio.conf written."
+    if [ "$ids_supported" -eq 1 ]; then
+        echo 'options vfio-pci ids=1093:c4c4' \
+            | sudo tee /etc/modprobe.d/pscan-vfio.conf >/dev/null
+        echo " -> /etc/modprobe.d/pscan-vfio.conf written."
+    fi
 
     # modprobe.d only says HOW vfio-pci behaves when something loads it. It
     # does not load it. Without this second file the binding works until the

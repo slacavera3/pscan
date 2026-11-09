@@ -78,6 +78,98 @@ def current_driver(slot):
     return os.path.basename(os.readlink(link))
 
 
+def module_state():
+    """Why is there no vfio-pci driver to bind to?
+
+    Report this BEFORE attempting a bind, because a bind that fails for this
+    reason fails silently: driver_override and drivers_probe bypass PCI id
+    matching entirely, so they bind a device to a named driver whatever its
+    ids - and when that driver does not exist they write successfully, change
+    nothing, and leave the card showing no driver at all. The only later
+    symptom is a missing /dev/vfio/<group>, which points nowhere near the
+    cause.
+
+    Returns True when the driver is registered and binding can work.
+    """
+    print("VFIO MODULE STATE")
+
+    registered = os.path.isdir("/sys/bus/pci/drivers/vfio-pci")
+    loaded = os.path.isdir("/sys/module/vfio_pci")
+    print(f"  driver registered  {'yes' if registered else 'NO'}"
+          f"   (/sys/bus/pci/drivers/vfio-pci)")
+    print(f"  module loaded      {'yes' if loaded else 'NO'}"
+          f"   (/sys/module/vfio_pci)")
+
+    # Does this kernel's vfio-pci even take an 'ids' parameter? If not, an
+    # 'options vfio-pci ids=...' line makes every modprobe fail outright -
+    # so the config meant to enable binding is what prevents it.
+    params = _run(["modinfo", "-p", "vfio-pci"])
+    has_ids = any(line.startswith("ids:") for line in params.splitlines())
+    print(f"  'ids' parameter    {'supported' if has_ids else 'NOT SUPPORTED'}")
+
+    for path in ("/etc/modprobe.d/pscan-vfio.conf",
+                 "/etc/modules-load.d/pscan-vfio.conf"):
+        try:
+            with open(path) as f:
+                print(f"  {path}\n      {f.read().strip()}")
+        except OSError:
+            print(f"  {path}\n      (absent)")
+
+    if has_ids:
+        try:
+            with open("/sys/module/vfio_pci/parameters/ids") as f:
+                print(f"  ids in force       {f.read().strip() or '(empty)'}")
+        except OSError:
+            pass
+
+    if not registered:
+        # Run it visibly. install.sh used to do this with 2>/dev/null, which
+        # is how a failing modprobe went unnoticed for an entire debugging
+        # session.
+        print("\n  Trying 'modprobe vfio-pci'...")
+        out = _run(["modprobe", "vfio-pci"], want_stderr=True)
+        print("      " + (out.strip().replace("\n", "\n      ")
+                          if out.strip() else "(no output)"))
+        registered = os.path.isdir("/sys/bus/pci/drivers/vfio-pci")
+        print(f"  driver registered  {'yes, now' if registered else 'STILL NO'}")
+
+        # Name a cause only where the evidence supports it. A confident
+        # verdict that does not match what was actually observed is worse
+        # than none: it is what sends the next person down a dead end.
+        if not registered:
+            lowered = out.lower()
+            conf = "/etc/modprobe.d/pscan-vfio.conf"
+            if "not found" in lowered:
+                print("\n  This kernel has no vfio-pci module at all. Without it")
+                print("  there is no way to reach the card under lockdown.")
+                print("  On Debian it is in the linux-image package - check that")
+                print("  the running kernel matches the installed modules:")
+                print("     uname -r; ls /lib/modules/")
+            elif "unknown parameter" in lowered or "invalid parameter" in lowered:
+                print(f"\n  The module is rejecting an option. If {conf}")
+                print("  exists, that is almost certainly it - remove it and")
+                print("  retry; binding works by driver_override without it.")
+            elif os.path.exists(conf) and not has_ids:
+                print(f"\n  {conf} sets 'ids=', which this")
+                print("  kernel's vfio-pci does not accept. Remove it and retry.")
+            else:
+                print("\n  Cause not identified from the above. The modprobe")
+                print("  output is the thing to look at.")
+
+    print("")
+    return registered
+
+
+def _run(argv, want_stderr=False):
+    """Run a command, returning its output. Never raises."""
+    import subprocess
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"could not run {argv[0]}: {e}"
+    return (done.stdout + done.stderr) if want_stderr else done.stdout
+
+
 def bind_to_vfio(slot):
     """Point the card at vfio-pci. Returns the driver it had before."""
     previous = current_driver(slot)
@@ -123,6 +215,15 @@ def probe(slot):
     group = iommu_group(slot)
     print(f"card           {slot}")
     print(f"IOMMU group    {group}")
+    print(f"current driver {current_driver(slot) or 'none'}")
+    print("")
+
+    # Before anything else: is there a vfio-pci to bind to at all?
+    if not module_state():
+        print("No vfio-pci driver is registered, so nothing can be bound to")
+        print("it. Everything below would fail for that reason alone, and")
+        print("would not tell you anything about the card. Fix this first.")
+        return 1
 
     if group is None:
         print("\nNo IOMMU group: the IOMMU is not enabled, and vfio-pci")
