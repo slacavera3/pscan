@@ -292,8 +292,33 @@ extern "C" {
  * - for a card at PCI 82:00.0 that is "PXI130::0::INSTR", since the DDK wants
  * the bus and device numbers in decimal.
  */
+/*
+ * When this library was compiled.
+ *
+ * Added because "same result" is an unactionable answer: the shim and the
+ * Python package install separately, several fixes here are static functions
+ * that change no exported symbol, and a .so that did not rebuild behaves
+ * exactly like one that did. Several rounds of hardware debugging were spent
+ * unable to tell those apart.
+ *
+ * __DATE__/__TIME__ are set by the compiler, so this string changes on every
+ * genuine rebuild whether or not anything else did. PSCAN_XSERIES_BUILD can
+ * override it with something more precise, such as a git hash.
+ */
+#ifndef PSCAN_XSERIES_BUILD
+#define PSCAN_XSERIES_BUILD __DATE__ " " __TIME__
+#endif
+
+const char* xseries_build_id(void)
+{
+   return PSCAN_XSERIES_BUILD;
+}
+
 void* xseries_open(const char* resource)
 {
+   if (debugEnabled())
+      printf("[xseries] shim built %s\n", xseries_build_id());
+
    xseries_session* s = new xseries_session();
    memset(s, 0, sizeof(*s));
    // 0 is a legitimate DAC code, so "nothing written yet" cannot be 0.

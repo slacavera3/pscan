@@ -125,6 +125,12 @@ echo "device         $(cat "/sys/bus/pci/devices/$SLOT/device")"
 echo "subsystem      $(cat "/sys/bus/pci/devices/$SLOT/subsystem_device")   <- this names the model"
 echo "driver         $(basename "$(readlink -f "/sys/bus/pci/devices/$SLOT/driver" 2>/dev/null)" 2>/dev/null || echo '(none bound)')"
 echo "iommu group    $(basename "$(readlink -f "/sys/bus/pci/devices/$SLOT/iommu_group" 2>/dev/null)" 2>/dev/null || echo '(none)')"
+# Runtime power management. A card the kernel may suspend loses its analog
+# outputs and comes back with registers at reset values - which reads as an
+# output that drops to zero seconds after being set, while register access
+# still appears to work, because the access itself wakes the device.
+echo "power control  $(cat "/sys/bus/pci/devices/$SLOT/power/control" 2>/dev/null || echo '(not exposed)')   <- want 'on'"
+echo "power status   $(cat "/sys/bus/pci/devices/$SLOT/power/runtime_status" 2>/dev/null || echo '(not exposed)')"
 run "lspci" lspci -nnv -s "$SLOT"
 
 # --- NI's own tools, first and in full -----------------------------------

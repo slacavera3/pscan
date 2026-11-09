@@ -120,6 +120,21 @@ def cmd_read(args):
     return 0
 
 
+def _card_power(session):
+    """The kernel's runtime-PM view of the card, or '?' if it cannot say.
+
+    Only meaningful for a PCI-backed session; the Phidget has no such notion.
+    """
+    address = getattr(session, 'address', None)
+    if address is None:
+        return "?"
+    try:
+        from pscan.nixseries_driver import power_status
+        return power_status(address)
+    except Exception:
+        return "?"
+
+
 def cmd_set(args):
     """Hold an output channel at a voltage, absolutely or relatively."""
     session = _open(args, need_ao=True)
@@ -192,8 +207,16 @@ def cmd_set(args):
                         if shadow != previous:
                             note = "as written" if agrees else "CHANGED"
                             want = "?" if expected is None else f"0x{expected:04x}"
+                            extra = ""
+                            if not agrees:
+                                # Whatever took the output away, say what the
+                                # kernel thinks the card's power state is at
+                                # that exact moment. 'suspended' would mean
+                                # the card was put to sleep under us, which
+                                # looks identical from the register side.
+                                extra = f"  [card {_card_power(session)}]"
                             print(f"    [{elapsed:4d}s] DAC 0x{shadow:04x} "
-                                  f"(expected {want}) {note}")
+                                  f"(expected {want}) {note}{extra}")
                             previous = shadow
                 time.sleep(1)
                 elapsed += 1

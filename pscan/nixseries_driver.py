@@ -91,6 +91,10 @@ _REQUIRED_SYMBOLS = (
     "xseries_read_ai",
     "xseries_write_ao",
     "xseries_ao_shadow",
+    # Not used for anything except proving the library is current. Listing it
+    # here means a .so older than this file is refused by name, instead of
+    # running happily and producing results for code that is not in it.
+    "xseries_build_id",
 )
 
 # nNISTC3::tInputRange, in the DDK's order. The index into this list is what
@@ -258,6 +262,9 @@ def _load():
     ]
     lib.xseries_ao_shadow.restype = ctypes.c_int
 
+    lib.xseries_build_id.argtypes = []
+    lib.xseries_build_id.restype = ctypes.c_char_p
+
     lib.xseries_selftest.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_double),  # temperature, degrees C
@@ -308,6 +315,63 @@ def _resource_string(slot):
     _domain, bus_hex, rest = slot.split(":")
     device_hex = rest.split(".")[0]
     return f"PXI{int(bus_hex, 16)}::{int(device_hex, 16)}::INSTR"
+
+
+def _debug():
+    return os.environ.get("PSCAN_XSERIES_DEBUG") is not None
+
+
+def pin_power_state(slot):
+    """Stop the kernel suspending the card while we are using it.
+
+    Linux PCI runtime power management can put an idle device into D3 to save
+    power, and vfio-pci has supported that since 6.1. A suspended card loses
+    its analog outputs and comes back with its registers at reset values -
+    which looks exactly like an output that mysteriously drops to zero a few
+    seconds after being set, while every register access still appears to
+    work because the access itself wakes the device up.
+
+    pscan holds outputs steady for the length of a scan, with no register
+    traffic in between, which is precisely the idle pattern that triggers
+    this. So the device is pinned to 'on' for as long as it is ours.
+
+    Best effort: it needs root or a udev rule, and on a kernel or device
+    without runtime PM the file is simply absent. Returns what happened, for
+    the debug line - this must never stop a scan starting.
+    """
+    path = os.path.join("/sys/bus/pci/devices", slot, "power", "control")
+    try:
+        with open(path) as f:
+            before = f.read().strip()
+    except OSError as e:
+        return f"runtime PM not exposed ({e.strerror})"
+
+    if before == "on":
+        return "runtime PM already off (control=on)"
+
+    try:
+        with open(path, "w") as f:
+            f.write("on")
+    except OSError as e:
+        return (f"control={before}, but could not pin it ({e.strerror}); "
+                f"the card may suspend mid-scan")
+
+    try:
+        with open(path) as f:
+            after = f.read().strip()
+    except OSError:
+        after = "?"
+    return f"runtime PM pinned: control {before} -> {after}"
+
+
+def power_status(slot):
+    """The card's runtime-PM state, for diagnostics. '?' if not exposed."""
+    path = os.path.join("/sys/bus/pci/devices", slot, "power", "runtime_status")
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return "?"
 
 
 class NIXSeriesDriver(DAQBackend):
@@ -401,6 +465,13 @@ class NIXSeriesDriver(DAQBackend):
                     f"no 'device' line said which to use."
                 )
             self.address = candidates[0][0]
+
+        # Before opening: a card the kernel is free to suspend will drop its
+        # outputs and reset its registers partway through a scan.
+        note = pin_power_state(self.address)
+        if _debug():
+            print(f"[xseries] {self.address}: {note}")
+            print(f"[xseries] runtime status: {power_status(self.address)}")
 
         resource = _resource_string(self.address)
         handle = lib.xseries_open(resource.encode())
