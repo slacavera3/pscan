@@ -267,6 +267,57 @@ echo -e "\n[1.7/6] Checking NI-DAQmx..."
 #   udev        gives the 'pscan' group access to /dev/vfio/*. Without it a
 #               scan needs root, which is a poor thing to require of
 #               everyday use.
+# Hand any NI card back from vfio-pci to whichever driver claims it.
+#
+# Needed because the two owners are exclusive. Once a device is bound to
+# vfio-pci nothing else can see it - not NI's driver, not lspci's "Kernel
+# driver in use" showing anything else - so a machine set up for the shim and
+# then given NI-DAQmx ends up with a working driver and an invisible card,
+# with nothing in either tool's output pointing at the cause.
+#
+# Removes the persistence first, so a reboot does not simply undo this.
+release_card_from_vfio() {
+    local changed=0
+
+    for f in /etc/modprobe.d/pscan-vfio.conf /etc/modules-load.d/pscan-vfio.conf; do
+        if [ -f "$f" ]; then
+            sudo rm -f "$f"
+            echo " ->   removed $f"
+            changed=1
+        fi
+    done
+
+    for dev in /sys/bus/pci/devices/*; do
+        [ -r "$dev/vendor" ] || continue
+        [ "$(cat "$dev/vendor" 2>/dev/null)" = "0x1093" ] || continue
+
+        local slot current
+        slot="$(basename "$dev")"
+        current="$(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)"
+
+        [ "$current" = "vfio-pci" ] || continue
+
+        echo " ->   releasing $slot from vfio-pci..."
+        echo "$slot" | sudo tee "$dev/driver/unbind" >/dev/null 2>&1 || true
+        # Clear the override, or drivers_probe just hands it back to vfio-pci.
+        echo "" | sudo tee "$dev/driver_override" >/dev/null 2>&1 || true
+        echo "$slot" | sudo tee /sys/bus/pci/drivers_probe >/dev/null 2>&1 || true
+
+        current="$(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)"
+        if [ -n "$current" ] && [ "$current" != "vfio-pci" ]; then
+            echo " ->   $slot is now driven by '$current'."
+        else
+            echo " ->   $slot is not bound to anything yet. NI's modules are"
+            echo " ->   loaded at boot, so REBOOT and check with 'pydaq list'."
+            NI_DAQMX_NEEDS_REBOOT=1
+        fi
+        changed=1
+    done
+
+    [ "$changed" -eq 1 ] || echo " ->   nothing to release."
+    return 0
+}
+
 setup_vfio_binding() {
     echo " -> Setting up vfio-pci binding..."
 
@@ -812,7 +863,22 @@ fi
 #
 # Done whenever an NI card is actually seated, so machines without one are
 # not given a vfio-pci binding they have no use for.
-if [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] && \
+#
+# AND ONLY WHEN NI-DAQmx IS NOT INSTALLED. The two cannot share a card: a
+# device bound to vfio-pci is invisible to every other driver, so binding it
+# here silently prevents DAQmx from ever seeing it. That is exactly what
+# happened on the rig - DAQmx installed correctly, 'pydaq list' reported the
+# backend available, and it enumerated no devices at all, because vfio-pci
+# still owned the card.
+#
+# DAQmx wins where it exists: it is NI's supported driver and the shim is the
+# fallback for distros that cannot run it. PSCAN_FORCE_VFIO=1 inverts that,
+# for working on the shim deliberately.
+if have_lib libnidaqmx && [ -z "${PSCAN_FORCE_VFIO:-}" ]; then
+    echo " -> NI-DAQmx is installed, so it owns any NI card. Not binding to"
+    echo " -> vfio-pci: a card bound there is invisible to NI's driver."
+    release_card_from_vfio
+elif [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] && \
    ls /sys/bus/pci/devices/*/vendor >/dev/null 2>&1 && \
    grep -qls '^0x1093$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
     echo " -> NI card present; using vfio-pci (no kernel module, works"
