@@ -416,6 +416,58 @@ UDEV
     return 0
 }
 
+# Did NI's kernel modules actually build, and will Secure Boot let them load?
+#
+# This is the step that decides whether the DAQmx route works on a locked-down
+# machine, and it fails silently otherwise: dkms reports success, the modules
+# sit on disk unsigned, and modprobe refuses them at boot with nothing in the
+# installer's output to say why.
+check_daqmx_modules() {
+    echo " -> Checking NI's kernel modules..."
+
+    local built
+    built=$(sudo dkms status 2>/dev/null | grep -ci 'ni' || true)
+    echo " ->   dkms knows about $built NI module(s)."
+
+    local secureboot="unknown"
+    if command -v mokutil >/dev/null 2>&1; then
+        if mokutil --sb-state 2>/dev/null | grep -qi enabled; then
+            secureboot="enabled"
+        else
+            secureboot="disabled"
+        fi
+    fi
+    echo " ->   Secure Boot: $secureboot"
+
+    if [ "$secureboot" != "enabled" ]; then
+        return 0
+    fi
+
+    # Debian's dkms can sign what it builds with a machine-owner key, but the
+    # key has to be enrolled once, interactively, at the next boot.
+    if [ -f /var/lib/dkms/mok.pub ]; then
+        echo " ->"
+        echo " ->   Secure Boot is on, so unsigned modules will not load."
+        echo " ->   Debian's dkms has a signing key at /var/lib/dkms/mok.pub."
+        echo " ->   Enrol it ONCE, then reboot:"
+        echo " ->"
+        echo " ->     sudo mokutil --import /var/lib/dkms/mok.der"
+        echo " ->"
+        echo " ->   It asks for a one-time password. On the next boot a blue"
+        echo " ->   'MOK management' screen appears: choose Enrol MOK, then"
+        echo " ->   Continue, and give that password. It is asked once, ever."
+        echo " ->   No BIOS visit and no Secure Boot change."
+    else
+        echo " ->"
+        echo " ->   Secure Boot is on and no dkms signing key was found at"
+        echo " ->   /var/lib/dkms/mok.der. NI's modules will not load until"
+        echo " ->   they are signed. Install 'dkms' from Debian (which"
+        echo " ->   generates one) and re-run, or check:"
+        echo " ->     sudo dmesg | grep -i 'module verification\\|key rejected'"
+    fi
+    return 0
+}
+
 install_nidaqmx() {
     if have_lib libnidaqmx; then
         echo " -> NI-DAQmx is already installed. Skipping."
@@ -457,26 +509,38 @@ install_nidaqmx() {
             echo " ->           Ubuntu, RHEL and openSUSE - NOT Debian - and"
             echo " ->           there is no Debian registration package."
             echo " ->"
-            echo " ->           NI-DAQmx is therefore NOT installed, which"
-            echo " ->           means NI X Series cards (your PCIe-6351) cannot"
-            echo " ->           be reached on this OS. comedi cards are fine."
+            echo " ->           NI-DAQmx is therefore NOT installed. The X"
+            echo " ->           Series shim (section 1.8) is the fallback."
+            echo " ->           comedi cards are unaffected either way."
             echo " ->"
-            echo " ->           The supported fix is Ubuntu 22.04 or 24.04 on"
-            echo " ->           this machine. To try the Ubuntu packages here"
-            echo " ->           anyway - unsupported, and it can leave apt"
-            echo " ->           pulling jammy libraries over Debian ones:"
+            echo " ->           'Not supported' is not the same as 'will not"
+            echo " ->           work': NI's packages are .debs, DKMS builds"
+            echo " ->           their modules against whatever kernel is here,"
+            echo " ->           and the feed is pinned so it cannot replace"
+            echo " ->           Debian packages. It is worth trying:"
             echo " ->             PSCAN_FORCE_DAQMX=1 bash install.sh"
-            echo " ->           Pin the feed to NI packages only if you do."
+            echo " ->"
+            echo " ->           With Secure Boot on you will need to enrol a"
+            echo " ->           DKMS signing key once; this script says how"
+            echo " ->           after it builds."
             return 1
         fi
 
         echo " -> [WARNING] '$distro $release' is not supported by NI."
-        echo " ->           PSCAN_FORCE_DAQMX is set, so trying the Ubuntu"
-        echo " ->           22.04 packages. If apt starts proposing to replace"
-        echo " ->           system libraries, abort and remove"
-        echo " ->           /etc/apt/sources.list.d/ni-*.list."
-        # Closest supported Ubuntu LTS to a Debian base.
-        ubu="2204"
+        echo " ->           PSCAN_FORCE_DAQMX is set, so trying NI's Ubuntu"
+        echo " ->           packages. The apt feed is pinned below so it"
+        echo " ->           cannot replace Debian system libraries."
+
+        # Ubuntu 24.04 (noble), not 22.04 (jammy).
+        #
+        # The closer the libc, the fewer surprises: Debian 13 ships glibc
+        # ~2.41, noble 2.39, jammy 2.35. Jammy was picked here when "closest
+        # supported LTS" was a guess rather than a comparison.
+        #
+        # NI_UBUNTU=2204 overrides, since which releases NI publishes for
+        # changes over time.
+        ubu="${NI_UBUNTU:-2404}"
+        echo " ->           Targeting Ubuntu $ubu packages."
     fi
 
     sudo apt install -y curl unzip
@@ -537,16 +601,52 @@ install_nidaqmx() {
         return 1
     fi
 
+    # Pin NI's feed BEFORE registering it.
+    #
+    # This is the part that makes putting an Ubuntu feed on Debian safe
+    # rather than reckless, and it was described in the warning above long
+    # before it was implemented. Priority 100 means "install from here only
+    # when nothing else provides this package": NI's own ni-* packages still
+    # install, because Debian has no competing version, while anything NI
+    # ships that Debian also ships - libstdc++, libpython, kernel headers -
+    # loses to Debian's at priority 500.
+    #
+    # Without this, a later 'apt upgrade' can quietly start pulling Ubuntu
+    # system libraries over Debian ones, which is how an unsupported-but-
+    # working machine becomes an unbootable one.
+    echo " -> Pinning NI's feed so it cannot replace Debian packages..."
+    sudo tee /etc/apt/preferences.d/pscan-ni-pin >/dev/null <<'PIN'
+# Written by pscan's install.sh.
+# NI's feed is built for Ubuntu. On Debian it must supply NI's own packages
+# and nothing else, or apt will offer to replace system libraries with
+# Ubuntu builds. Priority 100 = only when no other source provides it.
+Package: *
+Pin: origin download.ni.com
+Pin-Priority: 100
+PIN
+
     echo " -> Registering NI's apt feed ($deb)..."
     unzip -j -o "$workdir/ni.zip" "$deb" -d "$workdir" >/dev/null
     sudo apt install -y "$workdir/$deb"
 
     echo " -> Installing the driver from NI's feed..."
     sudo apt update
-    sudo apt install -y ni-daqmx
+    if ! sudo apt install -y ni-daqmx; then
+        echo " -> [ERROR] 'apt install ni-daqmx' failed."
+        echo " ->         Check what the feed actually offers:"
+        echo " ->           apt-cache search '^ni-' | head -30"
+        echo " ->           apt-cache policy ni-daqmx"
+        echo " ->         If it is a dependency on an Ubuntu-only package,"
+        echo " ->         that name is the thing to work around - try"
+        echo " ->         NI_UBUNTU=2204 for the older, lighter dependency set."
+        rm -rf "$workdir"
+        return 1
+    fi
 
     echo " -> Building kernel modules for the running kernel..."
-    sudo dkms autoinstall
+    sudo dkms autoinstall || echo " -> [WARNING] dkms autoinstall reported a failure."
+
+    check_daqmx_modules
 
     rm -rf "$workdir"
 
