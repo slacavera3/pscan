@@ -258,11 +258,23 @@ def cmd_set(args):
                 time.sleep(1)
                 elapsed += 1
         except KeyboardInterrupt:
-            print("\n  Released. The output resets as the card closes.")
+            if getattr(session, 'outputs_survive_close', True):
+                print(f"\n  Released. ao{args.channel} STAYS at {target:+.4f} V "
+                      f"- this card holds its output after the process exits.")
+                print(f"  Drive it to 0 explicitly if you need that:")
+                print(f"    pydaq set 0 --backend {session.name} "
+                      f"--channel {args.channel}")
+            else:
+                print("\n  Released. The output resets as the card closes.")
         return 0
 
-    print(f"  Done. Note the output may not survive this process exiting -")
-    print(f"  use --hold to keep it applied, and see 'pydaq set --help'.")
+    if getattr(session, 'outputs_survive_close', True):
+        print(f"  Done. ao{args.channel} holds {target:+.4f} V after this "
+              f"command exits.")
+    else:
+        print(f"  Done, but the output does NOT survive this process exiting "
+              f"on the '{session.name}' backend.")
+        print(f"  Use --hold to keep it applied; see 'pydaq set --help'.")
     return 0
 
 

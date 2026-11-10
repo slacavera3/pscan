@@ -478,6 +478,22 @@ class DAQBackend:
             self._last_ao[channel] = safe
         return ok
 
+    #: Does an analog output keep its voltage once this process exits?
+    #:
+    #: True for most backends, and the behaviour pscan wants: a run ending
+    #: must not slam a mirror or a piezo back through its range. The Phidget
+    #: path has always worked this way.
+    #:
+    #: False only where the platform takes it away regardless - the X Series
+    #: backend reaches the card through vfio-pci, which resets the device
+    #: when its last file descriptor closes, zeroing the DACs. That is
+    #: deliberate kernel behaviour and cannot be opted out of.
+    #:
+    #: Declared because 'pydaq set' used to tell everyone "the output resets
+    #: as the card closes", which was written for the X Series path and is
+    #: simply untrue under NI-DAQmx, where the voltage stays up.
+    outputs_survive_close = True
+
     def _write_ao(self, channel, volts):
         raise NotImplementedError
 

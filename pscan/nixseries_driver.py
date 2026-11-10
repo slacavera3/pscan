@@ -399,6 +399,10 @@ class NIXSeriesDriver(DAQBackend):
 
     name = "nixseries"
 
+    # vfio-pci resets the device when its last file descriptor closes, which
+    # zeroes the DACs. Nothing this driver does can prevent it.
+    outputs_survive_close = False
+
     def __init__(self, address=None):
         super().__init__(address=address)
         self._handle = None
