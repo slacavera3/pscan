@@ -84,6 +84,25 @@ cheap and still untested.
 | AO subsystem reset | **No** | Config bank reads `0x80`, which is what a correct `programConfigBank` produces (offset 0, gain 0, `kImmediate`=0, `kBipolar`=1). Its reset value would be `0xBF` |
 | Out timer pushing FIFO data into the DAC | **No** | `AO_FIFO_Status` = 0, `AO_Trigger_Select` = 0 |
 | Stale build — the fix was not in what ran | **No** | Shim prints its own `__DATE__ __TIME__`; `xseries_build_id` is a required symbol, so an old `.so` is now refused by name |
+| Kernel sees a PCIe error / link event / reset at the 8 s mark | **No** | `dmesg -T` across the window shows **nothing** at that time. The only two lines are at open (below) |
+
+### What dmesg does say, at open and only at open
+
+```
+vfio-pci 0000:82:00.0: enabling device (0000 -> 0002)
+pcieport 0000:80:1c.0: unlocked secondary bus reset via: __pci_reset_function_locked+0x3e/0x70
+```
+
+Two things worth knowing from that:
+
+- `0000 -> 0002` is the PCI command register: **memory space enabled, bus
+  master not**. Fine for this driver, which is programmed I/O only and
+  implements no DMA.
+- **`VFIO_DEVICE_RESET` is not doing a function-level reset.** This card has no
+  FLR, so VFIO falls back to a **secondary bus reset**, which resets the whole
+  bus segment below the port. That is far heavier than intended, it is ours,
+  and NI's driver does nothing like it on open. See `PSCAN_XSERIES_NO_RESET`
+  below.
 
 ---
 
@@ -123,7 +142,25 @@ cheap and still untested.
    against it. Note DAQmx installs out-of-tree kernel modules, so the
    interaction with Secure Boot must be checked — that is the thing to verify,
    not assume.
-4. **Reading `dmesg` during the 8-second window.** Never captured.
+4. **Opening the card WITHOUT the secondary bus reset.**
+
+   ```bash
+   sudo PSCAN_XSERIES_DEBUG=1 PSCAN_XSERIES_NO_RESET=1 \
+        pydaq set 2.5 --backend nixseries --channel 0 --hold
+   ```
+
+   Caveat on interpreting it: vfio-pci resets the device when the last file
+   descriptor closes, so the card has usually just been bus-reset by the
+   *previous* run anyway. A genuinely untouched card means trying this first
+   thing after a reboot.
+
+5. **Reading NI's own `osiUserCode.cpp`** — the nirlpk version, backed up by
+   `dev/build_ddk_examples.sh` to
+   `libs/vendor/build/.../LinuxKernel/osiUserCode.cpp.nirlpk`, plus the
+   `nirlpk/` kernel module source beside it. That is NI's real board-access
+   layer for Linux and the only reference we have for what their driver does
+   at open that ours does not. It has never been read. It cannot be committed
+   here — the repo is public and the DDK is not redistributable.
 
 Inference, not evidence: the MHDDK supplies register definitions and example
 sequences, but NI's real driver does considerably more initialisation than the

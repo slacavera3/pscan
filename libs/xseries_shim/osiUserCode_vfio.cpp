@@ -326,22 +326,51 @@ iBus* acquireBoard(tChar* brdLocation)
     *
     * Nothing has ever initialised this device: no NI driver has run on this
     * machine, and the DDK's examples assume a card in a known state rather
-    * than whatever the BIOS left behind. A function-level reset is the one
-    * initialisation step available to us that the DDK does not perform
-    * itself.
+    * than whatever the BIOS left behind.
+    *
+    * BUT THIS IS HEAVIER THAN IT LOOKS, and it is a suspect. The PCIe-6351
+    * does not support a function-level reset, so VFIO_DEVICE_RESET falls
+    * back to a SECONDARY BUS RESET - the kernel says so:
+    *
+    *   pcieport 0000:80:1c.0: unlocked secondary bus reset via:
+    *   __pci_reset_function_locked+0x3e/0x70
+    *
+    * That resets the whole bus segment beneath the port, not just this
+    * function, and the kernel then restores config space while the card's
+    * internal state comes back however the hardware decides. NI's own driver
+    * does nothing of the sort on open. A card whose analog output quietly
+    * reverts about eight seconds later, with no kernel event and every other
+    * register healthy, is consistent with internal initialisation that a bus
+    * reset disturbed and that we do not know how to complete.
+    *
+    * PSCAN_XSERIES_NO_RESET=1 skips it, so that can be tested in one run.
+    * Worth trying from a cold boot, where the card has not been reset by a
+    * previous attempt either.
     *
     * Failure is not fatal - not every device supports reset, and a card
-    * that is already in a sane state does not need it.
+    * already in a sane state does not need it.
     */
-   if (ioctl(deviceFd, VFIO_DEVICE_RESET) < 0)
+   const bool debug = (getenv("PSCAN_XSERIES_DEBUG") != NULL);
+
+   if (getenv("PSCAN_XSERIES_NO_RESET") != NULL)
    {
-      if (getenv("PSCAN_XSERIES_DEBUG") != NULL)
+      if (debug)
+         printf("[xseries] skipping device reset "
+                "(PSCAN_XSERIES_NO_RESET is set)\n");
+   }
+   else if (ioctl(deviceFd, VFIO_DEVICE_RESET) < 0)
+   {
+      if (debug)
          printf("[xseries] VFIO_DEVICE_RESET not available: %s\n",
                 strerror(errno));
    }
-   else if (getenv("PSCAN_XSERIES_DEBUG") != NULL)
+   else if (debug)
    {
-      printf("[xseries] device reset ok\n");
+      // Say what kind, because "reset ok" hid a secondary bus reset for a
+      // long time. The kernel log names the real mechanism; this just flags
+      // that something heavy may have happened.
+      printf("[xseries] device reset ok (check dmesg for which kind - this "
+             "card has no FLR, so it is a secondary bus reset)\n");
    }
 
    struct vfio_region_info region;
