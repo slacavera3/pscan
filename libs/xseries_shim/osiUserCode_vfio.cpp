@@ -373,6 +373,80 @@ iBus* acquireBoard(tChar* brdLocation)
              "card has no FLR, so it is a secondary bus reset)\n");
    }
 
+   /*
+    * Enable PCI bus mastering.
+    *
+    * This is the ONE functional difference left between this bus layer and
+    * NI's. Their osiUserCode.cpp reaches the card through nirlpk.ko, an
+    * ordinary PCI kernel driver that supports DMA, so it will have called
+    * pci_set_master(). vfio-pci does not: the kernel log says
+    *
+    *   vfio-pci 0000:82:00.0: enabling device (0000 -> 0002)
+    *
+    * and 0x0002 is memory space alone, with bus master (0x0004) clear.
+    *
+    * Reading NI's acquireBoard() settled that the MHDDK performs no board
+    * initialisation whatsoever - it finds a device node, mmaps BAR0 and
+    * constructs an iBus. So there is no missing init sequence to find, and
+    * this bit is the only thing their path does to the card that ours does
+    * not. Whether an X Series card needs it for anything beyond DMA is not
+    * documented anywhere we have; it is cheap to set and cheap to test.
+    *
+    * Safe under VFIO by construction: the IOMMU is what contains anything
+    * the device masters, which is the reason lockdown permits this at all.
+    *
+    * PSCAN_XSERIES_NO_BUSMASTER=1 leaves it alone, so the two can be
+    * compared in one run each.
+    */
+   if (getenv("PSCAN_XSERIES_NO_BUSMASTER") == NULL)
+   {
+      struct vfio_region_info config;
+      memset(&config, 0, sizeof(config));
+      config.argsz = sizeof(config);
+      config.index = VFIO_PCI_CONFIG_REGION_INDEX;
+
+      if (ioctl(deviceFd, VFIO_DEVICE_GET_REGION_INFO, &config) == 0)
+      {
+         // PCI COMMAND is 16 bits at offset 0x04; bit 2 is Bus Master Enable.
+         unsigned short command = 0;
+         const off_t where = static_cast<off_t>(config.offset) + 0x04;
+
+         if (pread(deviceFd, &command, sizeof(command), where)
+             == static_cast<ssize_t>(sizeof(command)))
+         {
+            const unsigned short before = command;
+            command |= 0x0004;
+
+            const bool wrote =
+               (pwrite(deviceFd, &command, sizeof(command), where)
+                == static_cast<ssize_t>(sizeof(command)));
+
+            unsigned short after = 0;
+            pread(deviceFd, &after, sizeof(after), where);
+
+            if (debug)
+               printf("[xseries] PCI command 0x%04x -> 0x%04x%s "
+                      "(bus master %s)\n",
+                      before, after, wrote ? "" : " [write failed]",
+                      (after & 0x0004) ? "ON" : "still OFF");
+         }
+         else if (debug)
+         {
+            printf("[xseries] could not read PCI command register: %s\n",
+                   strerror(errno));
+         }
+      }
+      else if (debug)
+      {
+         printf("[xseries] no VFIO config region: %s\n", strerror(errno));
+      }
+   }
+   else if (debug)
+   {
+      printf("[xseries] leaving bus master alone "
+             "(PSCAN_XSERIES_NO_BUSMASTER is set)\n");
+   }
+
    struct vfio_region_info region;
    memset(&region, 0, sizeof(region));
    region.argsz = sizeof(region);
@@ -406,11 +480,17 @@ iBus* acquireBoard(tChar* brdLocation)
       return NULL;
    }
 
-   iBus* bus = new iBus(devNumber, 0, mem0, NULL);
+   // (0, 0, ...) exactly as NI's osiUserCode.cpp does it. This passed
+   // devNumber as the first argument, which happened to be identical on this
+   // card - it sits at 82:00.0, so devNumber is 0 - but only by luck. What
+   // those first two parameters mean is not documented in osiBus.h, and
+   // matching NI's call removes the question.
+   iBus* bus = new iBus(0, 0, mem0, NULL);
 
-   // The DDK wants BAR0's physical address for the MITE on older hardware.
-   // X Series does not use it, and VFIO deliberately does not expose it, so
-   // it is left zero rather than invented.
+   // NI sets _physBar[0] to BAR0's physical address, for the MITE on older
+   // hardware. VFIO deliberately does not expose a physical address, so it
+   // is left zero here rather than invented - safe because nothing in the
+   // DDK or the chip objects reads it (grepped for, twice).
    for (int i = 0; i < 6; ++i) bus->_physBar[i] = 0;
 
    tVfioSpecific* specific = new tVfioSpecific;
