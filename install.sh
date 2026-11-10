@@ -630,8 +630,29 @@ install_nidaqmx() {
         return 1
     fi
 
+    # Find the package by its FULL PATH inside the zip, not by its basename.
+    #
+    # NI nest it in a directory, so the bare name matches when grepping the
+    # listing but is not a valid extraction pattern - unzip wants the entry's
+    # whole path. That mismatch made this step report
+    #
+    #   caution: filename not matched:  ni-ubuntu2404-drivers-stream.deb
+    #
+    # and then hand apt a file that was never extracted:
+    #
+    #   Error: Unsupported file /tmp/.../ni-ubuntu2404-drivers-stream.deb
+    #
+    # The feed was therefore never registered, which is the whole reason
+    # 'apt install ni-daqmx' then could not find the package. One bug, and
+    # every later failure followed from it.
+    #
+    # 'unzip -Z1' lists entry paths alone, so the search and the extraction
+    # now use exactly the same string and cannot disagree again.
     local deb="ni-ubuntu${ubu}-drivers-stream.deb"
-    if ! unzip -l "$workdir/ni.zip" | grep -q "$deb"; then
+    local deb_path
+    deb_path=$(unzip -Z1 "$workdir/ni.zip" 2>/dev/null | grep -m1 -F "$deb")
+
+    if [ -z "$deb_path" ]; then
         echo " -> [ERROR] Release $found_rel has no registration package for"
         echo " ->         Ubuntu $release. It contains:"
         unzip -l "$workdir/ni.zip" | grep -o 'ni-ubuntu[0-9]*' | sort -u | sed 's/^/ ->           /'
@@ -665,9 +686,29 @@ Pin: origin download.ni.com
 Pin-Priority: 100
 PIN
 
-    echo " -> Registering NI's apt feed ($deb)..."
-    unzip -j -o "$workdir/ni.zip" "$deb" -d "$workdir" >/dev/null
-    sudo apt install -y "$workdir/$deb"
+    echo " -> Registering NI's apt feed ($deb_path)..."
+    unzip -j -o "$workdir/ni.zip" "$deb_path" -d "$workdir" >/dev/null
+
+    # -j junks the directory, so it lands under its basename. Check it is
+    # really there: the previous version went straight on to apt with a path
+    # that did not exist, and the only clue was a 'caution:' line from unzip
+    # that scrolled past.
+    if [ ! -s "$workdir/$deb" ]; then
+        echo " -> [ERROR] Extracting $deb_path produced nothing."
+        echo " ->         The zip lists it, so this is a pattern problem, not"
+        echo " ->         a missing file. Inspect with:"
+        echo " ->           unzip -Z1 $workdir/ni.zip | grep ni-ubuntu"
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    if ! sudo apt install -y "$workdir/$deb"; then
+        echo " -> [ERROR] Installing the registration package failed."
+        echo " ->         Without it NI's apt feed is not configured, so"
+        echo " ->         'apt install ni-daqmx' cannot work."
+        rm -rf "$workdir"
+        return 1
+    fi
 
     echo " -> Installing the driver from NI's feed..."
     sudo apt update
