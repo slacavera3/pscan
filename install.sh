@@ -443,28 +443,68 @@ check_daqmx_modules() {
         return 0
     fi
 
-    # Debian's dkms can sign what it builds with a machine-owner key, but the
-    # key has to be enrolled once, interactively, at the next boot.
-    if [ -f /var/lib/dkms/mok.pub ]; then
+    # Debian's dkms signs what it builds with a machine-owner key and leaves
+    # the certificate in /var/lib/dkms. The key is useless until it is
+    # enrolled, which must happen at boot with someone physically present -
+    # that requirement IS Secure Boot, and no installer can work around it.
+    #
+    # The certificate's name has moved between Debian releases, so find it
+    # rather than hardcode one. Telling a user to import a path that does not
+    # exist is worse than saying nothing: this printed 'mok.der' while
+    # checking for 'mok.pub', and the command failed in their hands.
+    local cert=""
+    local candidate
+    for candidate in /var/lib/dkms/mok.pub /var/lib/dkms/mok.der \
+                     /var/lib/shim-signed/mok/MOK.der; do
+        [ -f "$candidate" ] && { cert="$candidate"; break; }
+    done
+
+    if [ -z "$cert" ]; then
         echo " ->"
-        echo " ->   Secure Boot is on, so unsigned modules will not load."
-        echo " ->   Debian's dkms has a signing key at /var/lib/dkms/mok.pub."
-        echo " ->   Enrol it ONCE, then reboot:"
-        echo " ->"
-        echo " ->     sudo mokutil --import /var/lib/dkms/mok.der"
-        echo " ->"
-        echo " ->   It asks for a one-time password. On the next boot a blue"
-        echo " ->   'MOK management' screen appears: choose Enrol MOK, then"
-        echo " ->   Continue, and give that password. It is asked once, ever."
-        echo " ->   No BIOS visit and no Secure Boot change."
-    else
-        echo " ->"
-        echo " ->   Secure Boot is on and no dkms signing key was found at"
-        echo " ->   /var/lib/dkms/mok.der. NI's modules will not load until"
-        echo " ->   they are signed. Install 'dkms' from Debian (which"
-        echo " ->   generates one) and re-run, or check:"
+        echo " ->   Secure Boot is on, and no DKMS signing certificate exists"
+        echo " ->   yet. It is created when dkms first builds a module, so"
+        echo " ->   this usually means nothing was built. Check:"
+        echo " ->     sudo dkms status"
         echo " ->     sudo dmesg | grep -i 'module verification\\|key rejected'"
+        return 0
     fi
+
+    # Already enrolled? Then there is nothing to do and nothing to say.
+    if command -v mokutil >/dev/null 2>&1 && \
+       sudo mokutil --test-key "$cert" 2>/dev/null | grep -qi 'already enrolled'; then
+        echo " ->   DKMS signing key already enrolled. Modules will load."
+        return 0
+    fi
+
+    echo " ->"
+    echo " ->   Secure Boot is on, so NI's modules must be signed by a key"
+    echo " ->   this machine trusts. DKMS has signed them with:"
+    echo " ->     $cert"
+    echo " ->   That key needs enrolling ONCE on this machine, ever."
+    echo " ->"
+    echo " ->   You will be asked to invent a password now, and to type it"
+    echo " ->   again on a blue screen at the next boot. It is not stored"
+    echo " ->   and you never need it again. No BIOS change."
+    echo " ->"
+    printf " ->   Enrol it now? [y/N] "
+    local answer=""
+    read -r answer </dev/tty 2>/dev/null || answer=""
+
+    case "$answer" in
+        [yY]*)
+            if sudo mokutil --import "$cert"; then
+                MOK_ENROLMENT_PENDING=1
+                echo " ->   Enrolment queued. It takes effect at the next boot."
+            else
+                echo " ->   [WARNING] mokutil --import failed. Run it by hand:"
+                echo " ->     sudo mokutil --import $cert"
+            fi
+            ;;
+        *)
+            echo " ->   Skipped. NI's modules will NOT load until you run:"
+            echo " ->     sudo mokutil --import $cert"
+            ;;
+    esac
     return 0
 }
 
@@ -1056,6 +1096,33 @@ if [ -n "${VFIO_NEEDS_RELOGIN:-}" ]; then
     echo " *** LOG OUT AND BACK IN: you were added to the 'pscan' group so"
     echo " *** the NI X Series card can be used without sudo. Group changes"
     echo " *** only apply to new logins."
+fi
+# Last, and in full, because it is the one step nobody can guess and the one
+# that cannot be automated: enrolling a key must happen with someone
+# physically at the machine, which is the entire point of Secure Boot.
+if [ -n "${MOK_ENROLMENT_PENDING:-}" ]; then
+    cat <<'MOK'
+
+ *** ON THE NEXT REBOOT, READ THIS SCREEN - do not just press enter.
+ ***
+ *** A blue screen titled "Shim UEFI key management" or "MOK management"
+ *** appears BEFORE Debian starts. It waits about 10 seconds and then
+ *** carries on without enrolling, so do not walk away.
+ ***
+ ***   1. Press any key when it says "Press any key to perform MOK
+ ***      management".
+ ***   2. Choose  Enroll MOK
+ ***   3. Choose  Continue
+ ***   4. Choose  Yes
+ ***   5. Type the password you just invented, and press enter.
+ ***   6. Choose  Reboot
+ ***
+ *** If you miss it, the machine boots normally and the NI card simply
+ *** will not appear. Re-run this installer to queue it again.
+ ***
+ *** This happens ONCE per machine. It is not asked again, and it is not
+ *** a BIOS change.
+MOK
 fi
 echo "======================================================="
 [ "${INSTALL_OK:-0}" -eq 1 ] || exit 1
