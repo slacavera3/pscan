@@ -293,26 +293,12 @@ extern "C" {
  * the bus and device numbers in decimal.
  */
 /*
- * When this library was compiled.
- *
- * Added because "same result" is an unactionable answer: the shim and the
- * Python package install separately, several fixes here are static functions
- * that change no exported symbol, and a .so that did not rebuild behaves
- * exactly like one that did. Several rounds of hardware debugging were spent
- * unable to tell those apart.
- *
- * __DATE__/__TIME__ are set by the compiler, so this string changes on every
- * genuine rebuild whether or not anything else did. PSCAN_XSERIES_BUILD can
- * override it with something more precise, such as a git hash.
+ * Defined in build_id.cpp, which is recompiled on every link so the answer
+ * describes THIS library rather than the last time this file changed. It
+ * lived here and reported a stale timestamp while the library was current,
+ * which is the one thing it must never do.
  */
-#ifndef PSCAN_XSERIES_BUILD
-#define PSCAN_XSERIES_BUILD __DATE__ " " __TIME__
-#endif
-
-const char* xseries_build_id(void)
-{
-   return PSCAN_XSERIES_BUILD;
-}
+const char* xseries_build_id(void);
 
 void* xseries_open(const char* resource)
 {

@@ -187,12 +187,26 @@ xseries_shim.o: xseries_shim.cpp
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
+# The build stamp. Computed per invocation of make, and build_id.cpp is
+# handed to the link as SOURCE rather than a cached .o, so it is recompiled
+# every time and the id always describes this build.
+#
+# It has to work this way. With the id in xseries_shim.cpp it once reported
+# an hours-old timestamp while the library was genuinely current: the link
+# rule recompiles OSI_SRC every time, but xseries_shim.o stayed cached
+# because that file had not changed. During hardware debugging "is the fix in
+# what I just ran?" must be answerable, and answerable correctly.
+BUILD_STAMP := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+BUILD_GIT   := $(shell git -C "$(CURDIR)" rev-parse --short HEAD 2>/dev/null || echo nogit)
+BUILD_DEFINE = -DPSCAN_XSERIES_BUILD='"$(BUILD_STAMP) $(BUILD_GIT)"'
+
 # CXXFLAGS matters here, not just LDFLAGS: OSI_SRC is handed to g++ as source,
 # so it is compiled by this command. Without the defines it would hit
 # osiTypes.h's "#error target endianness not specified" at link time, having
 # already compiled cleanly everywhere else.
-$(TARGET): $(OBJ) $(OSI_SRC)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $(OBJ) $(OSI_SRC)
+$(TARGET): $(OBJ) $(OSI_SRC) build_id.cpp
+	$(CXX) $(CXXFLAGS) $(BUILD_DEFINE) $(INCLUDES) $(LDFLAGS) -o $@ \
+		$(OBJ) $(OSI_SRC) build_id.cpp
 
 install: $(TARGET)
 	install -d $(PREFIX)/lib
