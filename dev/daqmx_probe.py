@@ -57,6 +57,7 @@ def iommu_report():
 
     A blocked transfer logs a DMAR fault, so this looks rather than guesses.
     """
+    import os
     import re
     import subprocess
 
@@ -68,11 +69,52 @@ def iommu_report():
     except OSError:
         cmdline = ""
 
-    on = ("intel_iommu=on" in cmdline) or ("amd_iommu=on" in cmdline)
-    passthrough = "iommu=pt" in cmdline
+    # Do NOT decide this from the kernel command line.
+    #
+    # Debian builds with CONFIG_INTEL_IOMMU_DEFAULT_ON, so the IOMMU is
+    # active on a stock install with nothing added - the rig's line is just
+    # "quiet". Testing for intel_iommu=on therefore misses precisely the
+    # machines that have the problem, which is what the first version of this
+    # check did.
+    #
+    # Ask the kernel what is actually in force instead. Each IOMMU group
+    # publishes its domain type: "DMA" or "DMA-FQ" means addresses are being
+    # translated, "identity" means passthrough and DMA goes straight through.
+    groups_dir = "/sys/kernel/iommu_groups"
+    active = os.path.isdir(groups_dir) and bool(os.listdir(groups_dir))
+
     print(f"  kernel cmdline : {cmdline or '(unreadable)'}")
-    print(f"  IOMMU forced on: {'yes' if on else 'no'}")
-    print(f"  passthrough    : {'yes' if passthrough else 'NO'}")
+    print(f"  IOMMU active   : {'yes' if active else 'no'}"
+          f"{'' if active else '  (so it is not the cause)'}")
+
+    # The NI card's own group is the one that matters.
+    card_group, card_type = None, None
+    pci = "/sys/bus/pci/devices"
+    try:
+        for slot in sorted(os.listdir(pci)):
+            vendor_path = os.path.join(pci, slot, "vendor")
+            if not os.path.exists(vendor_path):
+                continue
+            with open(vendor_path) as f:
+                if f.read().strip() != "0x1093":
+                    continue
+            link = os.path.join(pci, slot, "iommu_group")
+            if os.path.islink(link):
+                card_group = os.path.basename(os.path.realpath(link))
+                try:
+                    with open(os.path.join(groups_dir, card_group, "type")) as f:
+                        card_type = f.read().strip()
+                except OSError:
+                    card_type = "(not reported)"
+                print(f"  NI card        : {slot}, IOMMU group {card_group}")
+                print(f"  group type     : {card_type}"
+                      f"{'   <- translated, DMA goes through the IOMMU' if card_type and card_type.startswith('DMA') else ''}")
+            break
+    except OSError:
+        pass
+
+    passthrough = ("iommu=pt" in cmdline) or (card_type == "identity")
+    on = active and not passthrough
 
     faults = []
     try:
@@ -97,21 +139,27 @@ def iommu_report():
             print("  log nothing. The IOMMU is forced on without passthrough,")
             print("  which is still the leading suspect.")
 
-    if on and not passthrough:
-        print("\n  THE FIX, if this is it:")
+    if on:
+        print("\n  THE FIX, if this is it - add iommu=pt to the EXISTING line,")
+        print("  whatever it already says:")
         print("    sudo nano /etc/default/grub")
-        print("      GRUB_CMDLINE_LINUX_DEFAULT=\"... intel_iommu=on iommu=pt\"")
+        print("      GRUB_CMDLINE_LINUX_DEFAULT=\"quiet iommu=pt\"")
         print("    sudo update-grub && sudo reboot")
         print("")
-        print("  iommu=pt gives host drivers an identity mapping, so NI's DMA")
-        print("  works, while leaving the IOMMU available if the VFIO shim is")
-        print("  ever wanted again. Removing intel_iommu=on entirely would")
-        print("  also work and would close that door.")
-    elif on and passthrough:
-        print("\n  Already in passthrough, so the IOMMU should not be")
-        print("  blocking anything. Look elsewhere.")
+        print("  intel_iommu=on is NOT needed: Debian enables the IOMMU by")
+        print("  default, which is why it is active with nothing on the")
+        print("  command line. iommu=pt gives host drivers an identity")
+        print("  mapping, so NI's DMA goes straight through, while the IOMMU")
+        print("  stays available if the VFIO shim is ever wanted again.")
+        print("")
+        print(f"  Afterwards this should read 'identity' rather than"
+              f" '{card_type}':")
+        print(f"    cat /sys/kernel/iommu_groups/{card_group or '<N>'}/type")
+    elif active and passthrough:
+        print("\n  Already in passthrough, so the IOMMU is not translating")
+        print("  this card's DMA. Look elsewhere.")
     else:
-        print("\n  IOMMU is not forced on, so it is probably not the cause.")
+        print("\n  No IOMMU in force, so it is not the cause.")
 
 
 def main():

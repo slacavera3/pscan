@@ -892,25 +892,47 @@ if have_lib libnidaqmx && [ -z "${PSCAN_FORCE_VFIO:-}" ]; then
     # timed sample reads fine - all programmed I/O - while every buffered
     # acquisition fails with "-50152 A hardware failure has occurred",
     # because that is the one path that needs DMA.
-    if grep -qE 'intel_iommu=on|amd_iommu=on' /proc/cmdline 2>/dev/null && \
-       ! grep -q 'iommu=pt' /proc/cmdline 2>/dev/null; then
-        echo " ->"
-        echo " -> [WARNING] The IOMMU is forced on without passthrough:"
-        echo " ->             $(cat /proc/cmdline 2>/dev/null)"
-        echo " ->"
-        echo " ->           That was for vfio-pci, which is no longer the"
-        echo " ->           path. It blocks NI's DMA, so buffered reads fail"
-        echo " ->           with '-50152 A hardware failure has occurred'"
-        echo " ->           while single samples and analog output work."
-        echo " ->"
-        echo " ->           Add iommu=pt in /etc/default/grub:"
-        echo " ->             GRUB_CMDLINE_LINUX_DEFAULT=\"... intel_iommu=on iommu=pt\""
-        echo " ->             sudo update-grub && sudo reboot"
-        echo " ->"
-        echo " ->           Passthrough gives host drivers an identity"
-        echo " ->           mapping, so NI's DMA works while the IOMMU stays"
-        echo " ->           available if the VFIO shim is ever wanted again."
-    fi
+    # Ask the kernel what is IN FORCE, not what is on the command line.
+    #
+    # Debian builds with CONFIG_INTEL_IOMMU_DEFAULT_ON, so the IOMMU is
+    # active on a stock install with nothing added - the rig's line is just
+    # "quiet". Grepping for intel_iommu=on therefore misses exactly the
+    # machines that have this problem, which the first version of this check
+    # did. Each IOMMU group reports its domain type: DMA/DMA-FQ means
+    # addresses are translated, identity means passthrough.
+    for _grp in /sys/bus/pci/devices/*/iommu_group; do
+        [ -e "$_grp" ] || continue
+        _slot="$(basename "$(dirname "$_grp")")"
+        [ "$(cat "/sys/bus/pci/devices/$_slot/vendor" 2>/dev/null)" = "0x1093" ] \
+            || continue
+
+        _gid="$(basename "$(readlink -f "$_grp")")"
+        _type="$(cat "/sys/kernel/iommu_groups/$_gid/type" 2>/dev/null)"
+
+        case "$_type" in
+            DMA*)
+                echo " ->"
+                echo " -> [WARNING] $_slot is in IOMMU group $_gid, type '$_type'."
+                echo " ->           Its DMA is being translated, and NI's"
+                echo " ->           driver does not use the kernel DMA API the"
+                echo " ->           way the IOMMU expects. Buffered reads then"
+                echo " ->           fail with '-50152 A hardware failure has"
+                echo " ->           occurred' while single samples and analog"
+                echo " ->           output work, because only buffered"
+                echo " ->           acquisition needs DMA."
+                echo " ->"
+                echo " ->           Add iommu=pt to the EXISTING line in"
+                echo " ->           /etc/default/grub - intel_iommu=on is not"
+                echo " ->           needed, Debian enables it by default:"
+                echo " ->             GRUB_CMDLINE_LINUX_DEFAULT=\"quiet iommu=pt\""
+                echo " ->             sudo update-grub && sudo reboot"
+                echo " ->"
+                echo " ->           Then this should read 'identity':"
+                echo " ->             cat /sys/kernel/iommu_groups/$_gid/type"
+                ;;
+        esac
+        break
+    done
 elif [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] && \
    ls /sys/bus/pci/devices/*/vendor >/dev/null 2>&1 && \
    grep -qls '^0x1093$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
