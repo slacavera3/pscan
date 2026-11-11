@@ -50,7 +50,7 @@ def tracked_files():
         path = REPO / name.decode("utf-8", "replace")
         # Vendor drops are not ours, and libs/vendor is build output.
         parts = path.relative_to(REPO).parts
-        if parts[0] == "libs" and len(parts) > 1 and parts[1] != "xseries_shim":
+        if parts[0] == "libs":
             continue
         if path.is_file():
             yield path

@@ -57,7 +57,6 @@ DEFAULT_TERMINAL = 'rse'
 _BACKEND_SPECS = {
     'comedi': ('pscan.a2d_driver', 'NIDriver'),
     'daqmx': ('pscan.daqmx_driver', 'DaqmxDriver'),
-    'nixseries': ('pscan.nixseries_driver', 'NIXSeriesDriver'),
     'phidget': (__name__, 'PhidgetD2A'),
 }
 
@@ -72,9 +71,6 @@ DEFAULT_ADDRESS = {
     'comedi': '/dev/comedi0',
     'phidget': 'phidget0',
     'daqmx': None,
-    # nixseries addresses are PCI slots from /sys/bus/pci/devices, so there is
-    # nothing sensible to default to; its connect() resolves a lone NI card.
-    'nixseries': None,
 }
 
 # Backends registered at runtime rather than shipped in source - currently
@@ -484,14 +480,11 @@ class DAQBackend:
     #: must not slam a mirror or a piezo back through its range. The Phidget
     #: path has always worked this way.
     #:
-    #: False only where the platform takes it away regardless - the X Series
-    #: backend reaches the card through vfio-pci, which resets the device
-    #: when its last file descriptor closes, zeroing the DACs. That is
-    #: deliberate kernel behaviour and cannot be opted out of.
-    #:
-    #: Declared because 'pydaq set' used to tell everyone "the output resets
-    #: as the card closes", which was written for the X Series path and is
-    #: simply untrue under NI-DAQmx, where the voltage stays up.
+    #: Set it False in a backend whose platform takes the voltage away
+    #: regardless of what the driver wants, so 'pydaq set' can say which
+    #: happened. It exists because that command once told everyone "the
+    #: output resets as the card closes" - true for one backend, and a
+    #: dangerous thing to say while a mirror is still being driven.
     outputs_survive_close = True
 
     def _write_ao(self, channel, volts):

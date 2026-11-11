@@ -54,9 +54,9 @@ USEFUL FLAGS
 
 PROPRIETARY SDKs: THE libs/vendor/ DROP-BOX
 
-Two drivers pscan can use cannot be committed here. NI's X Series DDK and
-Tucsen's camera SDK are both free to download but licensed in ways that do not
-permit this public repository to redistribute them.
+One driver pscan uses cannot be committed here: Tucsen's camera SDK is free
+to download but licensed in a way that does not permit this public repository
+to redistribute it.
 
 So install.sh asks. When one is missing it finishes everything that does not
 depend on it, then prints a single block naming every outstanding download,
@@ -65,14 +65,8 @@ its URL, and the exact filename to save:
   =======================================================
    MANUAL STEP: 2 PROPRIETARY DOWNLOAD(S) NEEDED
   =======================================================
-    [1] NI X Series DDK (MHDDK)
-        Needed for : reading the PCIe-6351 without NI-DAQmx
-        Download   : https://www.ni.com/...ni-measurement-hardware-ddk.html
-        Save as    : libs/vendor/nixseries.tar.gz
-
-    [2] Tucsen Dhyana camera SDK
+    [1] Tucsen Dhyana camera SDK
         ...
-
 Drop the files in libs/vendor/ and re-run `bash install.sh`. That directory is
 gitignored, so nothing you put there can be committed.
 
@@ -233,57 +227,37 @@ otherwise:
             in service. Analog in and out.
 
   daqmx     pscan/daqmx_driver.py      (DaqmxDriver)
-            NI-DAQmx. The ONLY way to reach an NI X Series card - comedi's
-            ni_pcimio driver has no X Series support at all, so a PCIe-6351 is
-            invisible to it and always will be. Also drives the M Series cards
-            comedi handles, so a PCIe-6251 is reachable either way. Analog in
-            and out.
+            NI-DAQmx, NI's own supported driver. The way to reach an NI
+            X Series card: comedi's ni_pcimio has no X Series support at
+            all, so a PCIe-6351 is invisible to it and always will be. Also
+            drives the M Series cards comedi handles, so a PCIe-6251 is
+            reachable either way. Analog in and out.
 
-  nixseries pscan/nixseries_driver.py  (NIXSeriesDriver)
-            NI X Series on ANY Linux distribution, via NI's Measurement
-            Hardware Driver Development Kit. This is the route for a
-            PCIe-6351 on Debian, where NI-DAQmx will not install and comedi
-            has no X Series driver. No NI binaries: libs/xseries_shim/ builds
-            the DDK's register-level source into libpscan_xseries.so and this
-            module binds it with ctypes. Requires ROOT, since the card's PCI
-            BARs are mapped directly. Analog in and out.
+            WORKS ON DEBIAN, despite NI supporting only Ubuntu, RHEL and
+            openSUSE. Their packages are .debs and DKMS builds the kernel
+            modules against whatever kernel is present, so install.sh
+            installs them with PSCAN_FORCE_DAQMX=1, pinning NI's apt feed so
+            it cannot replace Debian packages. Verified on Debian 13 with a
+            PCIe-6351: self test passes, analog output holds, and 1000
+            samples at 10 kHz return a proper noise floor.
 
-            NO KERNEL MODULE, NO ROOT, NO BIOS CHANGE. Download the DDK's
-            "Linux (via kernel module)" OS interface, VERSION 2.0 - the only
-            64-bit-capable Linux option NI offers - but only its osiBus.cpp
-            and headers are used. libs/xseries_shim/osiUserCode_vfio.cpp
-            replaces NI's bus layer and reaches the card through vfio-pci.
+            Two things it needs, both handled by install.sh:
 
-            That matters on any machine with Secure Boot, which turns on
-            kernel lockdown. Lockdown blocks mapping a PCI BAR from
-            userspace (EPERM, and root does not override it) and refuses to
-            load unsigned kernel modules - so NI's nirlpk.ko, NI-DAQmx's
-            kernel modules, and a direct sysfs BAR mmap are all dead ends
-            there. vfio-pci is in-tree, signed, and permitted because the
-            IOMMU contains the device's DMA.
+              iommu=pt   Debian enables the IOMMU by default and NI's driver
+                         does not use the kernel DMA API the way address
+                         translation expects. Without passthrough, buffered
+                         acquisition fails with "-50152 A hardware failure
+                         has occurred" while single samples, self test and
+                         analog output all work - only buffered acquisition
+                         uses DMA. install.sh adds it to the kernel command
+                         line, backing up /etc/default/grub first.
 
-            install.sh binds X Series cards to vfio-pci persistently
-            (/etc/modprobe.d) and writes a udev rule giving the 'pscan'
-            group access to /dev/vfio, so running a scan needs no sudo. You
-            must log out and back in once for the group to apply.
-
-            Needs an IOMMU. If /sys/kernel/iommu_groups is empty, add
-            'intel_iommu=on' to GRUB_CMDLINE_LINUX_DEFAULT and update-grub -
-            scriptable, unlike a BIOS visit.
-
-            To use NI's nirlpk.ko instead - the only route to DMA, and only
-            viable without Secure Boot - install with
-            PSCAN_XSERIES_USE_NIRLPK=1.
-
-            Ranges: +/-10V, 5V, 2V, 1V, 500mV, 200mV, 100mV - finer than
-            comedi offers. No DMA, so a finite trace must fit the card's AI
-            FIFO (thousands of samples), and a single channel caps at
-            250 kHz. Neither limit binds at pscan's usual 1000 samples
-            @ 10 kHz.
-
-            NOT YET VERIFIED ON HARDWARE. The shim is written against the
-            DDK's aiex2 and aoex1 examples but has not been compiled or run
-            against a card.
+              MOK        With Secure Boot on, NI's out-of-tree modules must
+                         be signed. DKMS signs them; the key is enrolled
+                         once, at the next boot, on a blue screen. That step
+                         cannot be automated - enrolling a key has to
+                         involve someone physically present, which is what
+                         Secure Boot is for.
 
   phidget   pscan/d2aphidget_driver.py (D2APhidgetDriver)
             The Phidget analog board that has always driven the piezo.

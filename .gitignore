@@ -2,14 +2,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Native build output. install.sh compiles the X Series shim in place, so
-# these land beside their sources in libs/xseries_shim/ - and a 'git add -A'
-# on a rig that has just run the installer will otherwise commit them.
+# Native build output. install.sh compiles vendor sources in place, so these
+# land beside them in libs/ - and a 'git add -A' on a rig that has just run
+# the installer will otherwise commit them.
 *.so
 *.so.*
 *.o
 *.a
-libs/xseries_shim/libpscan_xseries.so*
 *.dat
 *.d
 *.jpg
@@ -26,7 +25,6 @@ context.md
 # Proprietary vendor SDKs. install.sh asks for these by name and URL when they
 # are missing; their licences do not permit this public repository to
 # redistribute them, so nothing in here is ever committed.
-#   - NI X Series DDK (nixseries.tar.gz) + its Linux OS interface
 #   - Tucsen Dhyana camera SDK
 libs/vendor/
 build/

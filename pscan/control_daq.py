@@ -120,55 +120,6 @@ def cmd_read(args):
     return 0
 
 
-def _card_power(session):
-    """The kernel's runtime-PM view of the card, or '?' if it cannot say.
-
-    Only meaningful for a PCI-backed session; the Phidget has no such notion.
-    """
-    address = getattr(session, 'address', None)
-    if address is None:
-        return "?"
-    try:
-        from pscan.nixseries_driver import power_status
-        return power_status(address)
-    except Exception:
-        return "?"
-
-
-def _dump_snapshot(session, channel):
-    """Print the card's state at the moment an output changed by itself.
-
-    Each line carries what it would mean, because a column of hex read a day
-    later tells nobody anything.
-    """
-    snap = getattr(session, 'snapshot', None)
-    if snap is None:
-        return
-    try:
-        s = snap(channel)
-    except RuntimeError as e:
-        print(f"      (snapshot failed: {e})")
-        return
-
-    # A healthy PCIe-6351 reports these two constants. boardBringup printed
-    # 0xC0107AD0 and 0x08050501/0x08050512 on this rig.
-    alive = (s['chinch_signature'] not in (0x0, 0xFFFFFFFF))
-    print(f"      CHInCh signature   0x{s['chinch_signature']:08x}"
-          f"{'' if alive else '   <- card is GONE, not just the output'}")
-    print(f"      STC3 signature     0x{s['stc3_signature']:08x}")
-    # 0xBF is the config bank's reset value, per the DDK's AO.rbm.
-    bank = s['ao_config_bank']
-    print(f"      AO config bank     0x{bank:02x}"
-          f"{'   <- RESET VALUE: the AO subsystem was reset' if bank == 0xBF else '   (still configured)'}")
-    print(f"      AO trigger select  0x{s['ao_trigger_select']:08x}"
-          f"{'   <- non-zero: something re-armed an AO trigger' if s['ao_trigger_select'] else ''}")
-    print(f"      AO FIFO status     0x{s['ao_fifo_status']:08x}"
-          f"{'   <- data queued: the out timer has something to push' if s['ao_fifo_status'] else ''}")
-    print(f"      watchdog state     {s['wdt_state']}, expired "
-          f"{s['wdt_expired_count']} time(s)"
-          f"{'   <- the watchdog DID fire' if s['wdt_expired_count'] else ''}")
-
-
 def cmd_set(args):
     """Hold an output channel at a voltage, absolutely or relatively."""
     session = _open(args, need_ao=True)
@@ -203,60 +154,17 @@ def cmd_set(args):
         return 1
 
     if args.hold:
-        # Keeping the process alive keeps the card open, which is the only
-        # way to hold an output on a VFIO-backed backend: vfio-pci resets
-        # the device when its last file descriptor closes, deliberately, so
-        # a userspace driver cannot leave hardware running unattended. That
-        # reset zeroes the DACs.
-        #
-        # It is also how to MEASURE an output: without it the voltage exists
-        # for the few milliseconds between the write and process exit, which
-        # a handheld meter sees only as a flicker.
+        # Holding the process open is how to MEASURE an output by hand:
+        # without it the voltage exists for the few milliseconds between the
+        # write and process exit, which a handheld meter sees as a flicker.
+        # On a backend whose outputs do not survive the process, it is also
+        # the only way to hold one at all.
         print(f"\n  Holding {target:+.4f} V on ao{args.channel}.")
         print("  Measure it now. Ctrl-C to release.")
 
-        # Poll the card while holding, when it can be asked.
-        #
-        # A meter says what the OUTPUT is doing; this says what the DAC is
-        # doing, and the difference is the whole diagnosis. A shadow that
-        # stays put while the meter falls to zero means the digital side is
-        # holding and the analog stage is not reproducing it. A shadow that
-        # changes on its own means something is still driving the DAC -
-        # an out timer re-arming and updating from an empty FIFO, say -
-        # which is ours to fix and needs no meter at all.
-        watch = getattr(session, 'ao_shadow', None)
-        if watch is not None:
-            print("  Watching the DAC register (it should not change):\n")
-
         try:
-            previous = None
-            elapsed = 0
             while True:
-                if watch is not None:
-                    try:
-                        shadow, expected, _v, agrees = watch(args.channel)
-                    except RuntimeError as e:
-                        print(f"    [{elapsed:4d}s] readback failed: {e}")
-                    else:
-                        if shadow != previous:
-                            note = "as written" if agrees else "CHANGED"
-                            want = "?" if expected is None else f"0x{expected:04x}"
-                            extra = ""
-                            if not agrees:
-                                # Whatever took the output away, say what the
-                                # kernel thinks the card's power state is at
-                                # that exact moment. 'suspended' would mean
-                                # the card was put to sleep under us, which
-                                # looks identical from the register side.
-                                extra = f"  [card {_card_power(session)}]"
-                            print(f"    [{elapsed:4d}s] DAC 0x{shadow:04x} "
-                                  f"(expected {want}) {note}{extra}")
-                            previous = shadow
-
-                            if not agrees:
-                                _dump_snapshot(session, args.channel)
                 time.sleep(1)
-                elapsed += 1
         except KeyboardInterrupt:
             if getattr(session, 'outputs_survive_close', True):
                 print(f"\n  Released. ao{args.channel} STAYS at {target:+.4f} V "
@@ -383,9 +291,9 @@ def build_parser():
                        help="analog output channel (default 0)")
     p_set.add_argument(
         '--hold', action='store_true',
-        help="keep the voltage applied until Ctrl-C. Needed to measure it, "
-             "and on the nixseries backend needed at all: vfio-pci resets "
-             "the card when the process exits, which zeroes the outputs.")
+        help="keep the voltage applied until Ctrl-C. Needed to measure one "
+             "by hand: otherwise it exists only for the moment between the "
+             "write and this command exiting.")
     p_set.set_defaults(func=cmd_set)
 
     return parser

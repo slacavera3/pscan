@@ -49,11 +49,10 @@ def iommu_report():
     so is an on-demand AO write - both work. A buffered acquisition uses DMA,
     and that is the one that fails. The thing that blocks DMA is the IOMMU.
 
-    pscan's own installer is what turned it on: vfio-pci cannot work without
-    an IOMMU, so the VFIO instructions say to add intel_iommu=on. On the
-    DAQmx path that is not merely unnecessary, it is actively in the way -
-    NI's kernel driver does not use the kernel DMA API the way the IOMMU
-    expects, so translation faults the transfer.
+    Debian builds with CONFIG_INTEL_IOMMU_DEFAULT_ON, so this is a stock
+    install's behaviour and nothing pscan did. NI's kernel driver does not use
+    the kernel DMA API the way address translation expects, so the transfer
+    faults.
 
     A blocked transfer logs a DMAR fault, so this looks rather than guesses.
     """

@@ -88,28 +88,6 @@ ldconfig_p() {
     fi
 }
 
-# modinfo is in /sbin too, and this one bit harder than ldconfig did.
-#
-# setup_vfio_binding() opened with 'if ! modinfo vfio-pci'. Run by a normal
-# user that is not "no such module", it is "no such COMMAND" - so the function
-# gave up before writing any configuration, and blamed the kernel for a PATH
-# problem. The card then could not be bound, by install.sh or by hand, and the
-# only visible symptom was a missing /dev/vfio/<group> much later.
-#
-# Returns 127 when modinfo itself cannot be found, which callers must
-# distinguish from "the module is not there".
-modinfo_run() {
-    if command -v modinfo >/dev/null 2>&1; then
-        modinfo "$@" 2>/dev/null
-    elif [ -x /sbin/modinfo ]; then
-        /sbin/modinfo "$@" 2>/dev/null
-    elif [ -x /usr/sbin/modinfo ]; then
-        /usr/sbin/modinfo "$@" 2>/dev/null
-    else
-        return 127
-    fi
-}
-
 have_lib() {
     ldconfig_p | grep -q "$1"
 }
@@ -253,20 +231,6 @@ echo -e "\n[1.7/6] Checking NI-DAQmx..."
 #   PSCAN_FORCE_DAQMX=1   install even with no NI card currently seated
 #   NI_RELEASE=2025Q1     pin the release whose zip is fetched
 
-# Bind NI X Series cards to vfio-pci, persistently, and make /dev/vfio
-# reachable without root.
-#
-# Two pieces, both needed:
-#
-#   modprobe.d  binds any 1093:c4c4 card to vfio-pci at boot. 0xc4c4 is the
-#               generic X Series PCI device id - every 632x/634x/635x/636x/
-#               637x reports it - so this claims X Series cards and nothing
-#               else. comedi cards have different ids and are untouched,
-#               which matters because comedi has no X Series support anyway.
-#
-#   udev        gives the 'pscan' group access to /dev/vfio/*. Without it a
-#               scan needs root, which is a poor thing to require of
-#               everyday use.
 # Hand any NI card back from vfio-pci to whichever driver claims it.
 #
 # Needed because the two owners are exclusive. Once a device is bound to
@@ -416,155 +380,6 @@ ensure_iommu_passthrough() {
     echo " ->   update-grub done."
     IOMMU_NEEDS_REBOOT=1
     IOMMU_GROUP_ID="$gid"
-    return 0
-}
-
-setup_vfio_binding() {
-    echo " -> Setting up vfio-pci binding..."
-
-    modinfo_run vfio-pci >/dev/null
-    local modinfo_rc=$?
-    local can_check_module=1
-    if [ "$modinfo_rc" -eq 127 ]; then
-        # Not a reason to stop: modprobe below settles it for real, and
-        # stopping here is exactly the failure this helper exists to prevent.
-        echo " -> [NOTE] 'modinfo' not found, so the module cannot be checked"
-        echo " ->        in advance. Carrying on - modprobe decides."
-        can_check_module=0
-    elif [ "$modinfo_rc" -ne 0 ]; then
-        echo " -> [WARNING] No vfio-pci module on this kernel. The X Series"
-        echo " ->           card cannot be reached without it."
-        return 1
-    fi
-
-    # Does this kernel's vfio-pci actually take an 'ids' parameter?
-    #
-    # This used to be assumed. If it is wrong, the options file written below
-    # makes EVERY later modprobe fail with "unknown parameter" - including the
-    # one at boot - so the config we wrote to make binding work is what stops
-    # it. The first install still succeeds, because the first modprobe runs
-    # before the file exists, which makes it look like a reboot broke it.
-    local ids_supported=0
-    if [ "$can_check_module" -eq 0 ]; then
-        # Unknown, so write nothing. A wrong 'options' line breaks modprobe at
-        # boot, which is a far worse failure than not auto-binding a card that
-        # gets fitted later - and re-running install.sh fixes that.
-        echo " -> Cannot tell whether 'ids' is supported; not writing"
-        echo " -> /etc/modprobe.d/pscan-vfio.conf. A card fitted later may"
-        echo " -> need 'bash install.sh' re-run to bind."
-    elif modinfo_run -p vfio-pci | grep -q '^ids:'; then
-        ids_supported=1
-    else
-        echo " -> This kernel's vfio-pci has no 'ids' parameter."
-        echo " -> Binding by driver_override instead."
-        sudo rm -f /etc/modprobe.d/pscan-vfio.conf
-    fi
-
-    # NOT silenced. A failure here is the whole story - an unloaded vfio-pci
-    # means driver_override and drivers_probe bind the card to nothing, with
-    # no symptom except a missing /dev/vfio/<group> much later.
-    local modprobe_out
-    if ! modprobe_out="$(sudo modprobe vfio-pci 2>&1)"; then
-        echo " -> [ERROR] 'modprobe vfio-pci' FAILED:"
-        printf ' ->           %s\n' "$modprobe_out"
-        echo " ->"
-        echo " ->           pscan cannot reach an X Series card without it."
-        return 1
-    fi
-
-    # Confirm the driver registered, rather than trusting modprobe's status.
-    if [ ! -d /sys/bus/pci/drivers/vfio-pci ]; then
-        echo " -> [ERROR] vfio-pci loaded but did not register as a PCI"
-        echo " ->         driver (/sys/bus/pci/drivers/vfio-pci is absent)."
-        echo " ->         Nothing can be bound to it."
-        return 1
-    fi
-
-    # An IOMMU is required: it is what makes lockdown willing to allow
-    # userspace device access at all.
-    if [ ! -d /sys/kernel/iommu_groups ] || \
-       [ -z "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]; then
-        echo " -> [WARNING] No IOMMU groups, so vfio-pci cannot be used."
-        echo " ->           Add 'intel_iommu=on' to GRUB_CMDLINE_LINUX_DEFAULT"
-        echo " ->           in /etc/default/grub, run 'sudo update-grub' and"
-        echo " ->           reboot. (VT-d must also be on in firmware, which"
-        echo " ->           it usually is by default.)"
-        return 1
-    fi
-
-    if [ "$ids_supported" -eq 1 ]; then
-        echo 'options vfio-pci ids=1093:c4c4' \
-            | sudo tee /etc/modprobe.d/pscan-vfio.conf >/dev/null
-        echo " -> /etc/modprobe.d/pscan-vfio.conf written."
-    fi
-
-    # modprobe.d only says HOW vfio-pci behaves when something loads it. It
-    # does not load it. Without this second file the binding works until the
-    # first reboot and then silently stops, which is a miserable thing to
-    # debug months later - /dev/vfio/<group> simply is not there, and the
-    # card looks unbound for no visible reason.
-    #
-    # Loading it is enough to bind: the ids= option above goes through
-    # pci_add_dynid(), which attaches the driver to matching devices that are
-    # already present and unbound. No native driver claims an X Series card on
-    # Debian, so it will be unbound and waiting.
-    echo 'vfio-pci' | sudo tee /etc/modules-load.d/pscan-vfio.conf >/dev/null
-    echo " -> /etc/modules-load.d/pscan-vfio.conf written (loads it at boot)."
-
-    sudo groupadd -f pscan 2>/dev/null || true
-    sudo tee /etc/udev/rules.d/99-pscan-vfio.rules >/dev/null <<'UDEV'
-# pscan: let the 'pscan' group reach VFIO devices, so a scan does not need
-# root. Written by install.sh.
-SUBSYSTEM=="vfio", GROUP="pscan", MODE="0660"
-UDEV
-    sudo udevadm control --reload-rules 2>/dev/null || true
-    sudo udevadm trigger --subsystem-match=vfio 2>/dev/null || true
-    echo " -> udev rule written; /dev/vfio is group 'pscan'."
-
-    # Bind any card that is present now, so a reboot is not required.
-    for dev in /sys/bus/pci/devices/*; do
-        [ -f "$dev/vendor" ] || continue
-        [ "$(cat "$dev/vendor" 2>/dev/null)" = "0x1093" ] || continue
-
-        slot="$(basename "$dev")"
-        current="$(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)"
-
-        if [ "$current" = "vfio-pci" ]; then
-            echo " -> $slot already bound to vfio-pci."
-            continue
-        fi
-        if [ -n "$current" ]; then
-            echo " -> $slot is bound to '$current'; leaving it alone."
-            continue
-        fi
-
-        echo vfio-pci | sudo tee "$dev/driver_override" >/dev/null
-        echo "$slot" | sudo tee /sys/bus/pci/drivers_probe >/dev/null
-        now="$(basename "$(readlink "$dev/driver" 2>/dev/null)" 2>/dev/null)"
-        if [ "$now" = "vfio-pci" ]; then
-            echo " -> $slot bound to vfio-pci."
-        else
-            # Said loudly: an unbound card produces no /dev/vfio/<group>, so
-            # the only symptom later is "No such file or directory" on a path
-            # nobody expects to have to create.
-            echo " -> [WARNING] $slot did NOT bind (driver is now"
-            echo " ->           '${now:-none}'). pscan cannot reach the card."
-            echo " ->           Check: /sbin/lsmod | grep vfio_pci"
-        fi
-    done
-
-    # Group membership only takes effect at next login, which is a confusing
-    # thing to discover later rather than now.
-    target_user="${SUDO_USER:-$USER}"
-    if id -nG "$target_user" 2>/dev/null | tr ' ' '\n' | grep -qx pscan; then
-        echo " -> $target_user is already in the 'pscan' group."
-    else
-        sudo usermod -aG pscan "$target_user" 2>/dev/null || true
-        echo " -> Added $target_user to the 'pscan' group."
-        echo " -> [NOTE] LOG OUT AND BACK IN for that to take effect. Until"
-        echo " ->        then pydaq and pscan need sudo for this card."
-        VFIO_NEEDS_RELOGIN=1
-    fi
     return 0
 }
 
@@ -892,240 +707,37 @@ PIN
 
 install_nidaqmx || echo " -> [WARNING] NI-DAQmx setup did not complete; see above."
 
-# --- 1.8 Setup NI X Series DDK (the route to X Series cards on any distro) ---
-echo -e "\n[1.8/6] Checking NI X Series DDK..."
+# --- 1.8 Tidy up after a pre-DAQmx install ---
+echo -e "\n[1.8/6] Checking the NI card is reachable..."
 
-# This is how an NI X Series card (PCIe-635x, e.g. the PCIe-6351) is reached
-# on a distro NI-DAQmx does not support - which is every distro but Ubuntu,
-# RHEL and openSUSE.
+# Undo what a pre-DAQmx install of pscan left behind.
 #
-# NI's MHDDK documents the DAQ-STC3 registers and ships source for them, and
-# NI describes it as the only Linux support they offer for custom drivers. We
-# build its X Series chip objects into a small shared library and bind that
-# with ctypes, exactly as this repo already does for libcomedi, libphidget21
-# and libTUCam.
-#
-# Crucially it needs NO kernel module: the DDK's "LinuxDevMem" OS interface
-# mmaps the card's PCI BARs from userspace, and the aiex2 example shows
-# hardware-timed finite acquisition read straight out of the AI FIFO. DMA is
-# unavailable that way, which does not matter at pscan's data rate - 1000
-# samples at 10 kHz is 20 KB/s.
-#
-# Two downloads, both free but licence-restricted, so neither is vendored.
-# The OS interface arrives under several names depending on which flavour was
-# downloaded. An ARCHIVE is looked for first and a pre-extracted directory
-# only as a fallback, because the two are handled differently below: an
-# archive is unpacked into build/, a directory is used where it sits.
-# Conflating them is what broke this before.
-XSERIES_TARBALL="$(vendor_find 'nixseries*.tar.gz')"
+# Migration, not setup. The X Series shim that needed these was removed once
+# NI-DAQmx was shown to work on Debian, but a machine set up for the shim
+# keeps its vfio-pci binding across upgrades - and a card bound there is
+# invisible to NI's driver. Without this, updating pscan would leave a working
+# driver and an unreachable card.
+release_card_from_vfio
 
-XSERIES_OSI_ARCHIVE="$(vendor_find '*kernelmodule*.tar.gz')"
-[ -n "$XSERIES_OSI_ARCHIVE" ] || XSERIES_OSI_ARCHIVE="$(vendor_find '*osinterface*.tar.gz')"
-[ -n "$XSERIES_OSI_ARCHIVE" ] || XSERIES_OSI_ARCHIVE="$(vendor_find '*nimhddk*.tar.gz')"
-[ -n "$XSERIES_OSI_ARCHIVE" ] || XSERIES_OSI_ARCHIVE="$(vendor_find '*Linux*Kernel*.tar.gz')"
+# The IOMMU half of the same problem. Debian enables the IOMMU by default, so
+# this is not something pscan did, but NI's driver does not use the kernel DMA
+# API the way address translation expects: buffered acquisition then fails
+# with "-50152 A hardware failure has occurred" while single samples, self
+# test and analog output all work, because only buffered acquisition uses DMA.
+for _grp in /sys/bus/pci/devices/*/iommu_group; do
+    [ -e "$_grp" ] || continue
+    _slot="$(basename "$(dirname "$_grp")")"
+    [ "$(cat "/sys/bus/pci/devices/$_slot/vendor" 2>/dev/null)" = "0x1093" ] \
+        || continue
 
-# Only if no archive: a tree the user unpacked themselves, identified by the
-# one header every flavour has.
-XSERIES_OSI_DIR=""
-if [ -z "$XSERIES_OSI_ARCHIVE" ]; then
-    _osi_header="$(vendor_find 'osiBus.h')"
-    [ -n "$_osi_header" ] && XSERIES_OSI_DIR="${_osi_header%/osiBus.h}"
-fi
+    _gid="$(basename "$(readlink -f "$_grp")")"
+    _type="$(cat "/sys/kernel/iommu_groups/$_gid/type" 2>/dev/null)"
 
-XSERIES_OSI="${XSERIES_OSI_ARCHIVE:-$XSERIES_OSI_DIR}"
-
-if [ -z "$XSERIES_TARBALL" ]; then
-    echo " -> X Series DDK source not found; will request it below."
-    request_vendor "NI X Series DDK (MHDDK)" "nixseries.tar.gz" \
-        "https://www.ni.com/en/support/downloads/drivers/download.ni-measurement-hardware-ddk.html" \
-        "reading the PCIe-6351 without NI-DAQmx"
-else
-    echo " -> X Series DDK source found: ${XSERIES_TARBALL#$REPO_ROOT/}"
-fi
-
-if [ -z "$XSERIES_OSI" ]; then
-    echo " -> X Series OS interface not found; will request it below."
-    request_vendor "MHDDK Linux OS interface - 'Linux (via kernel module)' VERSION 2.0" \
-        "osinterface-linux-kernelmodule-v2.tar.gz" \
-        "https://www.ni.com/en/support/downloads/drivers/download.ni-measurement-hardware-ddk.html" \
-        "the DDK's PCI access layer. Take the 64-bit-capable kernel-module flavour: the /dev/mem one is 32-bit only"
-else
-    echo " -> X Series OS interface found: ${XSERIES_OSI#$REPO_ROOT/}"
-fi
-
-# Bind the card FIRST, outside the source-code gate below.
-#
-# This used to live inside that gate, so a missing vendor archive meant the
-# card was never bound to vfio-pci either. Those are unrelated: binding is
-# about whether anything can reach the card at all, and has nothing to do
-# with whether NI's source happens to be on this machine. Conflating them
-# produces the worst kind of failure - an unbound card, no /dev/vfio/<group>,
-# and a message about a DDK tarball that explains none of it.
-#
-# Done whenever an NI card is actually seated, so machines without one are
-# not given a vfio-pci binding they have no use for.
-#
-# AND ONLY WHEN NI-DAQmx IS NOT INSTALLED. The two cannot share a card: a
-# device bound to vfio-pci is invisible to every other driver, so binding it
-# here silently prevents DAQmx from ever seeing it. That is exactly what
-# happened on the rig - DAQmx installed correctly, 'pydaq list' reported the
-# backend available, and it enumerated no devices at all, because vfio-pci
-# still owned the card.
-#
-# DAQmx wins where it exists: it is NI's supported driver and the shim is the
-# fallback for distros that cannot run it. PSCAN_FORCE_VFIO=1 inverts that,
-# for working on the shim deliberately.
-if have_lib libnidaqmx && [ -z "${PSCAN_FORCE_VFIO:-}" ]; then
-    echo " -> NI-DAQmx is installed, so it owns any NI card. Not binding to"
-    echo " -> vfio-pci: a card bound there is invisible to NI's driver."
-    release_card_from_vfio
-
-    # The other half of the same conflict, and far harder to spot.
-    #
-    # vfio-pci cannot work without an IOMMU, so this installer's VFIO
-    # instructions tell people to add intel_iommu=on. On the DAQmx path that
-    # setting is not merely unneeded - it blocks the card's DMA, because NI's
-    # kernel driver does not use the kernel DMA API the way the IOMMU
-    # expects.
-    #
-    # The result is a card that looks half-working in a very confusing way:
-    # a self test passes, an on-demand AO write holds, a single software
-    # timed sample reads fine - all programmed I/O - while every buffered
-    # acquisition fails with "-50152 A hardware failure has occurred",
-    # because that is the one path that needs DMA.
-    # Ask the kernel what is IN FORCE, not what is on the command line.
-    #
-    # Debian builds with CONFIG_INTEL_IOMMU_DEFAULT_ON, so the IOMMU is
-    # active on a stock install with nothing added - the rig's line is just
-    # "quiet". Grepping for intel_iommu=on therefore misses exactly the
-    # machines that have this problem, which the first version of this check
-    # did. Each IOMMU group reports its domain type: DMA/DMA-FQ means
-    # addresses are translated, identity means passthrough.
-    for _grp in /sys/bus/pci/devices/*/iommu_group; do
-        [ -e "$_grp" ] || continue
-        _slot="$(basename "$(dirname "$_grp")")"
-        [ "$(cat "/sys/bus/pci/devices/$_slot/vendor" 2>/dev/null)" = "0x1093" ] \
-            || continue
-
-        _gid="$(basename "$(readlink -f "$_grp")")"
-        _type="$(cat "/sys/kernel/iommu_groups/$_gid/type" 2>/dev/null)"
-
-        case "$_type" in
-            DMA*) ensure_iommu_passthrough || true ;;
-        esac
-        break
-    done
-elif [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] && \
-   ls /sys/bus/pci/devices/*/vendor >/dev/null 2>&1 && \
-   grep -qls '^0x1093$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
-    echo " -> NI card present; using vfio-pci (no kernel module, works"
-    echo " -> under lockdown)."
-    setup_vfio_binding || echo " -> [WARNING] vfio-pci binding did not complete."
-fi
-
-# Build the shim when both halves are present. Extracted into libs/vendor/ so
-# the vendor source and our one file stay visibly separate, and so a re-run
-# rebuilds against whatever was dropped there rather than a stale tree.
-if [ -n "$XSERIES_TARBALL" ] && [ -n "$XSERIES_OSI" ]; then
-    XS_BUILD="$VENDOR_DIR/build"
-    rm -rf "$XS_BUILD"
-    mkdir -p "$XS_BUILD"
-
-    echo " -> Extracting the DDK..."
-    tar -xzf "$XSERIES_TARBALL" -C "$XS_BUILD" || true
-
-    # The tarball may unpack to nixseries/ or straight into the directory.
-    XS_DDK="$(find "$XS_BUILD" -maxdepth 3 -type d -name ChipObjects -print -quit 2>/dev/null)"
-    XS_DDK="${XS_DDK%/ChipObjects}"
-
-    # An archive is unpacked into build/; a directory the user extracted
-    # themselves is used in place and never copied, so nothing here can
-    # delete it.
-    if [ -n "$XSERIES_OSI_ARCHIVE" ]; then
-        echo " -> Extracting the OS interface..."
-        case "$XSERIES_OSI_ARCHIVE" in
-            *.tar.gz|*.tgz) tar -xzf "$XSERIES_OSI_ARCHIVE" -C "$XS_BUILD" || true ;;
-            *.zip)          unzip -q -o "$XSERIES_OSI_ARCHIVE" -d "$XS_BUILD" || true ;;
-        esac
-        XS_OSI="$(find "$XS_BUILD" -maxdepth 4 -name osiBus.h -print -quit 2>/dev/null)"
-        XS_OSI="${XS_OSI%/osiBus.h}"
-    else
-        XS_OSI="$XSERIES_OSI_DIR"
-    fi
-
-    if [ -z "$XS_DDK" ] || [ -z "$XS_OSI" ]; then
-        echo " -> [WARNING] Could not locate the DDK and OS interface after"
-        echo " ->           extraction (looked for ChipObjects/ and osiBus.h)."
-        echo " ->           The X Series backend will be unavailable."
-    else
-        # The kernel-module OS interface needs nirlpk.ko built for the
-        # running kernel and loaded, or acquireBoard() finds no device however
-        # well the shim compiled. NI ships it as BSD-licensed source, so it
-        # builds here rather than coming from a vendor package.
-        XS_NIRLPK="$(find "$XS_BUILD" "$VENDOR_DIR" -maxdepth 5 -type d -name nirlpk -print -quit 2>/dev/null)"
-        # Only when explicitly asked for. The shim reaches the card through
-        # vfio-pci, an in-tree signed driver, so building NI's 2011 nirlpk.ko
-        # against a modern kernel is effort spent on something nothing loads -
-        # and under kernel lockdown it could not be loaded anyway, being
-        # unsigned. PSCAN_XSERIES_USE_NIRLPK=1 builds it and switches the shim
-        # over, which is the route to DMA if that is ever wanted.
-        # The binding itself already happened above, before this gate.
-        if [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ]; then
-            XS_NIRLPK=""
-        fi
-
-        if [ -n "$XS_NIRLPK" ]; then
-            if /sbin/lsmod 2>/dev/null | grep -q '^nirlpk'; then
-                echo " -> nirlpk.ko already loaded."
-            elif [ ! -d "/lib/modules/$(uname -r)/build" ]; then
-                echo " -> [WARNING] Skipping nirlpk.ko: no kernel build tree at"
-                echo " ->           /lib/modules/$(uname -r)/build. Its configure"
-                echo " ->           reports this as 'Unable to find kernel"
-                echo " ->           sources'. See the headers warning in step 1."
-            else
-                echo " -> Building nirlpk.ko for kernel $(uname -r)..."
-                # KERNELDIR is exported as well as passed: the DDK's configure
-                # is 2011-era and reads it from the environment, while its
-                # Makefile may take it as a variable.
-                if KERNELDIR="/lib/modules/$(uname -r)/build" \
-                   make -C "$XS_NIRLPK" KERNELDIR="/lib/modules/$(uname -r)/build" \
-                   && sudo make -C "$XS_NIRLPK" install; then
-                    echo " -> nirlpk.ko installed and loaded."
-                else
-                    echo " -> [WARNING] nirlpk.ko did not build. It is 2011-era"
-                    echo " ->           source against a $(uname -r) kernel, so"
-                    echo " ->           this is the step most likely to need"
-                    echo " ->           patching. It is BSD-licensed, so it can"
-                    echo " ->           be fixed rather than worked around."
-                fi
-            fi
-        fi
-
-        echo " -> Building libpscan_xseries.so..."
-        echo " ->   DDK: ${XS_DDK#$REPO_ROOT/}"
-        echo " ->   OSI: ${XS_OSI#$REPO_ROOT/}"
-        XS_USE_VFIO=1
-        [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] || XS_USE_VFIO=0
-
-        # The SAME variables go to both invocations. Passing them only to the
-        # build left `make install` resolving OSI_DIR to its default, which
-        # pointed at a directory that does not exist - and the define harvest
-        # then ran grep with no file, which reads stdin and hangs make before
-        # it prints anything.
-        XS_MAKEVARS="NIXSERIES_DIR=$XS_DDK OSI_DIR=$XS_OSI USE_VFIO=$XS_USE_VFIO"
-
-        if make -C "$REPO_ROOT/libs/xseries_shim" $XS_MAKEVARS && \
-           sudo make -C "$REPO_ROOT/libs/xseries_shim" $XS_MAKEVARS install; then
-            echo " -> libpscan_xseries.so installed."
-        else
-            echo " -> [WARNING] The X Series shim did not build. The card will"
-            echo " ->           be unreachable; everything else is unaffected."
-            echo " ->           This shim has not yet been compiled anywhere,"
-            echo " ->           so a first-time failure here is expected to"
-            echo " ->           need fixing rather than re-running."
-        fi
-    fi
-fi
+    case "$_type" in
+        DMA*) ensure_iommu_passthrough || true ;;
+    esac
+    break
+done
 
 # --- 2. Setup Tucsen SDK Drivers ---
 echo -e "\n[2/6] Setting up Tucsen Dhyana SDK..."
@@ -1347,12 +959,6 @@ if [ -n "${IOMMU_NEEDS_REBOOT:-}" ]; then
     echo " ***   cat /sys/kernel/iommu_groups/${IOMMU_GROUP_ID:-<N>}/type"
     echo " ***"
     echo " *** /etc/default/grub.pscan-backup is the file as it was."
-fi
-if [ -n "${VFIO_NEEDS_RELOGIN:-}" ]; then
-    echo ""
-    echo " *** LOG OUT AND BACK IN: you were added to the 'pscan' group so"
-    echo " *** the NI X Series card can be used without sudo. Group changes"
-    echo " *** only apply to new logins."
 fi
 # Last, and in full, because it is the one step nobody can guess and the one
 # that cannot be automated: enrolling a key must happen with someone
