@@ -318,6 +318,107 @@ release_card_from_vfio() {
     return 0
 }
 
+# Put the NI card's DMA into IOMMU passthrough, persistently.
+#
+# WHY THIS IS AUTOMATED RATHER THAN DOCUMENTED
+#
+# Debian builds with CONFIG_INTEL_IOMMU_DEFAULT_ON, so a stock install
+# translates every device's DMA. NI's kernel driver does not use the kernel
+# DMA API the way that expects, so buffered acquisition fails with "-50152 A
+# hardware failure has occurred" while single samples and analog output work
+# - only buffered acquisition needs DMA. The card looks half-broken in a way
+# that takes days to attribute.
+#
+# The alternative to doing this here is telling a new user to hand-edit
+# /etc/default/grub, which is far more dangerous than a script that backs the
+# file up, makes one idempotent change, validates the result and rolls back
+# if anything is wrong. Editing boot configuration badly is the one change in
+# this installer that can stop a machine booting; that is an argument for
+# doing it carefully, not for delegating it to someone with nano.
+#
+# PSCAN_NO_GRUB=1 skips it, for sites that manage boot configuration
+# centrally. The warning then says what to add.
+ensure_iommu_passthrough() {
+    local grub=/etc/default/grub
+
+    # Only when this card's own IOMMU group is actually translating.
+    local slot="" gid="" type=""
+    for g in /sys/bus/pci/devices/*/iommu_group; do
+        [ -e "$g" ] || continue
+        slot="$(basename "$(dirname "$g")")"
+        [ "$(cat "/sys/bus/pci/devices/$slot/vendor" 2>/dev/null)" = "0x1093" ] \
+            || { slot=""; continue; }
+        gid="$(basename "$(readlink -f "$g")")"
+        type="$(cat "/sys/kernel/iommu_groups/$gid/type" 2>/dev/null)"
+        break
+    done
+
+    [ -n "$slot" ] || return 0
+    case "$type" in
+        DMA*) ;;
+        *) echo " ->   IOMMU group $gid is '$type' - DMA is not translated."
+           return 0 ;;
+    esac
+
+    echo " ->   $slot is in IOMMU group $gid, type '$type': its DMA is"
+    echo " ->   translated, which breaks NI's buffered acquisition."
+
+    if [ -n "${PSCAN_NO_GRUB:-}" ]; then
+        echo " ->   PSCAN_NO_GRUB is set. Add this yourself and reboot:"
+        echo " ->     GRUB_CMDLINE_LINUX_DEFAULT=\"... iommu=pt\""
+        return 0
+    fi
+
+    if [ ! -f "$grub" ]; then
+        echo " ->   [WARNING] No $grub, so this cannot be set automatically."
+        echo " ->             Add 'iommu=pt' to the kernel command line."
+        return 0
+    fi
+
+    if grep -q 'iommu=pt' "$grub"; then
+        echo " ->   iommu=pt is already in $grub but not in force yet."
+        echo " ->   A REBOOT is needed for it to take effect."
+        IOMMU_NEEDS_REBOOT=1
+        return 0
+    fi
+
+    sudo cp -a "$grub" "$grub.pscan-backup"
+    echo " ->   Backed up $grub to $grub.pscan-backup"
+
+    if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub"; then
+        sudo sed -i -E \
+            's/^(GRUB_CMDLINE_LINUX_DEFAULT=")([^"]*)"/\1\2 iommu=pt"/' "$grub"
+    else
+        echo 'GRUB_CMDLINE_LINUX_DEFAULT="iommu=pt"' | sudo tee -a "$grub" >/dev/null
+    fi
+
+    # Validate by SOURCING it, which is what grub-mkconfig does. A file that
+    # no longer parses, or where the edit did not land, must not reach
+    # update-grub.
+    if ! ( . "$grub" >/dev/null 2>&1 && \
+           case "${GRUB_CMDLINE_LINUX_DEFAULT:-}" in *iommu=pt*) exit 0;; esac
+           exit 1 ); then
+        echo " ->   [ERROR] The edit did not produce a valid $grub. Restoring."
+        sudo cp -a "$grub.pscan-backup" "$grub"
+        echo " ->           Add 'iommu=pt' by hand and reboot."
+        return 1
+    fi
+
+    echo " ->   Set: $(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub")"
+
+    if ! sudo update-grub >/dev/null 2>&1; then
+        echo " ->   [ERROR] update-grub failed. Restoring $grub."
+        sudo cp -a "$grub.pscan-backup" "$grub"
+        sudo update-grub >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    echo " ->   update-grub done."
+    IOMMU_NEEDS_REBOOT=1
+    IOMMU_GROUP_ID="$gid"
+    return 0
+}
+
 setup_vfio_binding() {
     echo " -> Setting up vfio-pci binding..."
 
@@ -910,26 +1011,7 @@ if have_lib libnidaqmx && [ -z "${PSCAN_FORCE_VFIO:-}" ]; then
         _type="$(cat "/sys/kernel/iommu_groups/$_gid/type" 2>/dev/null)"
 
         case "$_type" in
-            DMA*)
-                echo " ->"
-                echo " -> [WARNING] $_slot is in IOMMU group $_gid, type '$_type'."
-                echo " ->           Its DMA is being translated, and NI's"
-                echo " ->           driver does not use the kernel DMA API the"
-                echo " ->           way the IOMMU expects. Buffered reads then"
-                echo " ->           fail with '-50152 A hardware failure has"
-                echo " ->           occurred' while single samples and analog"
-                echo " ->           output work, because only buffered"
-                echo " ->           acquisition needs DMA."
-                echo " ->"
-                echo " ->           Add iommu=pt to the EXISTING line in"
-                echo " ->           /etc/default/grub - intel_iommu=on is not"
-                echo " ->           needed, Debian enables it by default:"
-                echo " ->             GRUB_CMDLINE_LINUX_DEFAULT=\"quiet iommu=pt\""
-                echo " ->             sudo update-grub && sudo reboot"
-                echo " ->"
-                echo " ->           Then this should read 'identity':"
-                echo " ->             cat /sys/kernel/iommu_groups/$_gid/type"
-                ;;
+            DMA*) ensure_iommu_passthrough || true ;;
         esac
         break
     done
@@ -1252,6 +1334,19 @@ if [ -n "${NI_DAQMX_NEEDS_REBOOT:-}" ]; then
     echo " *** REBOOT REQUIRED: NI-DAQmx was installed this run and its"
     echo " *** kernel modules are not loaded yet. No NI X Series card will"
     echo " *** be visible until you reboot."
+fi
+if [ -n "${IOMMU_NEEDS_REBOOT:-}" ]; then
+    echo ""
+    echo " *** REBOOT REQUIRED: 'iommu=pt' was added to the kernel command"
+    echo " *** line so the NI card's DMA is not translated by the IOMMU."
+    echo " *** Until you reboot, buffered acquisition will keep failing with"
+    echo " *** '-50152 A hardware failure has occurred' while single samples"
+    echo " *** and analog output appear to work."
+    echo " ***"
+    echo " *** After rebooting this should read 'identity':"
+    echo " ***   cat /sys/kernel/iommu_groups/${IOMMU_GROUP_ID:-<N>}/type"
+    echo " ***"
+    echo " *** /etc/default/grub.pscan-backup is the file as it was."
 fi
 if [ -n "${VFIO_NEEDS_RELOGIN:-}" ]; then
     echo ""
