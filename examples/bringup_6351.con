@@ -1,28 +1,45 @@
 ## =====================================================================
-## PCIe-6351 bring-up - a2d and d2a through the NI-DAQmx backend
+## PCIe-6351 loopback sweep - NI-DAQmx, analog out into analog in
 ## =====================================================================
 ##
-## A deliberately tiny scan (5 traces, a couple of seconds) for proving a
-## new card end to end before trusting it with a real measurement.
+## Drives ao0 from 0 to +10 V in 1 V steps and reads ai0 at every step.
+## With ao0 wired to ai0 it is self-checking: trace N must read N-1 volts,
+## so a wrong number is obvious without a meter.
 ##
-## BEFORE RUNNING THIS, CHECK WHAT IS WIRED TO ao0. The d2a block below
-## drives a real voltage out of it. If a mirror, piezo or amplifier is
-## connected, confirm -1..+1 V is safe for it, or comment the block out -
-## the a2d half of this file is useful on its own.
+##   >>> WIRE AO 0 TO AI 0 with a BNC cable before running this. <<<
+##
+##   >>> AND CHECK NOTHING ELSE IS ON ao0. This drives a real +10 V. A
+##   >>> galvo, piezo or amplifier may not survive it. If something is
+##   >>> connected, change 'scan' and 'limits' to a safe span first.
+##
+## Without the loopback cable it still runs and still proves the scan
+## mechanics, but ai0 floats and every trace reads near zero.
 ##
 ## Run it in this order:
 ##
-##   pydaq list                 -> does pscan see the card at all?
+##   pydaq list                              does pscan see the card?
 ##   pscan --dry-run examples/bringup_6351.con
-##   pscan --timer  examples/bringup_6351.con
+##   pscan --timer   examples/bringup_6351.con
 ##
-## --timer is the point of this file. It breaks each trace down so you can
-## see what the committed DAQmx task actually costs per coordinate on your
-## kernel, rather than taking an estimate for it.
+## --timer is half the point of this file: it breaks each trace down so
+## you can see what a committed DAQmx task really costs per coordinate on
+## this kernel, instead of taking an estimate for it.
 ##
-## Expected output: bringup_6351_a2d1_1f.d, 5 traces x 1000 samples of
-## float32 volts = 20000 bytes. Reload in MATLAB the same way as any other
-## .d file; the backend makes no difference to the format.
+## Expected output: bringup_6351_a2d1_1f.d
+##   11 coordinates x 1 count x 1000 samples x 4 bytes = 44000 bytes
+##
+## Check it without leaving the shell - the mean of each trace should
+## climb 0, 1, 2 ... 10:
+##
+##   python3 -c "
+##   import numpy as np
+##   d = np.fromfile('bringup_6351_a2d1_1f.d', dtype=np.float32).reshape(-1, 1000)
+##   for i, t in enumerate(d):
+##       print(f'{i:3d}  set {i:5.1f} V   read {t.mean():+8.4f} V   sd {t.std():.5f}')
+##   "
+##
+## Reload in MATLAB exactly as any other .d file. The backend makes no
+## difference to the format.
 
 ## ---------------------------------------------------------------------
 ## One trace per coordinate. Raise this to average at a point.
@@ -32,22 +49,24 @@ count 1
 end
 
 ## ---------------------------------------------------------------------
-## The output axis: sweeps ao0 over -1..+1 V in 0.5 V steps (5 points).
+## The output axis: ao0 over 0..10 V in 1 V steps, 11 points.
 ##
-## 'device Dev1' is whatever 'pydaq list' reported - NI assigns the
-## name, it is not a /dev node. Drop the line to auto-detect, which works
-## as long as only one card can serve the block.
+## 'device Dev1' is whatever 'pydaq list' reported - NI assigns that name,
+## it is not a /dev node. Drop the line to auto-detect, which works as
+## long as only one card can serve the block.
 ##
-## 'settle 0.01' is a guess. A galvo settles in about a millisecond, a
-## piezo in tens. Find the real number by raising it until the trace stops
-## changing, then leave a little margin.
+## 'settle 0.01' is generous here. A DAC settles in microseconds and there
+## is no load on a loopback cable, so this is nearly all margin; it is
+## left visible because a real mirror or piezo needs a real number, found
+## by raising it until the trace stops changing.
 ##
-## 'restore' puts ao0 back to -1 V when the sweep finishes.
+## 'restore' returns ao0 to 0 V when the sweep ends rather than leaving it
+## parked at +10 V. On this backend an output survives the process, so
+## without it the card would still be driving 10 V afterwards.
 ##
-## Axis 98 rather than the default 99 for two reasons: 99 prints as
-## "Z/piezo" in the log, which would be misleading here, and leaving 99
-## free means the real piezo can be added later as the inner axis without
-## renumbering this one.
+## Axis 98, not the default 99: 99 prints as "Z/piezo" in the log, which
+## would be misleading here, and leaving it free means the real piezo can
+## be added later as the inner axis without renumbering this one.
 ## ---------------------------------------------------------------------
 action d2a
 axis 98
@@ -55,8 +74,8 @@ backend daqmx
 device Dev1
 channel 0
 units volts
-scan -1.0 1.0 0.5
-limits -2.0 2.0
+scan 0.0 10.0 1.0
+limits 0.0 10.0
 settle 0.01
 restore
 end
@@ -65,19 +84,20 @@ end
 ## The input: 1000 samples at 10 kHz off ai0, at every coordinate.
 ##
 ## 'v_min'/'v_max' rather than 'range <index>': the volts resolve to the
-## narrowest range the card offers that contains them, and mean the same
-## thing if this config is ever pointed at the old comedi card.
+## narrowest range the card offers that contains them, and still mean the
+## same thing if this config is ever pointed at the old comedi card.
+## 0..10 V resolves to +/-10 V, the only range that holds it.
 ##
-## 'terminal rse' is single-ended against ground. Use 'diff' if the
-## photodiode is wired differentially - on a 6351 that halves the usable
-## channel count, ai0 pairing with ai8.
+## 'terminal rse' is single-ended against ground, which is what a BNC
+## loopback gives you. Use 'diff' for a differentially wired photodiode -
+## on a 6351 that halves the channel count, ai0 pairing with ai8.
 ## ---------------------------------------------------------------------
 action a2d
 channel 0
 backend daqmx
 device Dev1
-v_min -1.0
-v_max 1.0
+v_min 0.0
+v_max 10.0
 terminal rse
 sample_rate 10000
 n_samples 1000
