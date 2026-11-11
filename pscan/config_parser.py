@@ -414,6 +414,83 @@ def _synthetic_count(n):
             'children': [], 'line': 0}
 
 
+def plan_trace_blocks(plan):
+    """The action blocks that make up ONE trace.
+
+    The leaf body - the innermost run of actions, with no loop among them.
+    For a flat config this is exactly the acquisition pipeline, which is what
+    main() has always run at each coordinate.
+
+    Returns the first leaf body found. validate_nesting() has already refused
+    configs whose recording blocks sit at more than one depth, so there is
+    only one for any config that gets this far.
+    """
+    loops = [s for s in plan if s['kind'] == 'loop']
+    if not loops:
+        return [s['block'] for s in plan]
+
+    for step in plan:
+        if step['kind'] == 'loop':
+            found = plan_trace_blocks(step['body'])
+            if found:
+                return found
+    return []
+
+
+def plan_sections(plan):
+    """(setup, teardown) - the action blocks outside the grid entirely.
+
+    Only the top level: a block before the first loop runs once before
+    anything moves, and one after the last runs once when the grid is
+    finished. Actions beside an INNER loop are neither - they belong to the
+    scan, running once per iteration of whatever encloses them, and
+    walk_plan() runs them in place.
+    """
+    loop_positions = [i for i, s in enumerate(plan) if s['kind'] == 'loop']
+    if not loop_positions:
+        return [], []
+
+    first, last = loop_positions[0], loop_positions[-1]
+    setup = [s['block'] for s in plan[:first] if s['kind'] == 'action']
+    teardown = [s['block'] for s in plan[last + 1:] if s['kind'] == 'action']
+    return setup, teardown
+
+
+def plan_action_blocks(plan):
+    """Every action block in the plan, in document order.
+
+    What main() opens cards and configures cameras from: anything that might
+    run needs its hardware ready, wherever in the nest it sits.
+    """
+    out = []
+    for step in plan:
+        if step['kind'] == 'loop':
+            out.extend(plan_action_blocks(step['body']))
+        else:
+            out.append(step['block'])
+    return out
+
+
+def plan_axis_id(block):
+    """The axis id a block names, for looking up its compiled parameters."""
+    return _flat_axis_id(block)
+
+
+def plan_repeats(plan):
+    """Total repeats the count loops ask for, for the dry-run summary.
+
+    The product, because nested counts multiply. 1 when there are none.
+    """
+    total = 1
+    for step in plan:
+        if step['kind'] != 'loop':
+            continue
+        if step.get('repeats') is not None:
+            total *= step['repeats']
+        total *= plan_repeats(step['body'])
+    return total
+
+
 def plan_total_traces(plan, axis_size):
     """How many traces a plan will take.
 

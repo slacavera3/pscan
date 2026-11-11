@@ -99,9 +99,11 @@ writer_thread.start()
 
 # Cross-platform module imports
 from pscan.config_parser import (
-    parse_flat_con_file, categorize_pipeline,
+    parse_con_tree, flatten_tree, validate_nesting, build_plan,
+    plan_sections, plan_trace_blocks, plan_action_blocks, plan_total_traces,
+    plan_axis_id, plan_repeats, categorize_pipeline,
     compile_pipeline_list, compile_stage_parameters,
-    validate_blocks, CORE_TYPES, APT_AXES, PIEZO_AXIS
+    validate_blocks, AXIS_TYPES, LOOP_TYPES, CORE_TYPES, APT_AXES, PIEZO_AXIS
 )
 from pscan import daq
 
@@ -1004,18 +1006,44 @@ def main():
     base_filename = original_base
     
     try:
-        all_blocks = parse_flat_con_file(con_filepath)
+        # Read as a tree, so a nested config means what it is written to
+        # mean. A flat one produces a tree one level deep and is unaffected.
+        roots = parse_con_tree(con_filepath)
+        all_blocks = flatten_tree(roots)
 
         # Everything checkable is checked here, before a single device opens.
         config_warnings = validate_blocks(all_blocks)
+        validate_nesting(roots)      # no-op unless the config nests
 
-        stages_str, count_val, r_set, r_acq, r_tear = categorize_pipeline(all_blocks)
+        # What runs, in what order. For a flat config this is the nest it has
+        # always implied - axes lowest id outermost, count innermost - so
+        # there is one path through the scan rather than a nested one bolted
+        # beside a flat one.
+        plan = build_plan(roots)
+
+        r_set, r_tear = plan_sections(plan)
+        r_acq = plan_trace_blocks(plan)
+        stages_str = [b for b in all_blocks if b['type'] in AXIS_TYPES]
 
         a2d_global_counter = [1]
         stage_params = compile_stage_parameters(stages_str)
-        setup_pipeline = compile_pipeline_list(r_set, a2d_global_counter)
-        acquisition_pipeline = compile_pipeline_list(r_acq, a2d_global_counter)
-        teardown_pipeline = compile_pipeline_list(r_tear, a2d_global_counter)
+
+        # Compiled in document order so a2d block numbering - which names the
+        # output files - is what it was. One block at a time rather than per
+        # section, because the plan knows the order and the sections do not
+        # have to be contiguous once nesting is allowed.
+        compiled_of = {}
+        for block in plan_action_blocks(plan):
+            built = compile_pipeline_list([block], a2d_global_counter)
+            if built:
+                compiled_of[id(block)] = built[0]
+
+        def compiled_list(blocks):
+            return [compiled_of[id(b)] for b in blocks if id(b) in compiled_of]
+
+        setup_pipeline = compiled_list(r_set)
+        acquisition_pipeline = compiled_list(r_acq)
+        teardown_pipeline = compiled_list(r_tear)
     except ValueError as e:
         print(f"\n[CONFIG ERROR] in '{con_filepath}': {e}")
         sys.exit(1)
@@ -1024,7 +1052,24 @@ def main():
     # is no longer a fixed set of three slots that an undeclared axis has to
     # occupy with a placeholder step.
     total_a2d_blocks = sum(1 for act in acquisition_pipeline if act['type'] == 'a2d')
-    global_total_traces = axis_grid_size(stage_params) * count_val
+
+    # From the plan rather than axis_grid_size(stage_params) * count_val.
+    # The two agree for a flat config - asserted in tests/test_plan_walk.py -
+    # but only the plan can answer it once count may sit anywhere in the nest.
+    _axis_positions = {
+        axis_id: len(params['positions'])
+        for axis_id, params in stage_params.items()
+        if params.get('positions')
+    }
+
+    def _axis_size(block):
+        return _axis_positions.get(plan_axis_id(block), 1)
+
+    global_total_traces = plan_total_traces(plan, _axis_size)
+
+    # Only for the dry-run summary now. The scan itself takes its repeats
+    # from the plan, where a nested config may put count at any depth.
+    count_val = plan_repeats(plan)
 
 
     scope_ip = next((act['params']['ip'] for act in acquisition_pipeline if act['type'] == 'scope'), None)
@@ -1170,50 +1215,76 @@ def main():
         master_trace_idx = 0
         pending = PendingSettle()
 
-        def acquire_here():
-            """Everything that happens at one coordinate.
+        axis_of_id = {ax.axis_id: ax for ax in axes}
 
-            Called by walk_axes() at the innermost level, after every
-            commanded move has arrived.
+        def axis_for(block):
+            """The axis object a loop step drives."""
+            return axis_of_id[plan_axis_id(block)]
+
+        def acquire_here(blocks):
+            """One trace: everything that happens at one coordinate.
+
+            Called by walk_plan() at the leaf, after every commanded move has
+            arrived. The repeat loop that used to be here is gone - count is
+            a level of the nest now, so this runs once per trace rather than
+            count times per coordinate.
             """
             nonlocal master_trace_idx
 
-            # The first coordinate gets extra time for everything to stabilise,
-            # but only if something actually moved to get there.
+            # The first coordinate gets extra time for everything to
+            # stabilise, but only if something actually moved to get there.
             moved = any(ax.current is not None for ax in axes)
             if moved and master_trace_idx == 0:
                 time.sleep(INITIAL_SETTLE_S)
 
-            for _ in range(count_val):
-                if timer_mode:
-                    t_trace_start = time.perf_counter()
+            if timer_mode:
+                t_trace_start = time.perf_counter()
 
-                call_state['current_trace_idx'] = master_trace_idx
+            call_state['current_trace_idx'] = master_trace_idx
 
-                print(
-                    f" -> Pos: {format_position_line(axes)} "
-                    f"| Trace {master_trace_idx + 1}/{global_total_traces}..."
-                )
+            print(
+                f" -> Pos: {format_position_line(axes)} "
+                f"| Trace {master_trace_idx + 1}/{global_total_traces}..."
+            )
 
-                run_pipeline_sequence(
-                    acquisition_pipeline, scope, ixon, tucsen, base_filename,
-                    total_a2d_blocks, global_total_traces, call_state,
-                    silent_acq=True, timer_mode=timer_mode
-                )
+            run_pipeline_sequence(
+                compiled_list(blocks), scope, ixon, tucsen, base_filename,
+                total_a2d_blocks, global_total_traces, call_state,
+                silent_acq=True, timer_mode=timer_mode
+            )
 
-                if timer_mode:
-                    t_trace_end = time.perf_counter()
-                    print(f"      [Timer] Total trace time: {t_trace_end - t_trace_start:.4f}s\n")
+            if timer_mode:
+                t_trace_end = time.perf_counter()
+                print(f"      [Timer] Total trace time: {t_trace_end - t_trace_start:.4f}s\n")
 
-                master_trace_idx += 1
+            master_trace_idx += 1
 
-        # One nest over however many axes the config declared, innermost last.
-        # Restores happen inside the walk, at the end of each axis's own loop,
-        # which is where the hardcoded version put them.
-        if axes:
-            walk_axes(axes, 0, pending, acquire_here)
+        def run_statement(block):
+            """An action beside a loop: runs in place, is not a trace.
+
+            A flat config's setup and teardown reach walk_plan() this way,
+            and so does anything a nested config puts between rows.
+            """
+            run_pipeline_sequence(
+                compiled_list([block]), scope, ixon, tucsen, base_filename,
+                total_a2d_blocks, global_total_traces, call_state,
+                timer_mode=timer_mode
+            )
+
+        # The grid only: the loops at the top of the plan.
+        #
+        # Setup and teardown are run above and below with their own headings,
+        # as they always have been, so they are deliberately NOT handed to
+        # walk_plan - it would run them a second time. Actions nested INSIDE
+        # a loop are a different matter and do belong to the walk, which is
+        # what run_statement() is for.
+        grid = [step for step in plan if step['kind'] == 'loop']
+
+        if grid:
+            walk_plan(grid, pending, axis_for, acquire_here, run_statement)
         else:
-            acquire_here()
+            # No axis declared: one coordinate, nothing moves.
+            acquire_here(plan_trace_blocks(plan))
 
         if teardown_pipeline:
             print("\nExecuting Post-Scan Teardown Commands...")
