@@ -17,7 +17,7 @@ grid runs with no stage, no card and no driver.
 
 import unittest
 
-from pscan.config_parser import build_plan, parse_con_tree
+from pscan.config_parser import build_plan, parse_con_tree, plan_total_traces
 from pscan.main import PendingSettle, walk_axes, walk_plan
 
 
@@ -328,6 +328,190 @@ class TestNestedConfigsReachTheirLeaves(unittest.TestCase):
 
         self.assertEqual(outer.count("TRACE"), inner.count("TRACE"))
         self.assertNotEqual(outer, inner)
+
+
+class TestPredictedTraceCountMatchesReality(unittest.TestCase):
+    """The number reported before a scan must be the number it takes.
+
+    plan_total_traces() mirrors walk_plan() branch for branch, so these check
+    the two against each other rather than trusting the mirror. A progress
+    count that drifts from reality is how a short run looks finished - and
+    it is also what every output file's expected length is computed from.
+    """
+
+    def check(self, text, sizes):
+        from tempfile import TemporaryDirectory
+        import re
+
+        log = []
+        axes = {i: RecordingAxis(i, list(range(n)), log)
+                for i, n in sizes.items()}
+
+        with TemporaryDirectory() as tmp:
+            plan = build_plan(parse_con_tree(con(tmp, text)))
+
+        def axis_id(block):
+            return int(re.search(r'^axis\s+(\d+)', block['body'],
+                                 re.M).group(1))
+
+        predicted = plan_total_traces(plan,
+                                      lambda b: len(axes[axis_id(b)].positions))
+
+        walk_plan(plan, PendingSettle(),
+                  lambda b: axes[axis_id(b)],
+                  lambda blocks: log.append("TRACE"))
+
+        actual = log.count("TRACE")
+        self.assertEqual(predicted, actual,
+                         f"predicted {predicted}, walked {actual}")
+        return actual
+
+    def test_flat_one_axis(self):
+        self.assertEqual(self.check("""
+            action d2a
+            axis 98
+            scan 0 4 1
+            end
+            action a2d
+            channel 0
+            end
+        """, {98: 5}), 5)
+
+    def test_flat_two_axes_with_count(self):
+        self.assertEqual(self.check("""
+            action count
+            count 3
+            end
+            action d2a
+            axis 98
+            scan 0 4 1
+            end
+            action d2a
+            axis 99
+            scan 0 1 1
+            end
+            action a2d
+            channel 0
+            end
+        """, {98: 5, 99: 2}), 30)
+
+    def test_nested_count_outermost(self):
+        self.assertEqual(self.check("""
+            action count
+            count 3
+              action d2a
+              axis 98
+              scan 0 4 1
+                action a2d
+                channel 0
+                end
+              end
+            end
+        """, {98: 5}), 15)
+
+    def test_nested_count_innermost(self):
+        self.assertEqual(self.check("""
+            action d2a
+            axis 98
+            scan 0 4 1
+              action count
+              count 3
+                action a2d
+                channel 0
+                end
+              end
+            end
+        """, {98: 5}), 15)
+
+    def test_nested_three_deep(self):
+        self.assertEqual(self.check("""
+            action d2a
+            axis 97
+            scan 0 2 1
+              action d2a
+              axis 98
+              scan 0 1 1
+                action count
+                count 4
+                  action a2d
+                  channel 0
+                  end
+                end
+              end
+            end
+        """, {97: 3, 98: 2}), 24)
+
+    def test_it_agrees_with_the_formula_main_uses_today(self):
+        """main() computes axis_grid_size(stage_params) * count_val.
+
+        The switch to plans replaces that formula, so for a flat config the
+        two must give the same answer - it is what every output file's
+        expected length and the progress display are built from.
+        """
+        from tempfile import TemporaryDirectory
+        import re
+        from pscan.config_parser import (categorize_pipeline,
+                                         compile_stage_parameters,
+                                         parse_flat_con_file)
+        from pscan.main import axis_grid_size
+
+        configs = [
+            ("""
+                action d2a
+                axis 98
+                scan 0 4 1
+                end
+                action a2d
+                channel 0
+                end
+            """, 1),
+            ("""
+                action count
+                count 3
+                end
+                action d2a
+                axis 98
+                scan 0 4 1
+                end
+                action d2a
+                axis 99
+                scan 0 1 1
+                end
+                action a2d
+                channel 0
+                end
+            """, 3),
+        ]
+
+        for text, _ in configs:
+            with TemporaryDirectory() as tmp:
+                path = con(tmp, text)
+                blocks = parse_flat_con_file(path)
+                stages, count_val, _s, _a, _t = categorize_pipeline(blocks)
+                stage_params = compile_stage_parameters(stages)
+                old = axis_grid_size(stage_params) * count_val
+
+                plan = build_plan(parse_con_tree(path))
+                sizes = {axis_id: len(p['positions'])
+                         for axis_id, p in stage_params.items()}
+                new = plan_total_traces(
+                    plan,
+                    lambda b: sizes[int(re.search(r'^axis\s+(\d+)',
+                                                  b['body'], re.M).group(1))],
+                )
+
+            with self.subTest(expected=old):
+                self.assertEqual(new, old)
+
+    def test_no_axis_at_all_is_one_trace(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            plan = build_plan(parse_con_tree(con(tmp, """
+                action a2d
+                channel 0
+                end
+            """)))
+        self.assertEqual(plan_total_traces(plan, lambda b: 0), 1)
 
 
 if __name__ == "__main__":

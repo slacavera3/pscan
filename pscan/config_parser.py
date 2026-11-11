@@ -414,6 +414,37 @@ def _synthetic_count(n):
             'children': [], 'line': 0}
 
 
+def plan_total_traces(plan, axis_size):
+    """How many traces a plan will take.
+
+    `axis_size(block)` gives an axis block's number of positions; a count
+    step carries its own repeats.
+
+    Mirrors walk_plan() deliberately, branch for branch: a body with no loops
+    in it is one trace, an action beside a loop is one trace, and a loop
+    multiplies whatever is inside it. Written that way because the number
+    reported before a scan starts and the number actually taken have to
+    agree - a progress count that drifts from reality is how a short run
+    looks finished. tests/test_plan_walk.py checks the two against each other
+    rather than trusting the mirror.
+    """
+    loops = [s for s in plan if s['kind'] == 'loop']
+
+    if not loops:
+        return 1 if plan else 0
+
+    total = 0
+    for step in plan:
+        if step['kind'] == 'loop':
+            n = step.get('repeats')
+            if n is None:
+                n = axis_size(step['block'])
+            total += n * plan_total_traces(step['body'], axis_size)
+        else:
+            total += 1
+    return total
+
+
 def plan_order(plan, iterations=None):
     """The step types a plan visits, in order, as flat text. For tests.
 
