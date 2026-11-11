@@ -23,10 +23,12 @@ from tempfile import TemporaryDirectory
 from pscan.config_parser import (
     DATA_TYPES,
     LOOP_TYPES,
+    build_plan,
     flatten_tree,
     has_nesting,
     parse_con_tree,
     parse_flat_con_file,
+    plan_order,
     validate_nesting,
 )
 
@@ -383,6 +385,168 @@ class TestNestingValidation(unittest.TestCase):
         self.assertIn('d2a', LOOP_TYPES)
         self.assertNotIn('a2d', LOOP_TYPES)
         self.assertIn('a2d', DATA_TYPES)
+
+
+class TestFlatPlansKeepTodaysOrder(unittest.TestCase):
+    """A flat config must run exactly as it runs now.
+
+    build_plan() synthesises the same nest a flat file has always implied -
+    axes lowest id outermost, count innermost, acquisition at the leaf - so
+    one executor can serve both shapes. These assert the ORDER directly,
+    because a nest that is structurally right and runs in the wrong sequence
+    is the failure this change could most easily introduce.
+    """
+
+    def order(self, text, iterations=2):
+        with TemporaryDirectory() as tmp:
+            roots = parse_con_tree(write(tmp, text))
+            return plan_order(build_plan(roots), iterations=iterations)
+
+    def test_axis_ids_decide_nesting_lowest_outermost(self):
+        # Written 99 first, but 98 must still be the OUTER loop.
+        order = self.order("""
+            action d2a
+            axis 99
+            scan 0 1 1
+            end
+            action d2a
+            axis 98
+            scan 0 1 1
+            end
+            action a2d
+            channel 0
+            end
+        """)
+        # The first loop entered is the outer one. Strip indentation to read
+        # the nesting: outer appears once per its own iteration.
+        self.assertEqual(order[0], "d2a[0]")
+        self.assertEqual(order[1], "  d2a[0]")
+        self.assertEqual(order[2], "    a2d")
+
+    def test_count_is_innermost_in_a_flat_config(self):
+        order = self.order("""
+            action count
+            count 2
+            end
+            action d2a
+            axis 98
+            scan 0 1 1
+            end
+            action a2d
+            channel 0
+            end
+        """)
+        self.assertEqual(order[0], "d2a[0]")
+        self.assertEqual(order[1], "  count[0]")
+        self.assertEqual(order[2], "    a2d")
+
+    def test_count_of_one_adds_no_loop(self):
+        """Today a count of 1 is not a loop at all; it must not become one."""
+        order = self.order("""
+            action count
+            count 1
+            end
+            action d2a
+            axis 98
+            scan 0 1 1
+            end
+            action a2d
+            channel 0
+            end
+        """)
+        self.assertNotIn("count[0]", [line.strip() for line in order])
+
+    def test_an_axis_restores_after_its_enclosing_iteration(self):
+        order = self.order("""
+            action d2a
+            axis 98
+            scan 0 1 1
+            end
+            action d2a
+            axis 99
+            scan 0 1 1
+            end
+            action a2d
+            channel 0
+            end
+        """)
+        stripped = [line.strip() for line in order]
+        # The inner axis restores once per outer iteration, not once overall.
+        self.assertEqual(stripped.count("d2a restore"), 3,
+                         "inner restores twice, outer once")
+
+    def test_the_repos_own_bringup_file(self):
+        path = REPO / "examples" / "bringup_6351.con"
+        order = plan_order(build_plan(parse_con_tree(str(path))), iterations=2)
+        self.assertEqual(order,
+                         ["d2a[0]", "  a2d", "d2a[1]", "  a2d", "d2a restore"])
+
+
+class TestNestingChangesTheExperiment(unittest.TestCase):
+    """The point of the whole change: where count sits is what it means."""
+
+    def order(self, text):
+        with TemporaryDirectory() as tmp:
+            roots = parse_con_tree(write(tmp, text))
+            validate_nesting(roots)
+            return plan_order(build_plan(roots), iterations=2)
+
+    OUTER = """
+        action count
+        count 2
+          action d2a
+          axis 98
+          scan 0 1 1
+            action a2d
+            channel 0
+            end
+          end
+        end
+    """
+
+    INNER = """
+        action d2a
+        axis 98
+        scan 0 1 1
+          action count
+          count 2
+            action a2d
+            channel 0
+            end
+          end
+        end
+    """
+
+    def test_count_outside_repeats_the_whole_sweep(self):
+        order = self.order(self.OUTER)
+        self.assertEqual(order[0], "count[0]")
+        self.assertEqual(order[1], "  d2a[0]")
+        self.assertEqual(order[2], "    a2d")
+
+    def test_count_inside_averages_each_point(self):
+        order = self.order(self.INNER)
+        self.assertEqual(order[0], "d2a[0]")
+        self.assertEqual(order[1], "  count[0]")
+        self.assertEqual(order[2], "    a2d")
+
+    def test_same_blocks_different_nesting_different_order(self):
+        """Identical block types, identical counts - different experiment."""
+        outer, inner = self.order(self.OUTER), self.order(self.INNER)
+        self.assertEqual(
+            sorted({line.strip().split('[')[0] for line in outer}),
+            sorted({line.strip().split('[')[0] for line in inner}),
+            "the two configs use the same block types",
+        )
+        self.assertNotEqual(outer, inner,
+                            "but must not run in the same order")
+
+    def test_acquisition_count_is_the_same_either_way(self):
+        """Both take 4 traces; only the order they are taken in differs."""
+        for text in (self.OUTER, self.INNER):
+            with self.subTest(config=text.split()[1]):
+                order = self.order(text)
+                self.assertEqual(
+                    sum(1 for line in order if line.strip() == "a2d"), 4)
 
 
 if __name__ == "__main__":

@@ -312,6 +312,131 @@ def _describe(block):
     return f"'action {block['type']}' on line {block['line']}"
 
 
+def _flat_axis_id(block):
+    """The axis id a block claims, for ordering a FLAT config.
+
+    Only used to reproduce the existing rule - lowest id outermost - when a
+    config does not nest. A nested config says the order itself and never
+    comes here.
+    """
+    if block['type'] == 'd2a_phidget':
+        return PIEZO_AXIS
+    match = _field(block['body'], 'axis', r'(\d+)')
+    if match:
+        return int(match.group(1))
+    return DEFAULT_D2A_AXIS
+
+
+def build_plan(roots):
+    """What runs, in what order, as plain data.
+
+    A plan is a list of steps, each either
+
+        {'kind': 'loop',   'block': b, 'body': [steps...]}
+        {'kind': 'action', 'block': b}
+
+    which is small enough to read, general enough for both shapes of config,
+    and - the point - pure data. main.py walks it; nothing here opens
+    hardware, so the ordering can be tested on any machine. That matters
+    because ordering is the risky part of this change and main.py cannot be
+    imported without the instrument stack.
+
+    A NESTED config translates directly: a loop block becomes a loop step
+    whose body is its children.
+
+    A FLAT config is SYNTHESISED into the same shape, reproducing exactly
+    what it does today - setup actions, then the axes lowest id outermost,
+    then count, then the acquisition actions at the leaf, then teardown. One
+    executor then serves both, rather than a nested path bolted beside a flat
+    one.
+    """
+    if has_nesting(roots):
+        return _plan_from_tree(roots)
+    return _plan_from_flat(roots)
+
+
+def _plan_from_tree(blocks):
+    plan = []
+    for block in blocks:
+        if block['type'] in LOOP_TYPES:
+            plan.append({'kind': 'loop', 'block': block,
+                         'body': _plan_from_tree(block['children'])})
+        else:
+            plan.append({'kind': 'action', 'block': block})
+    return plan
+
+
+def _plan_from_flat(blocks):
+    stages, count_val, setup_pipe, acq_pipe, tear_pipe = \
+        categorize_pipeline(blocks)
+
+    # Lowest axis id outermost, which is the rule flat configs have always
+    # been read by and the reason the piezo's 99 stays innermost.
+    stages = sorted(stages, key=_flat_axis_id)
+
+    # Innermost first, wrapping outwards.
+    #
+    # count goes inside every axis because that is where it has always
+    # effectively been: the old loop took `count` traces at each coordinate,
+    # which is the same thing as an innermost loop of repetitions. Making it
+    # a step rather than a special case is what lets one executor serve both
+    # shapes.
+    body = [{'kind': 'action', 'block': b} for b in acq_pipe]
+
+    if count_val != 1:
+        body = [{'kind': 'loop', 'block': _synthetic_count(count_val),
+                 'body': body}]
+
+    for block in reversed(stages):
+        body = [{'kind': 'loop', 'block': block, 'body': body}]
+
+    return ([{'kind': 'action', 'block': b} for b in setup_pipe]
+            + body
+            + [{'kind': 'action', 'block': b} for b in tear_pipe])
+
+
+def _synthetic_count(n):
+    """A count block for a flat config, which states count once globally.
+
+    Given the same shape as a parsed one so the executor cannot tell them
+    apart, and line 0 to mark it as not written by anyone.
+    """
+    return {'type': 'count', 'body': f"action count\ncount {n}\nend",
+            'children': [], 'line': 0}
+
+
+def plan_order(plan, iterations=None):
+    """The step types a plan visits, in order, as flat text. For tests.
+
+    `iterations` caps how many times each loop repeats so the sequence stays
+    readable; the real count comes from the block when a scan runs.
+
+    Exists so the executed ORDER can be asserted directly, rather than
+    inferred from structure. A nest that looks right and runs in the wrong
+    order is the failure this change could most easily introduce.
+    """
+    events = []
+
+    def walk(steps, depth):
+        for step in steps:
+            block = step['block']
+            if step['kind'] == 'loop':
+                n = iterations if iterations is not None else 2
+                for i in range(n):
+                    events.append(f"{'  ' * depth}{block['type']}[{i}]")
+                    walk(step['body'], depth + 1)
+                # Only an axis restores. A count moves nothing, so it has
+                # nothing to put back - and showing one would misrepresent
+                # what the executor does.
+                if block['type'] in AXIS_TYPES:
+                    events.append(f"{'  ' * depth}{block['type']} restore")
+            else:
+                events.append(f"{'  ' * depth}{block['type']}")
+
+    walk(plan, 0)
+    return events
+
+
 def validate_nesting(roots):
     """Check a nested config says something a scan can actually run.
 
