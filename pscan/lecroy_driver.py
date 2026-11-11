@@ -58,17 +58,6 @@ class LeCroyScope:
 
             # THE FIX: Force the scope to send all points (NP=0)
             # with zero sparsing (SP=0) starting at index 0 (FP=0)
-            #
-            # IT CHANGES THE DATA, so a .dat from before this is not
-            # comparable to one after it. Without this line the scope applies
-            # whatever WFSU settings it is holding, and a scope left sparsing
-            # by 2 returns every other sample: measured on the rigs as 2501
-            # points per trace against 5001 for the same timebase, and a .dat
-            # of exactly half the size.
-            #
-            # Analysis that reads scp.points_per_trace from the .m file
-            # adapts on its own. Anything that hardcodes a point count does
-            # not, and will be silently wrong on one side of August 2026.
             self.instr.write("WFSU SP,0,NP,0,FP,0,SN,0")
 
     def disconnect(self):
