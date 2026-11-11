@@ -878,6 +878,39 @@ if have_lib libnidaqmx && [ -z "${PSCAN_FORCE_VFIO:-}" ]; then
     echo " -> NI-DAQmx is installed, so it owns any NI card. Not binding to"
     echo " -> vfio-pci: a card bound there is invisible to NI's driver."
     release_card_from_vfio
+
+    # The other half of the same conflict, and far harder to spot.
+    #
+    # vfio-pci cannot work without an IOMMU, so this installer's VFIO
+    # instructions tell people to add intel_iommu=on. On the DAQmx path that
+    # setting is not merely unneeded - it blocks the card's DMA, because NI's
+    # kernel driver does not use the kernel DMA API the way the IOMMU
+    # expects.
+    #
+    # The result is a card that looks half-working in a very confusing way:
+    # a self test passes, an on-demand AO write holds, a single software
+    # timed sample reads fine - all programmed I/O - while every buffered
+    # acquisition fails with "-50152 A hardware failure has occurred",
+    # because that is the one path that needs DMA.
+    if grep -qE 'intel_iommu=on|amd_iommu=on' /proc/cmdline 2>/dev/null && \
+       ! grep -q 'iommu=pt' /proc/cmdline 2>/dev/null; then
+        echo " ->"
+        echo " -> [WARNING] The IOMMU is forced on without passthrough:"
+        echo " ->             $(cat /proc/cmdline 2>/dev/null)"
+        echo " ->"
+        echo " ->           That was for vfio-pci, which is no longer the"
+        echo " ->           path. It blocks NI's DMA, so buffered reads fail"
+        echo " ->           with '-50152 A hardware failure has occurred'"
+        echo " ->           while single samples and analog output work."
+        echo " ->"
+        echo " ->           Add iommu=pt in /etc/default/grub:"
+        echo " ->             GRUB_CMDLINE_LINUX_DEFAULT=\"... intel_iommu=on iommu=pt\""
+        echo " ->             sudo update-grub && sudo reboot"
+        echo " ->"
+        echo " ->           Passthrough gives host drivers an identity"
+        echo " ->           mapping, so NI's DMA works while the IOMMU stays"
+        echo " ->           available if the VFIO shim is ever wanted again."
+    fi
 elif [ -z "${PSCAN_XSERIES_USE_NIRLPK:-}" ] && \
    ls /sys/bus/pci/devices/*/vendor >/dev/null 2>&1 && \
    grep -qls '^0x1093$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then

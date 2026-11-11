@@ -41,6 +41,79 @@ def step(name):
     print(f"\n--- {name}")
 
 
+def iommu_report():
+    """Is the IOMMU blocking the card's DMA?
+
+    This is the question when software-timed acquisition works and
+    hardware-timed does not. A single on-demand read is programmed I/O, and
+    so is an on-demand AO write - both work. A buffered acquisition uses DMA,
+    and that is the one that fails. The thing that blocks DMA is the IOMMU.
+
+    pscan's own installer is what turned it on: vfio-pci cannot work without
+    an IOMMU, so the VFIO instructions say to add intel_iommu=on. On the
+    DAQmx path that is not merely unnecessary, it is actively in the way -
+    NI's kernel driver does not use the kernel DMA API the way the IOMMU
+    expects, so translation faults the transfer.
+
+    A blocked transfer logs a DMAR fault, so this looks rather than guesses.
+    """
+    import re
+    import subprocess
+
+    print("\n--- IOMMU, since buffered acquisition needs DMA")
+
+    try:
+        with open("/proc/cmdline") as f:
+            cmdline = f.read().strip()
+    except OSError:
+        cmdline = ""
+
+    on = ("intel_iommu=on" in cmdline) or ("amd_iommu=on" in cmdline)
+    passthrough = "iommu=pt" in cmdline
+    print(f"  kernel cmdline : {cmdline or '(unreadable)'}")
+    print(f"  IOMMU forced on: {'yes' if on else 'no'}")
+    print(f"  passthrough    : {'yes' if passthrough else 'NO'}")
+
+    faults = []
+    try:
+        out = subprocess.run(["dmesg", "-T"], capture_output=True,
+                             text=True, timeout=30)
+        for line in out.stdout.splitlines():
+            if re.search(r"DMAR:.*(fault|PTE|Translation)", line, re.I):
+                faults.append(line)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"  dmesg unavailable ({e}) - run as root to read it")
+
+    if faults:
+        print(f"\n  {len(faults)} DMAR fault line(s), most recent last:")
+        for line in faults[-6:]:
+            print(f"    {line}")
+        print("\n  CONFIRMED: the IOMMU is refusing the card's DMA. That is")
+        print("  why a buffered read fails while a single sample works.")
+    else:
+        print("\n  No DMAR faults in dmesg.")
+        if on and not passthrough:
+            print("  Not conclusive - a transfer refused before it starts may")
+            print("  log nothing. The IOMMU is forced on without passthrough,")
+            print("  which is still the leading suspect.")
+
+    if on and not passthrough:
+        print("\n  THE FIX, if this is it:")
+        print("    sudo nano /etc/default/grub")
+        print("      GRUB_CMDLINE_LINUX_DEFAULT=\"... intel_iommu=on iommu=pt\"")
+        print("    sudo update-grub && sudo reboot")
+        print("")
+        print("  iommu=pt gives host drivers an identity mapping, so NI's DMA")
+        print("  works, while leaving the IOMMU available if the VFIO shim is")
+        print("  ever wanted again. Removing intel_iommu=on entirely would")
+        print("  also work and would close that door.")
+    elif on and passthrough:
+        print("\n  Already in passthrough, so the IOMMU should not be")
+        print("  blocking anything. Look elsewhere.")
+    else:
+        print("\n  IOMMU is not forced on, so it is probably not the cause.")
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     device_name = args[0] if args else "Dev1"
@@ -142,8 +215,15 @@ def main():
             else:
                 print("\n  Varying samples: the converter and the timing engine")
                 print("  both work.")
+        timed_ok = True
     except Exception as e:
         print(f"  FAILED: {e}")
+        timed_ok = False
+
+    # Only when the pattern actually points at DMA: the converter answers a
+    # software-timed read but a buffered one fails.
+    if not timed_ok:
+        iommu_report()
 
     step("Summary")
     print("  If the single read works and the timed one does not, the fault")
