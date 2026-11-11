@@ -206,7 +206,9 @@ def main():
     try:
         device.self_test_device()
         print("  PASSED")
+        self_test_ok = True
     except Exception as e:
+        self_test_ok = False
         print(f"  FAILED: {e}")
         print("\n  This is NI's supported driver reporting its own hardware")
         print("  as faulty. That is the single most useful line to put in a")
@@ -231,7 +233,9 @@ def main():
             print(f"  ai0 reads {task.read():+.6f} V")
             print("  OK - the converter works. Nothing is connected, so any")
             print("  value is fine; that it returned at all is the result.")
+        single_ok = True
     except Exception as e:
+        single_ok = False
         print(f"  FAILED: {e}")
         print("\n  No clock, no buffer, no timing engine involved. A failure")
         print("  here means the analog input path itself is not working.")
@@ -273,13 +277,32 @@ def main():
     if not timed_ok:
         iommu_report()
 
+    # Say what happened, not what might have. A summary that lists every
+    # possible outcome regardless of the result is noise at exactly the
+    # moment someone is trying to read a verdict.
     step("Summary")
-    print("  If the single read works and the timed one does not, the fault")
-    print("  is in the timing engine, not the converter.")
-    print("  If self-test fails, raise it with NI - that verdict is theirs,")
-    print("  not ours, and this card is known good on Windows.")
-    print("  If everything passes, pscan's own task setup is the difference")
-    print("  and that is ours to fix.")
+    if self_test_ok and single_ok and timed_ok:
+        print("  Everything passed: self test, a software-timed sample, and a")
+        print("  buffered acquisition at 10 kHz. The card is working.")
+        print("")
+        print("  pscan's own path is the thing still to confirm, since this")
+        print("  script deliberately bypasses it:")
+        print("    sudo pydaq read --backend daqmx --channel 0 "
+              "--samples 1000 --rate 10000")
+    elif single_ok and not timed_ok:
+        print("  The converter works and buffered acquisition does not, so")
+        print("  the fault is in the timing engine or its DMA - not the ADC.")
+        print("  The IOMMU section above is the first thing to settle.")
+    elif not single_ok:
+        print("  Even a single software-timed sample fails, so the analog")
+        print("  input path is not working at all. No clock, no buffer and no")
+        print("  DMA are involved in that read.")
+    if not self_test_ok:
+        print("")
+        print("  NOTE: self_test_device() failed. That is NI's supported")
+        print("  driver calling its own hardware faulty, with none of our")
+        print("  code involved - the strongest thing to put in a support")
+        print("  case, especially as this card passes self test on Windows.")
     return 0
 
 

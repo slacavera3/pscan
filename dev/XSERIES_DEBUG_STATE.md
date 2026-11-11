@@ -1,5 +1,43 @@
 # PCIe-6351 on Debian: what is known, what is ruled out
 
+---
+
+## RESOLVED — the card works, via NI-DAQmx
+
+**11 Nov 2026.** The PCIe-6351 is fully working on Debian 13 under NI's own
+driver. Both analog directions verified:
+
+```
+self_test_device()            PASSED
+one sample, software timed    -0.000184 V
+1000 samples at 10 kHz        span 0.001932 V, varying
+ao0 set to +2.5 V             holds indefinitely
+```
+
+Two things were in the way, and neither was the card:
+
+1. **NI-DAQmx was never tried.** `install_nidaqmx()` returned early on Debian
+   unless `PSCAN_FORCE_DAQMX=1`, and that flag had never been pulled. "Not
+   officially supported" was treated as "will not work". NI ship `.deb`s, DKMS
+   builds their modules against whatever kernel is present, and the feed can
+   be pinned so it cannot touch Debian packages. It works.
+
+2. **The IOMMU was translating the card's DMA.** Debian builds with
+   `CONFIG_INTEL_IOMMU_DEFAULT_ON`, so this is a stock install's behaviour,
+   not something pscan enabled. NI's kernel driver does not use the kernel DMA
+   API the way that expects, so every buffered acquisition failed with
+   `-50152 A hardware failure has occurred` while single samples, self test
+   and analog output all worked — only buffered acquisition needs DMA.
+   `iommu=pt` fixes it, and `install.sh` now sets it.
+
+**The shim below is the fallback**, for machines that cannot run NI-DAQmx. Its
+faults were never explained, and the record of that investigation is kept
+because it would otherwise have to be repeated. Note it was never retried with
+`iommu=pt`, though VFIO uses the IOMMU deliberately so the connection is not
+obvious.
+
+---
+
 Handover for a session working **on the e-rig itself**, with no access to the
 conversation this came from. Everything below is evidence from that rig unless
 marked as inference.
