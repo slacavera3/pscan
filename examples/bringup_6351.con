@@ -25,6 +25,25 @@
 ## you can see what a committed DAQmx task really costs per coordinate on
 ## this kernel, instead of taking an estimate for it.
 ##
+## Measured on the e-rig (Debian 13, kernel 6.12, PCIe-6351), as the
+## baseline to compare against if this ever feels slow:
+##
+##   Trace 1       0.1098 s     task commit, paid once
+##   Traces 2-11   0.1010 s     steady state
+##   Acquisition   0.1000 s     1000 samples at 10 kHz
+##
+## So pscan costs about 1.0 ms per trace, roughly 1%, and 'Total trace
+## time' minus 'A2D module' is 0.1 ms - the acquisition is very nearly all
+## of it. Trace 1 is slower because _build_task() does the
+## verify/reserve/program work once and caches it; every later trace
+## skips it. That gap IS the saving.
+##
+## Note what the timer does NOT include: the axis move and its 'settle'
+## happen before the trace timer starts, so real time per coordinate here
+## is about 0.111 s. The settle is ten times the software overhead, which
+## is the useful conclusion - a slow scan is tuned by finding the true
+## settle time, not by optimising code.
+##
 ## Expected output: bringup_6351_a2d1_1f.d
 ##   11 coordinates x 1 count x 1000 samples x 4 bytes = 44000 bytes
 ##
