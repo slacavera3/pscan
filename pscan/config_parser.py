@@ -359,11 +359,20 @@ def _plan_from_tree(blocks):
     plan = []
     for block in blocks:
         if block['type'] in LOOP_TYPES:
-            plan.append({'kind': 'loop', 'block': block,
-                         'body': _plan_from_tree(block['children'])})
+            step = {'kind': 'loop', 'block': block,
+                    'body': _plan_from_tree(block['children'])}
+            if block['type'] == 'count':
+                step['repeats'] = _count_of(block)
+            plan.append(step)
         else:
             plan.append({'kind': 'action', 'block': block})
     return plan
+
+
+def _count_of(block):
+    """How many repeats a count block asks for. Defaults to 1."""
+    match = _field(block['body'], 'count', r'(\d+)')
+    return int(match.group(1)) if match else 1
 
 
 def _plan_from_flat(blocks):
@@ -385,7 +394,7 @@ def _plan_from_flat(blocks):
 
     if count_val != 1:
         body = [{'kind': 'loop', 'block': _synthetic_count(count_val),
-                 'body': body}]
+                 'body': body, 'repeats': count_val}]
 
     for block in reversed(stages):
         body = [{'kind': 'loop', 'block': block, 'body': body}]

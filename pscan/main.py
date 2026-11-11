@@ -569,6 +569,62 @@ def walk_axes(axes, level, pending, body):
     axis.restore()
 
 
+def walk_plan(steps, pending, axis_for, trace):
+    """Run a compiled plan: loops nest, and the innermost body is one trace.
+
+    The general form of walk_axes(). Where that took a fixed list of axes and
+    always put `count` inside all of them, this follows whatever structure
+    config_parser.build_plan() produced - so a nested config can put count
+    around an outer axis and average a whole row instead of a point.
+
+    A flat config compiles to the nest it has always implied, so this runs it
+    identically. That equivalence is asserted in tests/test_plan_walk.py
+    rather than assumed.
+
+        axis_for(block) -> the axis object for a loop step
+        trace(blocks)   -> run these action blocks as ONE trace
+
+    A body with no loops in it IS a trace: today that is the acquisition
+    pipeline at the innermost level, which is exactly what one pass through
+    it has always meant. Draining happens there, once, before the actions -
+    which is what keeps moves from several enclosing axes overlapping, since
+    each has only commanded, not waited.
+    """
+    loops = [s for s in steps if s['kind'] == 'loop']
+
+    if not loops:
+        pending.drain()
+        trace([s['block'] for s in steps])
+        return
+
+    for step in steps:
+        if step['kind'] != 'loop':
+            # An action beside a loop - a delay or script between rows, say.
+            # Drained first for the same reason a trace is: it may depend on
+            # the hardware having arrived.
+            pending.drain()
+            trace([step['block']])
+            continue
+
+        block = step['block']
+
+        if block['type'] == 'count':
+            # Nothing to command and nothing to restore: its iterations are
+            # repetitions, not positions.
+            for _ in range(step.get('repeats', 1)):
+                walk_plan(step['body'], pending, axis_for, trace)
+            continue
+
+        axis = axis_for(block)
+        for position in axis.positions:
+            axis.command(position, pending)
+            walk_plan(step['body'], pending, axis_for, trace)
+
+        # Once per iteration of the enclosing loop, which is where the
+        # hardcoded version restored Y - after each row, inside the X loop.
+        axis.restore()
+
+
 def format_position_line(axes):
     """The coordinate as it appears in the per-trace log line."""
     if not axes:
