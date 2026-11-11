@@ -4,11 +4,23 @@ import glob
 import time
 import subprocess
 import traceback
-import cv2
 import shutil
-from pscan.tucsen_driver import TucsenCamera
 import queue
 import threading
+
+# cv2, TucsenCamera, LeCroyScope and ThorlabsStage are imported WHERE THEY
+# ARE USED, not here.
+#
+# This module is the orchestrator: it owns the scan loop, the axis nest and
+# the move-overlap rules, which are the most consequential logic in pscan and
+# the easiest to break. Importing a camera SDK and a serial stack at module
+# scope made all of it unimportable on any machine without them, so
+# tests/test_axis_walk.py - the 24 tests that pin exactly that logic - could
+# only run on the rig, which is the one place a regression is expensive.
+#
+# Each is used in one or two places inside a function, so the cost of moving
+# them is a line each, and the gain is that the scan loop can be tested
+# anywhere.
 
 # Stage settling. The encoder is the authority: wait_for_move() polls the
 # position counter until the axis is inside SETTLE_TOLERANCE_MM, then naps
@@ -91,8 +103,6 @@ from pscan.config_parser import (
     compile_pipeline_list, compile_stage_parameters,
     validate_blocks, CORE_TYPES, APT_AXES, PIEZO_AXIS
 )
-from pscan.lecroy_driver import LeCroyScope
-from pscan.stage_driver import ThorlabsStage
 from pscan import daq
 
 # OS-Specific Andor Import
@@ -147,6 +157,7 @@ def run_pipeline_sequence(pipeline, scope, ixon, tucsen, base_filename,
             # here cost 0.3-1s of USB enumeration at every coordinate.
             cam = call_state.get('webcam')
             if cam is not None:
+                import cv2
                 ret, frame = cam.read()
                 if ret:
                     cv2.imwrite(img_filename, frame)
@@ -866,6 +877,7 @@ def configure_cameras(pipelines, ixon, tucsen, call_state):
             device = p['device']
             print(f"Opening USB webcam device {device}...")
 
+            import cv2
             cam = cv2.VideoCapture(device)
             if not cam.isOpened():
                 print(f"[WARNING] Could not open webcam device {device}; "
@@ -1022,10 +1034,12 @@ def main():
     try:
         if tucsen_in_pipeline:
             print("\nConnecting to Tucsen Camera...")
+            from pscan.tucsen_driver import TucsenCamera
             tucsen = TucsenCamera()
             tucsen.connect()
         if scope_ip:
             print(f"\nOpening session to LeCroy at {scope_ip}...")
+            from pscan.lecroy_driver import LeCroyScope
             scope = LeCroyScope(scope_ip)
             scope.connect()
         # Opened before anything moves, so a missing card - or a config that
@@ -1034,6 +1048,7 @@ def main():
         open_a2d_sessions(all_actions)
 
         if any(axis in stage_params for axis in APT_AXES):
+            from pscan.stage_driver import ThorlabsStage
             stage = ThorlabsStage()
             stage.connect()
 
