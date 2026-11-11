@@ -125,9 +125,27 @@ DEFAULT_D2A_AXIS = PIEZO_AXIS
 # an analog output landing on one of them would be iterated as a stage move.
 D2A_AXIS_RANGE = (2, 99)
 
-# Nesting order is by axis id ascending: axis 0 is the outermost loop and the
-# highest-numbered axis the innermost. The piezo's 99 therefore stays the
-# innermost axis, as it was when the loop was hardcoded.
+# In a FLAT config, nesting order is by axis id ascending: axis 0 is the
+# outermost loop and the highest-numbered axis the innermost. The piezo's 99
+# therefore stays the innermost axis, as it was when the loop was hardcoded.
+#
+# In a NESTED config the file says it instead, and these ids only name the
+# axis for logging and restore. See LOOP_TYPES.
+
+#: Block types that are loops: each one is a level of the nest, and whatever
+#: is written inside it runs once per iteration.
+#:
+#: 'count' is here because an 'action ... end' block IS a for-loop, and count
+#: is the one whose iterations are repetitions rather than positions. Writing
+#: it around an outer axis then means "average this row", and around the
+#: innermost means "average this point" - which was the only thing it could
+#: say when it was a single global number.
+LOOP_TYPES = AXIS_TYPES + ('count',)
+
+#: Block types that produce a data file. All of them must sit at the same
+#: depth, so every .d file from one run has the same trace count - which is
+#: what keeps the output format and its analysis unchanged.
+DATA_TYPES = ('a2d', 'scope', 'webcam', 'ixon', 'tucsen')
 
 #: What a d2a block's 'units' line may say.
 D2A_UNITS = ('volts', 'um')
@@ -288,6 +306,89 @@ def parse_flat_con_file(filepath):
     Identical output to the old reader for any flat file - see parse_con_tree.
     """
     return flatten_tree(parse_con_tree(filepath))
+
+
+def _describe(block):
+    return f"'action {block['type']}' on line {block['line']}"
+
+
+def validate_nesting(roots):
+    """Check a nested config says something a scan can actually run.
+
+    Only applies to configs that USE nesting. A flat file is governed by the
+    rules it has always been governed by, and is not put through this.
+
+    Four rules, each because the alternative is a config that looks sensible
+    and does something else:
+
+      - Only a loop may contain anything. An 'a2d' with blocks inside it
+        reads as though they run per trace; they would not.
+      - A loop must contain something. An axis with an empty body sweeps the
+        hardware and records nothing, which is a slow way to achieve nothing.
+      - Every data block sits at the same depth, so every .d file from one
+        run has the same trace count. Two files of different lengths from one
+        scan is a change in what the output means, not just its size.
+      - There is at least one data block. Otherwise the run moves hardware
+        and writes no file.
+    """
+    # Guard here rather than trusting callers to check first.
+    #
+    # Applied to a flat config every one of these rules misfires: its axis
+    # blocks have no children, so "a loop must contain something" rejects
+    # the lot. Returning early makes this safe to call unconditionally,
+    # which is the only way it will reliably be called correctly - the
+    # mistake is easy enough that it was made while writing the tests.
+    if not has_nesting(roots):
+        return
+
+    data_depths = {}
+
+    def walk(block, depth, path):
+        here = path + [_describe(block)]
+
+        if block['type'] in LOOP_TYPES:
+            if not block['children']:
+                raise ValueError(
+                    f"{_describe(block)} is a loop with nothing inside it. "
+                    f"It would sweep the hardware and record nothing - put "
+                    f"the blocks it should repeat between its 'action' and "
+                    f"'end' lines."
+                )
+        elif block['children']:
+            raise ValueError(
+                f"{_describe(block)} has blocks nested inside it, but only "
+                f"{', '.join(LOOP_TYPES)} are loops. Nesting here reads as "
+                f"though those blocks run per trace, and they would not."
+            )
+
+        if block['type'] in DATA_TYPES:
+            data_depths.setdefault(depth, []).append(_describe(block))
+
+        for child in block['children']:
+            walk(child, depth + 1, here)
+
+    for root in roots:
+        walk(root, 0, [])
+
+    if not data_depths:
+        raise ValueError(
+            "This config records nothing: no "
+            f"{', '.join(DATA_TYPES)} block anywhere. It would move the "
+            f"hardware through the whole grid and write no file."
+        )
+
+    if len(data_depths) > 1:
+        lines = []
+        for depth in sorted(data_depths):
+            for who in data_depths[depth]:
+                lines.append(f"    depth {depth}: {who}")
+        raise ValueError(
+            "Recording blocks are at different depths:\n"
+            + "\n".join(lines)
+            + "\n  All of them must sit at the same level, so every file "
+              "from one run has the same number of traces. Move them into "
+              "the same innermost block."
+        )
 
 
 def _field(body, key, value_pattern=r'([^\n]+)'):

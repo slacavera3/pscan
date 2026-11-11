@@ -21,10 +21,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from pscan.config_parser import (
+    DATA_TYPES,
+    LOOP_TYPES,
     flatten_tree,
     has_nesting,
     parse_con_tree,
     parse_flat_con_file,
+    validate_nesting,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -250,6 +253,136 @@ class TestUnbalancedBlocksAreErrors(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 parse_con_tree(path)
             self.assertIn("outside", str(caught.exception))
+
+
+class TestNestingValidation(unittest.TestCase):
+    """What a nested config must say to describe a runnable scan."""
+
+    def check(self, text):
+        with TemporaryDirectory() as tmp:
+            validate_nesting(parse_con_tree(write(tmp, text)))
+
+    def rejects(self, text, *expected_words):
+        with TemporaryDirectory() as tmp:
+            roots = parse_con_tree(write(tmp, text))
+            with self.assertRaises(ValueError) as caught:
+                validate_nesting(roots)
+            message = str(caught.exception).lower()
+            for word in expected_words:
+                self.assertIn(word.lower(), message)
+
+    def test_axis_then_count_then_acquisition_is_valid(self):
+        self.check("""
+            action d2a
+            axis 97
+            channel 0
+            scan 0 10 1
+              action count
+              count 5
+                action a2d
+                channel 0
+                end
+              end
+            end
+        """)
+
+    def test_two_nested_axes_are_valid(self):
+        self.check("""
+            action d2a
+            axis 97
+            scan 0 10 1
+              action d2a
+              axis 98
+              scan 0 5 1
+                action a2d
+                channel 0
+                end
+              end
+            end
+        """)
+
+    def test_a_flat_config_is_not_subjected_to_these_rules(self):
+        """The guard that matters.
+
+        Flat axis blocks have no children, so "a loop must contain something"
+        would reject every config written before nesting existed. This is
+        called unconditionally by design, so it must no-op on flat input.
+        """
+        self.check("""
+            action d2a
+            axis 97
+            scan 0 10 1
+            end
+            action a2d
+            channel 0
+            end
+        """)
+
+    def test_a_loop_with_nothing_inside_it(self):
+        self.rejects("""
+            action d2a
+            axis 97
+            scan 0 10 1
+              action count
+              count 5
+              end
+              action a2d
+              channel 0
+              end
+            end
+        """, "nothing inside")
+
+    def test_blocks_nested_inside_a_non_loop(self):
+        self.rejects("""
+            action d2a
+            scan 0 1 1
+              action a2d
+              channel 0
+                action delay
+                seconds 1
+                end
+              end
+            end
+        """, "only", "loops")
+
+    def test_recording_blocks_at_different_depths(self):
+        self.rejects("""
+            action d2a
+            axis 97
+            scan 0 10 1
+              action a2d
+              channel 0
+              end
+              action d2a
+              axis 98
+              scan 0 5 1
+                action a2d
+                channel 1
+                end
+              end
+            end
+        """, "different depths")
+
+    def test_a_config_that_records_nothing(self):
+        self.rejects("""
+            action d2a
+            axis 97
+            scan 0 10 1
+              action count
+              count 5
+                action delay
+                seconds 1
+                end
+              end
+            end
+        """, "records nothing")
+
+    def test_count_is_a_loop_and_a2d_is_not(self):
+        """The two answers that shaped this design, pinned as facts."""
+        self.assertIn('count', LOOP_TYPES)
+        self.assertIn('d2a', LOOP_TYPES)
+        self.assertNotIn('a2d', LOOP_TYPES)
+        self.assertIn('a2d', DATA_TYPES)
 
 
 if __name__ == "__main__":
