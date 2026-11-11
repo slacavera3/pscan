@@ -174,7 +174,30 @@ def generate_positions(start, stop, step):
     return [round(start + i * step, 6) for i in range(n_steps + 1)]
 
 
-def parse_flat_con_file(filepath):
+def parse_con_tree(filepath):
+    """Read a .con file as a TREE, honouring 'action ... end' nesting.
+
+    Each block is {'type', 'body', 'children', 'line'}. 'body' holds only that
+    block's own directives - a child's lines belong to the child - and
+    'children' is the blocks written inside it, in document order.
+
+    WHY A TREE
+
+    The old reader was flat and could not see nesting at all: a nested
+    'action' silently CLOSED its parent, so the outer block lost every
+    directive written after the nested one, the matching 'end' was discarded
+    as unopened, and nothing reported a problem. A nested config did not fail,
+    it quietly meant something else.
+
+    A flat file produces a tree one level deep, and flatten_tree() then
+    reproduces the old reader's output exactly - which is the invariant the
+    tests pin, because every .con file in use today is flat and must keep
+    meaning precisely what it means now.
+
+    Unbalanced blocks are errors here rather than silently tolerated. A file
+    with a stray 'end', or one that runs out before closing, was already
+    broken; saying so with a line number is strictly better than guessing.
+    """
     # utf-8-sig, not utf-8: a .con file edited in Notepad on Windows starts
     # with a byte-order mark, which plain utf-8 hands back as a '﻿' glued
     # to the first directive. The file then fails on line 1 with a message
@@ -184,44 +207,87 @@ def parse_flat_con_file(filepath):
     with open(filepath, 'r', encoding='utf-8-sig') as f:
         lines = f.readlines()
 
-    all_blocks = []
-    current_block = None
-    block_body = []
+    roots = []
+    stack = []
 
-    for line in lines:
+    for number, line in enumerate(lines, start=1):
         cleaned = line.strip()
         if not cleaned or cleaned.startswith('#'):
             continue
 
         if cleaned.startswith('action '):
-            if current_block:
-                all_blocks.append({
-                    'type': current_block,
-                    'body': "\n".join(block_body)
-                })
-            current_block = cleaned.split()[1].lower()
-            block_body = [cleaned]
+            parts = cleaned.split()
+            if len(parts) < 2:
+                raise ValueError(
+                    f"{filepath}:{number}: 'action' needs a type, "
+                    f"e.g. 'action a2d'"
+                )
+            block = {
+                'type': parts[1].lower(),
+                'body': [cleaned],
+                'children': [],
+                'line': number,
+            }
+            (stack[-1]['children'] if stack else roots).append(block)
+            stack.append(block)
 
         elif cleaned == 'end':
-            if current_block:
-                block_body.append(cleaned)
-                all_blocks.append({
-                    'type': current_block,
-                    'body': "\n".join(block_body)
-                })
-                current_block = None
-                block_body = []
+            if not stack:
+                raise ValueError(
+                    f"{filepath}:{number}: 'end' with no open 'action' block"
+                )
+            block = stack.pop()
+            block['body'].append(cleaned)
+            block['body'] = "\n".join(block['body'])
+
+        elif stack:
+            stack[-1]['body'].append(cleaned)
+
         else:
-            if current_block:
-                block_body.append(cleaned)
+            raise ValueError(
+                f"{filepath}:{number}: '{cleaned}' is outside any "
+                f"'action ... end' block"
+            )
 
-    if current_block:
-        all_blocks.append({
-            'type': current_block,
-            'body': "\n".join(block_body)
-        })
+    if stack:
+        unclosed = stack[-1]
+        raise ValueError(
+            f"{filepath}: 'action {unclosed['type']}' opened on line "
+            f"{unclosed['line']} is never closed - add 'end'"
+        )
 
-    return all_blocks
+    return roots
+
+
+def flatten_tree(blocks):
+    """Every block in document order, parents before their children.
+
+    What the pipeline consumes until it understands nesting. For a flat file
+    this is the tree itself, which is what makes the new reader a drop-in.
+    """
+    out = []
+    for block in blocks:
+        out.append(block)
+        out.extend(flatten_tree(block['children']))
+    return out
+
+
+def has_nesting(blocks):
+    """Does this config use nested blocks at all?
+
+    The discriminator for keeping flat files on exactly the path they are on
+    now. Nesting is opt-in: a file that does not use it cannot be affected by
+    anything the nested interpretation does.
+    """
+    return any(block['children'] for block in blocks)
+
+
+def parse_flat_con_file(filepath):
+    """The flat block list, for callers that do not handle nesting yet.
+
+    Identical output to the old reader for any flat file - see parse_con_tree.
+    """
+    return flatten_tree(parse_con_tree(filepath))
 
 
 def _field(body, key, value_pattern=r'([^\n]+)'):
