@@ -440,8 +440,10 @@ def plan_total_traces(plan, axis_size):
             if n is None:
                 n = axis_size(step['block'])
             total += n * plan_total_traces(step['body'], axis_size)
-        else:
-            total += 1
+        # An action BESIDE a loop is not a trace. A flat config's setup and
+        # teardown blocks sit there, and counting them made a config with one
+        # 'action script' at the top report six traces where main() reports
+        # five. Only a leaf body is a trace.
     return total
 
 
@@ -462,6 +464,8 @@ def plan_order(plan, iterations=None):
             block = step['block']
             if step['kind'] == 'loop':
                 n = iterations if iterations is not None else 2
+                if step.get('repeats') is not None:
+                    n = min(n, step['repeats'])
                 for i in range(n):
                     events.append(f"{'  ' * depth}{block['type']}[{i}]")
                     walk(step['body'], depth + 1)

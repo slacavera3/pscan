@@ -69,7 +69,10 @@ def run_new(plan, axes_by_id, log):
     def trace(blocks):
         log.append("TRACE")
 
-    walk_plan(plan, pending, axis_for, trace)
+    def run_action(block):
+        log.append(f"ONCE:{block['type']}")
+
+    walk_plan(plan, pending, axis_for, trace, run_action)
     return log
 
 
@@ -229,7 +232,8 @@ class TestMoveOverlapIsPreserved(unittest.TestCase):
                       int(__import__('re').search(r'^axis\s+(\d+)',
                                                   b['body'],
                                                   __import__('re').M).group(1))],
-                  lambda blocks: log.append("TRACE"))
+                  lambda blocks: log.append("TRACE"),
+                  lambda block: log.append("ONCE"))
 
         # The grid is 2 outer x 2 inner, so four traces and four drains.
         #
@@ -261,6 +265,7 @@ class TestNestedConfigsReachTheirLeaves(unittest.TestCase):
             lambda b: axes[int(re.search(r'^axis\s+(\d+)', b['body'],
                                          re.M).group(1))],
             lambda blocks: log.append("TRACE"),
+            lambda block: log.append("ONCE"),
         )
         return log
 
@@ -359,7 +364,8 @@ class TestPredictedTraceCountMatchesReality(unittest.TestCase):
 
         walk_plan(plan, PendingSettle(),
                   lambda b: axes[axis_id(b)],
-                  lambda blocks: log.append("TRACE"))
+                  lambda blocks: log.append("TRACE"),
+                  lambda block: log.append("ONCE"))
 
         actual = log.count("TRACE")
         self.assertEqual(predicted, actual,
@@ -502,6 +508,74 @@ class TestPredictedTraceCountMatchesReality(unittest.TestCase):
 
             with self.subTest(expected=old):
                 self.assertEqual(new, old)
+
+    def test_setup_and_teardown_blocks_are_not_traces(self):
+        """The bug this class exists to catch, found by widening it.
+
+        categorize_pipeline() puts blocks before the first core block into
+        setup and after the last into teardown. In a plan they sit beside the
+        axis loop, not inside it. Counting them made this config report six
+        traces where main() reports five - and walk_plan would have run the
+        script through the acquisition path, as though it produced data.
+        """
+        from tempfile import TemporaryDirectory
+        import re
+        from pscan.config_parser import (categorize_pipeline,
+                                         compile_stage_parameters,
+                                         parse_flat_con_file)
+        from pscan.main import axis_grid_size
+
+        text = """
+            action script
+            cmd echo before
+            end
+
+            action d2a
+            axis 98
+            scan 0 4 1
+            end
+
+            action a2d
+            channel 0
+            end
+
+            action script
+            cmd echo after
+            end
+        """
+
+        with TemporaryDirectory() as tmp:
+            path = con(tmp, text)
+            blocks = parse_flat_con_file(path)
+            stages, count_val, setup, acq, tear = categorize_pipeline(blocks)
+            stage_params = compile_stage_parameters(stages)
+            expected = axis_grid_size(stage_params) * count_val
+
+            plan = build_plan(parse_con_tree(path))
+            sizes = {i: len(p['positions']) for i, p in stage_params.items()}
+            predicted = plan_total_traces(
+                plan,
+                lambda b: sizes[int(re.search(r'^axis\s+(\d+)',
+                                              b['body'], re.M).group(1))])
+
+        self.assertEqual(len(setup), 1, "the script before is setup")
+        self.assertEqual(len(tear), 1, "the script after is teardown")
+        self.assertEqual(predicted, expected,
+                         "setup/teardown must not be counted as traces")
+        self.assertEqual(predicted, 5)
+
+        # And the walker must run them, exactly once each, outside any trace.
+        log = []
+        axes = {98: RecordingAxis(98, list(range(5)), log)}
+        walk_plan(plan, PendingSettle(),
+                  lambda b: axes[98],
+                  lambda blocks: log.append("TRACE"),
+                  lambda block: log.append(f"ONCE:{block['type']}"))
+
+        self.assertEqual(log.count("TRACE"), 5)
+        self.assertEqual(log.count("ONCE:script"), 2)
+        self.assertEqual(log[0], "ONCE:script", "setup runs before the grid")
+        self.assertEqual(log[-1], "ONCE:script", "teardown runs after it")
 
     def test_no_axis_at_all_is_one_trace(self):
         from tempfile import TemporaryDirectory
