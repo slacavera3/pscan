@@ -1,0 +1,109 @@
+## =====================================================================
+## Nested action blocks - where you write a block is what it means
+## =====================================================================
+##
+## An 'action ... end' block is a for-loop. What you write inside it runs
+## once per iteration, so the nesting in the file IS the nesting of the
+## scan. This file is the worked example of that; it needs no hardware
+## beyond a PCIe-6351 and runs in a few seconds.
+##
+##   pscan --dry-run examples/nested_loops.con
+##
+## WHAT THIS ONE DOES
+##
+##   for each of 5 X positions          (ao0, 0..4 V)
+##       for each of 3 Y positions      (ao1, 0..2 V)
+##           take 4 traces and average them later
+##
+##   5 x 3 x 4 = 60 traces.
+##
+## >>> This drives real voltages out of ao0 and ao1. Check what is
+## >>> connected before running it.
+##
+## WHY NESTING MATTERS: WHERE 'count' SITS
+##
+## Move the count block and you change the experiment, not just the
+## order. Same three blocks, same 60 traces, three different meanings:
+##
+##   count INSIDE both axes      average each point
+##                               -> noise at a point averages down;
+##                                  slow drift does not
+##
+##   count around the Y axis     repeat each row
+##                               -> a row takes 4x longer, and drift
+##                                  within a row is still in the data
+##
+##   count OUTSIDE both axes     repeat the whole image 4 times
+##                               -> each image is a snapshot, and the
+##                                  four can be compared for drift
+##                                  instead of being averaged blindly
+##
+## The third is impossible to say with a global count, which is what
+## 'action count' used to be. This is the reason for the whole change.
+##
+## FLAT FILES STILL WORK, UNCHANGED
+##
+## A config that does not nest is read exactly as it always was: axes
+## nest by axis id, lowest outermost, and count applies at each
+## coordinate. examples/bringup_6351.con is one. Nothing written before
+## nesting existed means anything different now, and there is nothing to
+## migrate.
+##
+## THE RULES
+##
+##   - Loops are the axis blocks and 'count'. Only they may contain
+##     other blocks.
+##   - A loop must contain something.
+##   - Every recording block (a2d, scope, webcam, ixon, tucsen) must sit
+##     at the same depth, so every .d file from one run has the same
+##     number of traces.
+##   - In a nested file the 'axis' number no longer decides the order -
+##     the nesting does. It still names the axis in the log and is what
+##     'restore' belongs to.
+
+## --- X: the outer axis. Steps once per complete Y sweep. ------------
+action d2a
+axis 97
+backend daqmx
+device Dev1
+channel 0
+units volts
+scan 0.0 4.0 1.0
+limits 0.0 10.0
+settle 0.01
+restore
+
+    ## --- Y: the inner axis. Sweeps fully at every X. ----------------
+    action d2a
+    axis 98
+    backend daqmx
+    device Dev1
+    channel 1
+    units volts
+    scan 0.0 2.0 1.0
+    limits 0.0 10.0
+    settle 0.01
+    restore
+
+        ## --- 4 traces at each (X, Y), to average later. -------------
+        ##
+        ## Written here, inside both axes, this averages a POINT. Move
+        ## this block outside the Y loop and it repeats a ROW; outside
+        ## the X loop and it repeats the whole IMAGE.
+        action count
+        count 4
+
+            action a2d
+            channel 0
+            backend daqmx
+            device Dev1
+            v_min -1.0
+            v_max 1.0
+            terminal rse
+            sample_rate 10000
+            n_samples 1000
+            end
+
+        end
+    end
+end

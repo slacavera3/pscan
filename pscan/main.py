@@ -99,7 +99,7 @@ writer_thread.start()
 
 # Cross-platform module imports
 from pscan.config_parser import (
-    parse_con_tree, flatten_tree, validate_nesting, build_plan,
+    parse_con_tree, flatten_tree, validate_nesting, has_nesting, build_plan,
     plan_sections, plan_trace_blocks, plan_action_blocks, plan_total_traces,
     plan_axis_id, plan_repeats, categorize_pipeline,
     compile_pipeline_list, compile_stage_parameters,
@@ -548,40 +548,17 @@ def build_axes(stage_params, stage, counts_per_mm, state, open_d2a):
     return axes
 
 
-def walk_axes(axes, level, pending, body):
-    """Iterate the nest, commanding each axis and acquiring at the leaves.
-
-    Every commanded move is drained at the innermost level rather than at the
-    level that commanded it, which is what keeps moves overlapping: nothing is
-    acquired until everything in flight has arrived, but nothing waits any
-    earlier than it has to.
-    """
-    if level == len(axes):
-        pending.drain()
-        body()
-        return
-
-    axis = axes[level]
-    for position in axis.positions:
-        axis.command(position, pending)
-        walk_axes(axes, level + 1, pending, body)
-
-    # Runs once per iteration of the enclosing axis, which is where the
-    # hardcoded loop restored Y - after each row, inside the X loop.
-    axis.restore()
-
-
 def walk_plan(steps, pending, axis_for, trace, run_action):
     """Run a compiled plan: loops nest, and the innermost body is one trace.
 
-    The general form of walk_axes(). Where that took a fixed list of axes and
-    always put `count` inside all of them, this follows whatever structure
-    config_parser.build_plan() produced - so a nested config can put count
-    around an outer axis and average a whole row instead of a point.
+    This replaced a walker that took a fixed list of axes and always put
+    `count` inside all of them. It follows whatever structure
+    config_parser.build_plan() produced instead, so a nested config can put
+    count around an outer axis and average a whole row instead of a point.
 
     A flat config compiles to the nest it has always implied, so this runs it
     identically. That equivalence is asserted in tests/test_plan_walk.py
-    rather than assumed.
+    against a verbatim copy of the old walker, rather than assumed.
 
         axis_for(block)  -> the axis object for a loop step
         trace(blocks)    -> run these action blocks as ONE trace
@@ -804,7 +781,7 @@ def record_camera_frame(call_state, kind, frame):
 def print_dry_run(con_filepath, base_filename, setup_pipeline,
                   acquisition_pipeline, teardown_pipeline, stage_params,
                   count_val, global_total_traces, total_a2d_blocks,
-                  config_warnings):
+                  config_warnings, nested=False):
     """Report exactly what a run would do, without opening any hardware."""
     rule = "=" * 72
     print(f"\n{rule}\n DRY RUN - {con_filepath}\n{rule}")
@@ -835,9 +812,18 @@ def print_dry_run(con_filepath, base_filename, setup_pipeline,
               f"run them at teardown.")
 
     print("\nGRID")
-    print("  Listed outermost first. Axis ids set the nesting order, so the "
-          "highest-numbered")
-    print("  axis is the innermost loop and moves most often.")
+    if nested:
+        # Said explicitly, because the axis numbers are still printed and a
+        # reader who knows the flat rule would otherwise assume they decide
+        # the order here. In a nested config they only name the axis.
+        print("  Listed outermost first. This config NESTS its blocks, so the "
+              "file decides")
+        print("  the order - an axis number only names the axis, it does not "
+              "place it.")
+    else:
+        print("  Listed outermost first. Axis ids set the nesting order, so "
+              "the highest-numbered")
+        print("  axis is the innermost loop and moves most often.")
 
     if not stage_params:
         print("\n  (no axis declared - one coordinate, nothing moves)")
@@ -1081,7 +1067,7 @@ def main():
         print_dry_run(
             con_filepath, base_filename, setup_pipeline, acquisition_pipeline,
             teardown_pipeline, stage_params, count_val, global_total_traces,
-            total_a2d_blocks, config_warnings,
+            total_a2d_blocks, config_warnings, nested=has_nesting(roots),
         )
         return
 

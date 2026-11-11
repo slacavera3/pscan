@@ -10,25 +10,58 @@ grid is exercised with no stage, no card and no driver.
 
 import unittest
 
-# The grid lives in main.py, which is the orchestrator and imports the camera,
-# scope and serial stacks at module scope. Those are installed on the rig, so
-# this module runs there; on a bare laptop it skips with a reason rather than
-# erroring out and looking like a real failure.
-try:
-    from pscan.main import (
-        AcquisitionAborted,
-        D2AAxis,
-        PendingSettle,
-        axis_grid_size,
-        build_axes,
-        format_position_line,
-        walk_axes,
+from pscan.config_parser import plan_axis_id
+from pscan.main import (
+    AcquisitionAborted,
+    D2AAxis,
+    PendingSettle,
+    axis_grid_size,
+    build_axes,
+    format_position_line,
+    walk_plan,
+)
+
+# This module used to guard the import with a SkipTest, because main.py pulled
+# in the camera and serial stacks at module scope and so could not be imported
+# without them. These 24 tests therefore ran only on the rig - the one place a
+# regression here is expensive. Those imports are lazy now, so the guard is
+# gone and the tests run everywhere.
+
+
+def nest(axes):
+    """A plan nesting these axes outer-to-inner, one trace at the leaf.
+
+    The walk used to be driven by a list of axes and an index. It is driven
+    by a compiled plan now, so these tests build the plan that list always
+    meant - which is the same shape config_parser.build_plan() produces for a
+    flat config.
+    """
+    def block(kind, axis_id=None):
+        body = f"action {kind}"
+        if axis_id is not None:
+            body += f"\naxis {axis_id}"
+        return {'type': kind, 'body': body + "\nend", 'children': [], 'line': 0}
+
+    plan = [{'kind': 'action', 'block': block('a2d')}]
+    for axis in reversed(axes):
+        plan = [{'kind': 'loop', 'block': block('d2a', axis.axis_id),
+                 'body': plan}]
+    return plan
+
+
+def walk(axes, pending, body):
+    """walk_plan() over `axes`, calling body() once per coordinate.
+
+    The signature walk_axes() had, so each test below still reads as the
+    property it is pinning rather than as plumbing.
+    """
+    by_id = {axis.axis_id: axis for axis in axes}
+    walk_plan(
+        nest(axes), pending,
+        lambda blk: by_id[plan_axis_id(blk)],
+        lambda blocks: body(),
+        lambda blk: None,
     )
-except ImportError as e:
-    raise unittest.SkipTest(
-        f"pscan.main needs the instrument stack to import ({e}). These tests "
-        f"run on a machine with the full install."
-    ) from e
 
 
 class RecordingAxis:
@@ -70,7 +103,7 @@ class TestNestingOrder(unittest.TestCase):
             RecordingAxis(99, ['a', 'b'], log, waits=False),
         ]
         coords = []
-        walk_axes(axes, 0, PendingSettle(),
+        walk(axes, PendingSettle(),
                   lambda: coords.append((axes[0].current, axes[1].current)))
 
         # Axis 0 steps once for every full sweep of axis 99.
@@ -86,7 +119,7 @@ class TestNestingOrder(unittest.TestCase):
             RecordingAxis(99, [1, 2, 3, 4], log, waits=False),
         ]
         visited = []
-        walk_axes(axes, 0, PendingSettle(),
+        walk(axes, PendingSettle(),
                   lambda: visited.append(tuple(a.current for a in axes)))
 
         self.assertEqual(len(visited), 3 * 2 * 4)
@@ -94,14 +127,14 @@ class TestNestingOrder(unittest.TestCase):
 
     def test_no_axes_is_one_coordinate(self):
         calls = []
-        walk_axes([], 0, PendingSettle(), lambda: calls.append(1))
+        walk([], PendingSettle(), lambda: calls.append(1))
         self.assertEqual(calls, [1])
 
     def test_static_axis_still_yields_one_coordinate(self):
         log = []
         axes = [RecordingAxis(0, [None], log, waits=False)]
         calls = []
-        walk_axes(axes, 0, PendingSettle(), lambda: calls.append(1))
+        walk(axes, PendingSettle(), lambda: calls.append(1))
         self.assertEqual(calls, [1])
         self.assertEqual(log, [('command', 0, None), ('restore', 0, None)])
 
@@ -120,7 +153,7 @@ class TestMoveOverlap(unittest.TestCase):
             RecordingAxis(0, [10, 20], log),
             RecordingAxis(1, [1, 2], log),
         ]
-        walk_axes(axes, 0, PendingSettle(), lambda: log.append(('acquire',)))
+        walk(axes, PendingSettle(), lambda: log.append(('acquire',)))
 
         # The first coordinate: both axes commanded, then both arrivals, then
         # the acquisition. Not command-arrive-command-arrive.
@@ -138,7 +171,7 @@ class TestMoveOverlap(unittest.TestCase):
             RecordingAxis(0, [10], log),
             RecordingAxis(1, [1, 2], log),
         ]
-        walk_axes(axes, 0, PendingSettle(), lambda: log.append(('acquire',)))
+        walk(axes, PendingSettle(), lambda: log.append(('acquire',)))
 
         # Second coordinate: only axis 1 moved, so only axis 1 is waited on.
         after_first_acquire = log[log.index(('acquire',)) + 1:]
@@ -155,7 +188,7 @@ class TestMoveOverlap(unittest.TestCase):
             RecordingAxis(98, [1, 2], log),
             RecordingAxis(99, [1, 2], log),
         ]
-        walk_axes(axes, 0, PendingSettle(), lambda: log.append(('acquire',)))
+        walk(axes, PendingSettle(), lambda: log.append(('acquire',)))
 
         pending = 0
         for event in log:
@@ -202,7 +235,7 @@ class TestRestoreTiming(unittest.TestCase):
             RecordingAxis(0, [10, 20, 30], log, waits=False),
             RecordingAxis(1, [1, 2], log, waits=False),
         ]
-        walk_axes(axes, 0, PendingSettle(), lambda: None)
+        walk(axes, PendingSettle(), lambda: None)
 
         restores = [e for e in log if e[0] == 'restore']
         self.assertEqual(
@@ -216,7 +249,7 @@ class TestRestoreTiming(unittest.TestCase):
             RecordingAxis(0, [10, 20], log, waits=False),
             RecordingAxis(1, [1], log, waits=False),
         ]
-        walk_axes(axes, 0, PendingSettle(), lambda: None)
+        walk(axes, PendingSettle(), lambda: None)
 
         self.assertEqual(log, [
             ('command', 0, 10),

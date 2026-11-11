@@ -18,7 +18,32 @@ grid runs with no stage, no card and no driver.
 import unittest
 
 from pscan.config_parser import build_plan, parse_con_tree, plan_total_traces
-from pscan.main import PendingSettle, walk_axes, walk_plan
+from pscan.main import PendingSettle, walk_plan
+
+
+def walk_axes(axes, level, pending, body):
+    """The walker main() used before plans, kept here as the reference.
+
+    Verbatim, so the equivalence below is checked against the real previous
+    behaviour rather than a paraphrase of it - the same reason
+    test_con_nesting.py keeps a copy of the old .con reader.
+
+    It lives in the tests rather than in pscan/ because nothing ships that
+    calls it any more. Keeping dead production code alive to serve its own
+    test is how a codebase accumulates exactly the weight the X Series shim
+    was deleted for.
+    """
+    if level == len(axes):
+        pending.drain()
+        body()
+        return
+
+    axis = axes[level]
+    for position in axis.positions:
+        axis.command(position, pending)
+        walk_axes(axes, level + 1, pending, body)
+
+    axis.restore()
 
 
 class RecordingAxis:

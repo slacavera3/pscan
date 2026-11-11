@@ -87,12 +87,26 @@ class TestFlatFilesAreUnchanged(unittest.TestCase):
             self.assertEqual(got['body'], want['body'],
                              f"body differs in a '{want['type']}' block")
 
-    def test_every_con_file_in_the_repo_parses_identically(self):
+    def test_every_flat_con_file_in_the_repo_parses_identically(self):
+        """Every FLAT config, which is every config written before nesting.
+
+        Deliberately not every .con file: a nested one parses differently on
+        purpose, since the old reader could not see nesting at all. Skipping
+        them by detection rather than by name means a new nested example
+        cannot quietly opt itself out of a check it should be subject to.
+        """
         files = sorted(REPO.glob("**/*.con"))
         self.assertTrue(files, "no .con files found to check")
+
+        checked = 0
         for path in files:
+            if has_nesting(parse_con_tree(str(path))):
+                continue
             with self.subTest(con=str(path.relative_to(REPO))):
                 self.assert_same_as_old(str(path))
+            checked += 1
+
+        self.assertTrue(checked, "no flat .con files were actually checked")
 
     def test_a_typical_flat_config(self):
         with TemporaryDirectory() as tmp:
