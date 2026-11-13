@@ -7,14 +7,19 @@ import sys
 
 # Inbound APT message IDs.
 MSG_GET_POSCOUNTER = 0x0412
+MSG_GET_HOMEPARAMS = 0x0442
+MSG_MOVE_HOMED     = 0x0444
 MSG_MOVE_COMPLETED = 0x0464
 MSG_MOVE_STOPPED   = 0x0466
 
 # Outbound.
+MSG_REQ_POSCOUNTER = 0x0411
 MSG_MOVE_STOP = 0x0465
 MSG_SET_VELPARAMS = 0x0413
 MSG_REQ_VELPARAMS = 0x0414
 MSG_GET_VELPARAMS = 0x0415
+MSG_REQ_HOMEPARAMS = 0x0441
+MSG_MOVE_HOME      = 0x0443
 
 # APT velocity scaling for brushless (BBD) controllers is
 # counts_per_mm * T * 65536, where T is the controller's sampling interval.
@@ -41,6 +46,70 @@ def velocity_scale(counts_per_mm, sample_interval_s=BBD_SAMPLE_INTERVAL_S):
 # Param2 of MOVE_STOP selects the stop mode.
 STOP_IMMEDIATE = 0x01
 STOP_PROFILED  = 0x02
+
+# HOMEPARAMS fields. These live in the controller's own flash and nothing in
+# pscan writes them - they are read here only so a tool can SAY where zero is
+# rather than leaving someone to infer it from where the stage ended up.
+#
+# This is the whole reason 'home' and 'go to zero' look unrelated between two
+# controllers: the home direction, the switch it seeks and the offset applied
+# afterwards are per-controller stored state, usually set once in Kinesis or
+# APT User and then forgotten.
+HOME_DIR_FORWARD = 0x01
+HOME_DIR_REVERSE = 0x02
+LIMIT_SWITCH_REVERSE = 0x01
+LIMIT_SWITCH_FORWARD = 0x04
+
+# chan_ident, home_dir, limit_switch, home_velocity, offset_distance
+HOMEPARAMS_STRUCT = '<HHHll'
+HOMEPARAMS_LEN = struct.calcsize(HOMEPARAMS_STRUCT)  # 14
+
+
+def decode_home_params(payload, counts_per_mm=None):
+    """Unpack a GET_HOMEPARAMS payload into something readable.
+
+    `offset_mm` is None when no counts_per_mm is supplied, because converting
+    with a wrong scale would be worse than not converting: pscan's hardcoded
+    34304 is the Z8xx/TDC001 figure and is very likely wrong for a brushless
+    stage. The raw count is always reported alongside it.
+    """
+    if payload is None or len(payload) < HOMEPARAMS_LEN:
+        return None
+
+    _chan, direction, limit, velocity, offset = struct.unpack_from(
+        HOMEPARAMS_STRUCT, payload, 0)
+
+    directions = {HOME_DIR_FORWARD: 'forward', HOME_DIR_REVERSE: 'reverse'}
+    switches = {LIMIT_SWITCH_REVERSE: 'reverse', LIMIT_SWITCH_FORWARD: 'forward'}
+
+    return {
+        'direction': directions.get(direction, f'unknown (0x{direction:02x})'),
+        'limit_switch': switches.get(limit, f'unknown (0x{limit:02x})'),
+        'velocity_counts': velocity,
+        'offset_counts': offset,
+        'offset_mm': (offset / counts_per_mm) if counts_per_mm else None,
+    }
+
+
+def describe_zero(params):
+    """One line saying where this axis's zero sits, for a UI to show.
+
+    Deliberately refuses to call anything 'the centre'. Whether zero is the
+    middle of travel depends on the travel length, which is a property of the
+    stage and is not reported over APT - so this says what it knows (distance
+    from which limit switch) and leaves the rest alone.
+    """
+    if params is None:
+        return "unknown (controller did not answer)"
+
+    switch = f"{params['limit_switch']} limit"
+    offset_mm = params['offset_mm']
+
+    if offset_mm is None:
+        return f"{params['offset_counts']} counts from the {switch}"
+    if abs(offset_mm) < 1e-6:
+        return f"at the {switch} - i.e. a corner of travel, not the centre"
+    return f"{offset_mm:.5f} mm from the {switch}"
 
 
 class ThorlabsStage:

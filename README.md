@@ -160,19 +160,50 @@ Once installed, the package exposes two global terminal commands that can be run
 To manually jog the Thorlabs stage, enable/disable axes, or define your absolute focus coordinates, launch the Precision Control CLI:
    pystage
 
-Controls: Use Arrow Keys to jog, 'J' to adjust step size (mm), '1' or '2' to toggle motor power, and 'H' to home the stages and clear safety lockouts.
+Controls:
+
+   Arrow Keys   jog the axes by the current step size
+   J            set the step size (mm)
+   G            go to an absolute X/Y target
+   C            go to zero (0,0)
+   1 / 2        toggle X / Y motor power
+   R            re-read positions and zero from the controller
+   H            home the stages and clear safety lockouts
+   Q            quit
+
+H and C are not two kinds of centring, and they are not interchangeable:
+
+* **H** is a hardware seek. The controller drives the axis until it trips a
+  limit switch and then *defines that point as encoder zero*. It waits for the
+  controller's MOVE_HOMED confirmation per axis and says which axes answered,
+  so an axis that stalled is named rather than assumed.
+* **C** is an ordinary absolute move to encoder coordinate 0 - wherever H last
+  put it. Straight after a successful home, C is a no-op.
+
+Neither key centres the stage. Whether (0,0) is the middle of travel or a
+corner of it depends on the home direction, limit switch and offset distance
+stored in the controller's own flash (APT `SET_HOMEPARAMS`), which nothing in
+pscan writes - they are normally set once in Kinesis or APT User. **This is why
+a BBD20x and a BBD30x on the same bench can behave differently: it is stored
+controller state, not a model pscan knows about.** pystage reads those
+parameters and prints them on the `Zero X:` / `Zero Y:` lines, so the panel
+tells you whether zero is sitting on a limit switch (a corner) or offset away
+from one.
+
+C acts only on *enabled* axes and names any it skipped. If you have toggled an
+axis off with '1' or '2', C moves the other one and says so.
 
 1b. DAQ Card Inspection (pydaq)
 This is the bring-up tool for a new card. Before writing a .con file against
 one, use it to confirm pscan sees the card, under which backend, with which
 channels and ranges - and to check there is actually a signal on the input.
 
-   pydaq-dev list                          what pscan can see, and what it can't
-   pydaq-dev list --all                    also the Phidget, which auto-detect skips
-   pydaq-dev read --channel 0              acquire a trace, print its statistics
-   pydaq-dev read --channel 0 --v-min -1 --v-max 1
-   pydaq-dev set 1.5 --channel 0           hold an output at 1.5 V
-   pydaq-dev set +0.1 --channel 0          step it relative to where it is
+   pydaq list                              what pscan can see, and what it can't
+   pydaq list --all                        also the Phidget, which auto-detect skips
+   pydaq read --channel 0                  acquire a trace, print its statistics
+   pydaq read --channel 0 --v-min -1 --v-max 1
+   pydaq set 1.5 --channel 0               hold an output at 1.5 V
+   pydaq set +0.1 --channel 0              step it relative to where it is
 
 `list` prints the exact `backend` and `device` lines to paste into a .con
 block, so pinning a config to a specific card is copy-and-paste. Without
@@ -375,7 +406,7 @@ Two further things that bite on Linux:
     `sudo dkms status`.
   * X Series PCIe boards have been reported throwing DMA faults on kernels
     newer than an LTS release. The fix is the `iommu=pt` kernel parameter. If
-    `pydaq-dev list` sees the card but `pydaq-dev read` fails with a hardware
+    `pydaq list` sees the card but `pydaq read` fails with a hardware
     error, try that before anything else.
 
 ### RUNNING THE TESTS
