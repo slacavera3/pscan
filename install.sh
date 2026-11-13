@@ -896,12 +896,31 @@ done
 
 # Brute-force delete any lingering files, including the old venv and its
 # -dev command symlinks.
-rm -rf ~/.local/lib/python*/site-packages/pscan*
+#
+# Both top-level packages are named explicitly. The glob used to be 'pscan*',
+# which does not match 'flyscan', so flyscan/ survived every reinstall: a
+# module deleted upstream stayed importable out of site-packages and the
+# installed flyscan was a mix of two versions.
+for _pkg in pscan flyscan pscan_lab pscan-lab; do
+    rm -rf ~/.local/lib/python*/site-packages/"$_pkg"*
+    sudo rm -rf /usr/local/lib/python*/dist-packages/"$_pkg"*
+done
 rm -rf ~/.local/share/pscan
-rm -f ~/.local/bin/pscan ~/.local/bin/pscan ~/.local/bin/pystage \
-      ~/.local/bin/pypiezo ~/.local/bin/pydaq ~/.local/bin/flyscan
-sudo rm -rf /usr/local/lib/python*/dist-packages/pscan*
-sudo rm -f /usr/local/bin/pscan
+
+# Every command, under both prefixes. This used to remove ~/.local/bin/pscan
+# twice and /usr/local/bin/pscan once, leaving pystage, pypiezo, pydaq and
+# flyscan behind in /usr/local/bin.
+#
+# That is not cosmetic. The .egg-info is deleted just above, so pip no longer
+# knows anything is installed; if the install below then fails, those four
+# files stay on PATH as executable stubs importing a package that is no longer
+# there. 'pscan' says "command not found" while 'pystage' dies with
+# ModuleNotFoundError - which reads as a code bug rather than a failed
+# install, and sends you looking in the wrong place.
+for _cmd in pscan pystage pypiezo pydaq flyscan; do
+    rm -f ~/.local/bin/"$_cmd"
+    sudo rm -f /usr/local/bin/"$_cmd"
+done
 
 # --- 6. Clean Installation ---
 echo -e "\n[6/6] Compiling and installing pscan..."
@@ -916,8 +935,31 @@ echo -e "\n[6/6] Compiling and installing pscan..."
 # The second forces just pscan itself, so a code change always takes even when
 # the version number has not moved. Forcing everything would reinstall 90 MB
 # of wheels on every run for no reason.
-sudo pip install --no-cache-dir . $FLAG
-sudo pip install --force-reinstall --no-deps --no-cache-dir . $FLAG
+sudo pip install --no-cache-dir . $FLAG || INSTALL_FAILED=1
+sudo pip install --force-reinstall --no-deps --no-cache-dir . $FLAG || INSTALL_FAILED=1
+
+# Stop here rather than carrying on to the verify step.
+#
+# There is no 'set -e' in this script, so without this check both commands
+# above can fail and the run still reaches the summary, which reports the much
+# softer "the commands may exist but will not work" - after step [5/6] has
+# already deleted the installation that was working five seconds earlier. Say
+# plainly that the machine has no pscan on it at all now, because that is the
+# state the next command the user types will be in.
+if [ -n "${INSTALL_FAILED:-}" ]; then
+    echo ""
+    echo " *** INSTALL FAILED: pip could not install pscan."
+    echo " ***"
+    echo " *** Step [5/6] removed the previous installation, so there is NO"
+    echo " *** working pscan on this machine right now - pscan, pystage,"
+    echo " *** pypiezo, pydaq and flyscan are all gone until this succeeds."
+    echo " ***"
+    echo " *** Read pip's error above; the usual causes are no network, a"
+    echo " *** PEP 668 refusal, or a wheel that has to compile and cannot."
+    echo " *** Fix it and re-run 'bash install.sh'. The git tree here is"
+    echo " *** untouched, so nothing of yours is lost."
+    exit 1
+fi
 
 # The nidaqmx Python binding, only when the driver it wraps is actually
 # present - 'pydaq list' reporting the backend as available when there is no
