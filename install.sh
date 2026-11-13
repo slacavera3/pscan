@@ -14,12 +14,37 @@ echo "======================================================="
 # upgrade, when NI-DAQmx's modules need rebuilding but nothing in Python has
 # changed.
 #
+# --calibrate runs the counts-per-mm calibration at the end of the install.
+# OFF by default, and deliberately so: calibration moves the stage, and an
+# installer that drives hardware nobody asked it to touch - possibly with a
+# sample mounted - is a bad trade for the convenience. A normal install only
+# reports whether a calibration exists.
+#
 # Every driver step is idempotent, so re-running this costs seconds.
 DRIVERS_ONLY=0
-if [ "${1:-}" = "--drivers-only" ]; then
-    DRIVERS_ONLY=1
-    echo " MODE: shared system drivers only (no Python packages)"
-fi
+CALIBRATE=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --drivers-only)
+            DRIVERS_ONLY=1
+            echo " MODE: shared system drivers only (no Python packages)"
+            ;;
+        --calibrate)
+            CALIBRATE=1
+            echo " MODE: will calibrate counts-per-mm after installing"
+            ;;
+        --help|-h)
+            echo "usage: bash install.sh [--drivers-only] [--calibrate]"
+            echo "  --drivers-only  system drivers only, no Python packages"
+            echo "  --calibrate     after installing, measure counts-per-mm."
+            echo "                  MOVES THE STAGE. Clear the sample first."
+            exit 0
+            ;;
+        *)
+            echo " [WARNING] ignoring unknown argument '$_arg'"
+            ;;
+    esac
+done
 
 # ldconfig lives in /sbin, which is NOT on a normal user's PATH on Debian and
 # Ubuntu. Calling it bare makes every "is this library installed?" check come
@@ -1007,6 +1032,48 @@ sys.exit(1 if problems else 0)
 else
     echo " -> [ERROR] The installation is not usable (see above)."
     INSTALL_OK=0
+fi
+
+# --- Stage calibration ------------------------------------------------------
+#
+# counts-per-mm belongs to the stage and its controller, not to pscan. The
+# hardcoded 34304 is the Z8xx/TDC001 DC-servo figure; a BBD303 driving an
+# MLS203 reports 20000. A wrong value rescales every position silently - the
+# data look healthy and the microns are wrong - so say plainly whether this
+# machine has settled the question.
+#
+# Not run by default. Calibration moves the stage, and an installer that
+# drives hardware nobody asked it to touch, possibly with a sample mounted, is
+# a bad trade for the convenience.
+if [ "${INSTALL_OK:-0}" -eq 1 ]; then
+    # Under sudo, $HOME is root's. The calibration belongs to the person who
+    # ran this, so look where they would actually have written it.
+    CAL_HOME="$HOME"
+    if [ -n "${SUDO_USER:-}" ]; then
+        CAL_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    fi
+    CAL_USER_FILE="$CAL_HOME/.config/pscan/stage_calibration.json"
+    CAL_SYS_FILE="/etc/pscan/stage_calibration.json"
+
+    if [ "$CALIBRATE" -eq 1 ]; then
+        echo -e "\nCalibrating counts-per-mm..."
+        echo " *** This MOVES THE STAGE. Ctrl-C now if a sample is mounted."
+        if [ -n "${SUDO_USER:-}" ]; then
+            sudo -u "$SUDO_USER" pystage --calibrate \
+                || echo " -> calibration did not complete; run it again later."
+        else
+            pystage --calibrate \
+                || echo " -> calibration did not complete; run it again later."
+        fi
+    elif [ -s "$CAL_USER_FILE" ] || [ -s "$CAL_SYS_FILE" ]; then
+        echo -e "\nStage calibration: present."
+    else
+        echo -e "\nStage calibration: NONE recorded on this machine."
+        echo " -> pscan will use the controller's own cnts_per_unit where it"
+        echo " -> reports one, and fall back to 34304 where it does not."
+        echo " -> Run 'pystage --calibrate' to settle it against the actual"
+        echo " -> stage. It moves the stage, so clear the sample first."
+    fi
 fi
 
 report_vendor_requests

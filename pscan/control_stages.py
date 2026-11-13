@@ -1,3 +1,4 @@
+import argparse
 import sys
 import os
 import struct
@@ -18,6 +19,10 @@ from pscan.stage_driver import (
     decode_stage_axis_params, validate_travel, travel_centre_mm,
     travel_centre_counts, describe_travel, describe_axis_raw,
     scale_disagreement,
+)
+from pscan.calibrate import (
+    LEGACY_COUNTS_PER_MM, SOURCE_LEGACY,
+    counts_per_mm_for, describe_source, run_calibration,
 )
 
 # How long to wait for a homing seek to report back. Generous on purpose: the
@@ -56,10 +61,36 @@ else:
 # 2. The Fixed Stage Driver
 # ==========================================
 class SimpleStage:
-    def __init__(self):
+    def __init__(self, scale=None):
         self.ser = None
-        self.scale = 34304.0
+        # The legacy single scale, kept as the fallback and as what callers
+        # that predate per-axis calibration still read.
+        self.scale = float(scale) if scale else LEGACY_COUNTS_PER_MM
+        # Per axis, because two axes can carry different encoders and because
+        # the calibration store is keyed per axis. Populated by
+        # apply_calibration() once the controller has identified itself.
+        self.scales = {1: self.scale, 2: self.scale}
+        self.scale_sources = {1: SOURCE_LEGACY, 2: SOURCE_LEGACY}
         self.velocity_mm_s = None
+
+    def scale_for(self, axis_id):
+        return self.scales.get(axis_id, self.scale)
+
+    def apply_calibration(self, calibration=None):
+        """Resolve each axis's counts-per-mm: stored, else controller, else default.
+
+        Called after connect(), because the store is keyed by the controller's
+        serial and the stage's part number and neither is known until the
+        controller has been asked.
+        """
+        for axis_id in (1, 2):
+            params = self.get_stage_axis_params(axis_id)
+            value, source = counts_per_mm_for(params, axis_id,
+                                              calibration=calibration,
+                                              fallback=self.scale)
+            self.scales[axis_id] = value
+            self.scale_sources[axis_id] = source
+        return self.scales
 
     def _read_exactly(self, n, timeout_s):
         """Read exactly n bytes, or return None if they do not arrive in time."""
@@ -202,7 +233,7 @@ class SimpleStage:
                                    dest, 0x01))
 
         payload = self._await_reply(MSG_GET_HOMEPARAMS, dest)
-        return decode_home_params(payload, self.scale)
+        return decode_home_params(payload, self.scale_for(axis_id))
 
     def set_velocity_mm_s(self, axis_id, mm_per_s):
         """Set max velocity, leaving acceleration as the controller has it.
@@ -215,7 +246,7 @@ class SimpleStage:
         if current is None:
             return False
 
-        raw = int(round(mm_per_s * velocity_scale(self.scale)))
+        raw = int(round(mm_per_s * velocity_scale(self.scale_for(axis_id))))
         dest = 0x20 + axis_id
         payload = struct.pack('<Hlll', 0x01, current['min'],
                               current['accel'], raw)
@@ -340,11 +371,20 @@ class SimpleStage:
         counts = self.get_position_counts(axis_id)
         if counts is None:
             return None
-        return counts / self.scale
+        return counts / self.scale_for(axis_id)
 
     def move_relative(self, axis_id, distance_mm):
+        self.move_relative_counts(
+            axis_id, int(distance_mm * self.scale_for(axis_id)))
+
+    def move_relative_counts(self, axis_id, counts):
+        """Jog by an exact number of counts, with no scale in the way.
+
+        What the calibration uses: the quantity being calibrated is the
+        counts-to-mm conversion, so setting up the measurement through it
+        would make the result depend on the answer.
+        """
         dest = 0x20 + axis_id
-        counts = int(distance_mm * self.scale)
         data = struct.pack('<Hl', 0x01, counts)
         header = struct.pack('<HBBBB', 0x0445, 0x06, 0x00, dest | 0x80, 0x01)
         self.ser.write(header + data)
@@ -352,7 +392,8 @@ class SimpleStage:
         self.ser.write(struct.pack('<HBBBB', 0x0448, 0x01, 0x00, dest, 0x01))
 
     def move_absolute(self, axis_id, position_mm):
-        self.move_absolute_counts(axis_id, int(position_mm * self.scale))
+        self.move_absolute_counts(
+            axis_id, int(position_mm * self.scale_for(axis_id)))
 
     def move_absolute_counts(self, axis_id, counts):
         """Move to an absolute encoder count, with no scale in the way.
@@ -385,7 +426,25 @@ def format_position(pos):
     return f"{pos:8.5f}"
 
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog='pystage',
+        description='Jog the Thorlabs stages, and calibrate counts-per-mm.')
+    parser.add_argument(
+        '--calibrate', action='store_true',
+        help='establish counts-per-mm for this stage and controller, then '
+             'store it, instead of opening the jog UI')
+    parser.add_argument(
+        '--span', action='store_true',
+        help='with --calibrate, also travel the full reported range to '
+             'cross-check against the datasheet travel. Moves the stage '
+             'across its whole travel, so clear the sample first.')
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
     stage = SimpleStage()
     try:
         port = stage.connect()
@@ -393,7 +452,18 @@ def main():
         print(f"Connection failed: {e}")
         return
 
-    current_step = 0.5 
+    # Before anything is displayed or commanded in millimetres, settle what a
+    # millimetre is on this rig: a stored measurement if one exists, else the
+    # controller's own figure, else the legacy 34304 that started all this.
+    stage.apply_calibration()
+
+    if args.calibrate:
+        run_calibration(stage, allow_span=args.span)
+        stage.apply_calibration()
+        print("\nCalibration finished. Re-run 'pystage' to use it.")
+        return
+
+    current_step = 0.5
     msg = "Connected. Use Arrow Keys to jog."
 
     # Not 'or 0.0'. A position the controller did not report is unknown, and
@@ -404,8 +474,8 @@ def main():
     # and what a move is commanded in, so they are the thing that has to be
     # right even when the mm scale is not.
     pos_counts = {axis: stage.get_position_counts(axis) for axis in (1, 2)}
-    x_pos = counts_to_mm(pos_counts[1], stage.scale)
-    y_pos = counts_to_mm(pos_counts[2], stage.scale)
+    x_pos = counts_to_mm(pos_counts[1], stage.scale_for(1))
+    y_pos = counts_to_mm(pos_counts[2], stage.scale_for(2))
 
     x_enabled = True
     y_enabled = True
@@ -440,14 +510,19 @@ def main():
         # travel depends on the offset below, which lives in the controller.
         print(f" Zero   X: {describe_zero(zero[1])}")
         print(f" Zero   Y: {describe_zero(zero[2])}")
-        print(f" Travel X: {describe_travel(travel[1], stage.scale, pos_counts[1])}")
-        print(f" Travel Y: {describe_travel(travel[2], stage.scale, pos_counts[2])}")
+        print(f" Travel X: {describe_travel(travel[1], stage.scale_for(1), pos_counts[1])}")
+        print(f" Travel Y: {describe_travel(travel[2], stage.scale_for(2), pos_counts[2])}")
+        # Said out loud, because a counts-per-mm nobody can see the
+        # provenance of is exactly how 34304 survived on a rig that reports
+        # 20000.
+        print(f" Scale  X: {describe_source(stage.scale_for(1), stage.scale_sources[1])}")
+        print(f" Scale  Y: {describe_source(stage.scale_for(2), stage.scale_sources[2])}")
         print("==================================================")
         print("   Up/Down/L/R : Jog Axes   |  J : Set Step Size")
         print("   G           : Go To Abs  |  C : Centre of Travel")
         print("   1 / 2       : Toggle X/Y |  R : Refresh Pos")
         print("   H           : Home Stage |  D : Dump Raw Axis")
-        print("   Q           : Quit")
+        print("   K           : Calibrate  |  Q : Quit")
         print("==================================================")
         print(f" [MSG] {msg}")
         
@@ -489,6 +564,25 @@ def main():
                 except ValueError:
                     msg = "Invalid coordinates entered. Move cancelled."
 
+            elif key_str == 'k':
+                # The same procedure as 'pystage --calibrate', from inside
+                # the UI. --span is not offered here: driving the full travel
+                # is worth a deliberate command line, not a keystroke next to
+                # the jog keys.
+                print("\n --- CALIBRATE counts-per-mm ---")
+                try:
+                    run_calibration(stage)
+                except Exception as e:
+                    print(f" calibration aborted: {e}")
+                stage.apply_calibration()
+                zero = {axis: stage.get_home_params(axis) for axis in (1, 2)}
+                travel = {axis: stage.get_stage_axis_params(axis)
+                          for axis in (1, 2)}
+                print(" --- press any key to continue ---")
+                get_key()
+                msg = "Calibration run; scale reloaded."
+                needs_refresh = True
+
             elif key_str == 'd':
                 # Every decoded field, raw. The 0x04F2 layout is transcribed
                 # from third-party libraries rather than Thorlabs' manual, so
@@ -506,7 +600,7 @@ def main():
                         ok, why = validate_travel(
                             params, stage.get_position_counts(axis))
                         print(f"    usable for C: {ok} - {why}")
-                        warn = scale_disagreement(params, stage.scale)
+                        warn = scale_disagreement(params, stage.scale_for(axis))
                         if warn:
                             print(f"    scale: {warn}")
                 print(" --- press any key to continue ---")
@@ -641,8 +735,8 @@ def main():
                     counts = stage.get_position_counts(axis)
                     if counts is not None:
                         pos_counts[axis] = counts
-                x_pos = counts_to_mm(pos_counts[1], stage.scale)
-                y_pos = counts_to_mm(pos_counts[2], stage.scale)
+                x_pos = counts_to_mm(pos_counts[1], stage.scale_for(1))
+                y_pos = counts_to_mm(pos_counts[2], stage.scale_for(2))
                 needs_refresh = False
 
     os.system('cls' if os.name == 'nt' else 'clear')

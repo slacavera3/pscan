@@ -49,6 +49,11 @@ class FakeController:
         self._in = bytearray()
         self.is_open = True
         self.targets = {}
+        self.rel_targets = {}
+        # Travel is enforced: a relative move that would run past a limit
+        # stops at it, as the hardware does. Without this a calibration step
+        # could "succeed" past the end of the stage.
+        self.enforce_limits = True
 
     # --- pyserial surface ---
     def read(self, n=1):
@@ -90,9 +95,16 @@ class FakeController:
                     return
                 payload = bytes(self._in[6:6 + length])
                 del self._in[:6 + length]
-                if msg_id == 0x0450 and (dest & 0x7F) in (0x21, 0x22):
+                if msg_id in (0x0450, 0x0445) and (dest & 0x7F) in (0x21, 0x22):
+                    # 0x0450 SET_MOVEABSPARAMS / 0x0445 SET_MOVERELPARAMS.
+                    # Both stash a target; which one is applied depends on
+                    # the trigger that follows.
                     _chan, counts = struct.unpack_from('<Hl', payload, 0)
-                    self.targets[(dest & 0x7F) - 0x20] = counts
+                    axis = (dest & 0x7F) - 0x20
+                    if msg_id == 0x0450:
+                        self.targets[axis] = counts
+                    else:
+                        self.rel_targets[axis] = counts
             else:
                 del self._in[:6]
                 self._reply(msg_id, dest)
@@ -130,11 +142,26 @@ class FakeController:
             self.out += _short(0x0444, dest)
         elif msg_id == 0x0453:                                # MOVE_ABSOLUTE
             if axis in self.targets:
-                self.position[axis] = self.targets.pop(axis)
-            self.out += _long(0x0464,
-                              struct.pack('<HllL', 0x01, self.position[axis],
-                                          self.position[axis], 0x80000400),
-                              dest)
+                self.position[axis] = self._clamp(
+                    axis, self.targets.pop(axis))
+            self._completed(axis, dest)
+        elif msg_id == 0x0448:                                # MOVE_RELATIVE
+            if axis in self.rel_targets:
+                self.position[axis] = self._clamp(
+                    axis, self.position[axis] + self.rel_targets.pop(axis))
+            self._completed(axis, dest)
+
+    def _clamp(self, axis, target):
+        if not self.enforce_limits:
+            return target
+        lo, hi = self.travel[axis]
+        return max(lo, min(hi, target))
+
+    def _completed(self, axis, dest):
+        self.out += _long(0x0464,
+                          struct.pack('<HllL', 0x01, self.position[axis],
+                                      self.position[axis], 0x80000400),
+                          dest)
 
 
 class NoPorts:
@@ -143,18 +170,28 @@ class NoPorts:
         return []
 
 
-def drive(fake, keys):
-    """Run main() through these keystrokes, returning everything printed."""
+def drive(fake, keys, calibration=None):
+    """Run main() through these keystrokes, returning everything printed.
+
+    main([]) rather than main(): with no argv it would parse pytest's own
+    command line and exit.
+
+    The calibration store is stubbed empty by default so these tests read the
+    controller rather than whatever happens to be saved on the machine
+    running them.
+    """
     it = iter(list(keys) + ['q'])
     printed = []
     with mock.patch.object(cs.serial, 'Serial', return_value=fake), \
             mock.patch.object(cs.serial.tools, 'list_ports', NoPorts), \
             mock.patch.object(cs, 'get_key', lambda: next(it)), \
             mock.patch.object(cs.os, 'system', lambda *a, **k: None), \
+            mock.patch('pscan.calibrate.load_calibration',
+                       return_value=dict(calibration or {})), \
             mock.patch('builtins.print',
                        side_effect=lambda *a, **k: printed.append(
                            ' '.join(str(x) for x in a))):
-        cs.main()
+        cs.main([])
     return '\n'.join(printed)
 
 
@@ -307,11 +344,32 @@ class TestRealBBD303(unittest.TestCase):
         drive(fake, ['c', 'c'])
         self.assertEqual(fake.position[1], -55 * self.CNTS)
 
-    def test_panel_warns_that_the_mm_scale_disagrees(self):
+    def test_scale_now_comes_from_the_controller_not_34304(self):
+        """The fix for the original bug: 20000 is adopted, and said out loud."""
         out = drive(self._rig(), [])
+        self.assertIn('20000.0 counts/mm (declared by the controller)', out)
+        self.assertNotIn('34304.0 counts/mm', out)
+
+    def test_no_disagreement_warning_once_the_scale_is_right(self):
+        out = drive(self._rig(), [])
+        self.assertNotIn('(!)', out)
+
+    def test_positions_are_now_in_real_millimetres(self):
+        """-42.06623 mm was the 34304 reading of -840000 counts."""
+        fake = self._rig(x_mm=-42.0)
+        out = drive(fake, [])
+        self.assertIn('-42.00000', out)
+
+    def test_a_stored_value_that_disagrees_is_flagged(self):
+        """A measurement contradicting the controller is worth seeing."""
+        stored = {f'123456:MLS203:1': {'counts_per_mm': 18000.0,
+                                       'source': 'manual'},
+                  f'123456:MLS203:2': {'counts_per_mm': 18000.0,
+                                       'source': 'manual'}}
+        out = drive(self._rig(), [], calibration=stored)
         self.assertIn('(!)', out)
-        self.assertIn('20000', out)
-        self.assertIn('34304', out)
+        self.assertIn('18000', out)
+        self.assertIn('measured on this rig', out)
 
     def test_panel_shows_the_negative_span(self):
         out = drive(self._rig(), [])

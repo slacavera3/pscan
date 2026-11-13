@@ -169,6 +169,7 @@ Controls:
    1 / 2        toggle X / Y motor power
    R            re-read positions, zero and travel from the controller
    D            dump the raw stage-axis parameters (diagnostics)
+   K            calibrate counts-per-mm for this stage and controller
    H            home the stages and clear safety lockouts
    Q            quit
 
@@ -232,6 +233,59 @@ move is never reported as having centred both.
 **D** dumps every decoded `0x04F2` field raw - resolution, limits, the
 position counter, the computed midpoint and whether C would accept it. That is
 the first thing to run when C refuses on a controller you have not used before.
+
+#### Counts per mm, and calibrating it
+
+counts-per-mm belongs to the stage and its controller, not to pscan. pscan
+hardcoded **34304**, which is the Z8xx/TDC001 DC-servo figure; a BBD303
+driving an MLS203 reports **20000** (50 nm). A wrong value rescales every
+position silently - the data look perfectly healthy and the microns are wrong.
+
+pystage now resolves it per axis, in this order, and **prints which source it
+used** on the `Scale X:` / `Scale Y:` lines, because a number whose provenance
+nobody can see is how 34304 survived:
+
+1. a stored calibration for this controller serial + stage part + axis;
+2. the controller's own `cnts_per_unit` from `0x04F2`;
+3. 34304, announced as `UNCALIBRATED fallback`.
+
+Calibrate with `pystage --calibrate`, or **K** from inside the UI:
+
+```
+pystage --calibrate              # controller figure, plus an optional
+                                 # human-referenced measurement
+pystage --calibrate --span       # also travel the full reported range
+```
+
+Three sources, because software alone cannot measure a length - there is no
+reference inside the loop:
+
+| method | needs | moves the stage | a measurement? |
+|---|---|---|---|
+| `controller` | nothing; reads `cnts_per_unit` | no | no, a declaration |
+| `span` | the stage's datasheet travel | across full travel | no, trades one constant for another |
+| `manual` | your own micrometer or target reading | one known jog | **yes** |
+
+They are worth having together because they cross-check: if
+`span_counts / cnts_per_unit` comes out at the datasheet travel, the
+controller's figure is independently corroborated. Disagreements are reported
+rather than resolved silently, and the best evidence wins - a measurement over
+a derivation over a claim.
+
+The manual step commands a move in **counts**, not millimetres, so setting up
+the measurement does not depend on the answer being measured. Records are
+keyed by controller serial, stage part number and axis, so a figure measured
+on one rig is never silently reused on another - which is the failure that
+produced the 34304 problem in the first place.
+
+Stored in `~/.config/pscan/stage_calibration.json`, with
+`/etc/pscan/stage_calibration.json` as a machine-wide default the user file
+overrides.
+
+`install.sh` does **not** calibrate by default - it only reports whether a
+calibration exists. An installer that drives hardware to its limits unasked,
+possibly with a sample mounted, is a bad trade for the convenience. Opt in
+with `bash install.sh --calibrate`.
 
 1b. DAQ Card Inspection (pydaq)
 This is the bring-up tool for a new card. Before writing a .con file against
