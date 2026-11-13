@@ -719,25 +719,44 @@ echo -e "\n[1.8/6] Checking the NI card is reachable..."
 # driver and an unreachable card.
 release_card_from_vfio
 
-# The IOMMU half of the same problem. Debian enables the IOMMU by default, so
-# this is not something pscan did, but NI's driver does not use the kernel DMA
-# API the way address translation expects: buffered acquisition then fails
-# with "-50152 A hardware failure has occurred" while single samples, self
-# test and analog output all work, because only buffered acquisition uses DMA.
-for _grp in /sys/bus/pci/devices/*/iommu_group; do
-    [ -e "$_grp" ] || continue
-    _slot="$(basename "$(dirname "$_grp")")"
-    [ "$(cat "/sys/bus/pci/devices/$_slot/vendor" 2>/dev/null)" = "0x1093" ] \
-        || continue
+# The IOMMU half of the same problem - BUT ONLY WHERE NI-DAQmx DRIVES THE
+# CARD.
+#
+# NI's own driver does not use the kernel DMA API the way address translation
+# expects, so buffered acquisition fails with "-50152 A hardware failure has
+# occurred" while single samples, self test and analog output all work.
+# iommu=pt fixes that.
+#
+# comedi's ni_pcimio does not have the problem: it is an ordinary in-tree
+# driver and uses the DMA API properly, so an M Series card on comedi works
+# with the IOMMU translating and needs nothing changed.
+#
+# This was briefly unconditional, and edited /etc/default/grub on a stable
+# comedi rig that had no use for it. Editing boot configuration is the most
+# intrusive thing this installer does and it has to be earned, not done on
+# the off-chance the card might one day be driven by something else.
+if have_lib libnidaqmx; then
+    for _grp in /sys/bus/pci/devices/*/iommu_group; do
+        [ -e "$_grp" ] || continue
+        _slot="$(basename "$(dirname "$_grp")")"
+        [ "$(cat "/sys/bus/pci/devices/$_slot/vendor" 2>/dev/null)" = "0x1093" ] \
+            || continue
 
-    _gid="$(basename "$(readlink -f "$_grp")")"
-    _type="$(cat "/sys/kernel/iommu_groups/$_gid/type" 2>/dev/null)"
+        _gid="$(basename "$(readlink -f "$_grp")")"
+        _type="$(cat "/sys/kernel/iommu_groups/$_gid/type" 2>/dev/null)"
 
-    case "$_type" in
-        DMA*) ensure_iommu_passthrough || true ;;
-    esac
-    break
-done
+        case "$_type" in
+            DMA*) ensure_iommu_passthrough || true ;;
+        esac
+        break
+    done
+elif grep -qls '^0x1093$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+    # Say nothing is needed, rather than nothing at all. Someone who reads
+    # about iommu=pt elsewhere should be able to tell it was considered.
+    echo " ->   NI card present but NI-DAQmx is not installed, so comedi"
+    echo " ->   drives it. comedi needs no IOMMU change; boot config"
+    echo " ->   untouched."
+fi
 
 # --- 2. Setup Tucsen SDK Drivers ---
 echo -e "\n[2/6] Setting up Tucsen Dhyana SDK..."
