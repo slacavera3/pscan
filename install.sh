@@ -538,6 +538,26 @@ install_nidaqmx() {
         echo " ->           packages. The apt feed is pinned below so it"
         echo " ->           cannot replace Debian system libraries."
 
+        # If comedi currently drives an NI card here, say so before changing
+        # anything. Two kernel drivers cannot bind the same PCI function:
+        # ni_pcimio and NI's own driver both claim NI boards, and whichever
+        # binds first owns it. The loser's card simply is not there - comedi
+        # finds cards through /dev/comediN, which stops existing if NI's
+        # driver won.
+        #
+        # Not a warning against doing it, and not predicting which wins:
+        # stated because 'pydaq list' afterwards is the only way to know, and
+        # a card that has quietly changed hands looks like a card that has
+        # failed. The same mistake as the vfio-pci binding, which cost a day.
+        if ls /dev/comedi0 >/dev/null 2>&1 && \
+           grep -qls '^0x1093$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+            echo " ->"
+            echo " ->           NOTE: comedi currently has a device node and an"
+            echo " ->           NI card is present. Both drivers claim NI"
+            echo " ->           boards and only one can own a card, so check"
+            echo " ->           with 'pydaq list' afterwards which one has it."
+        fi
+
         # Ubuntu 24.04 (noble), not 22.04 (jammy).
         #
         # The closer the libc, the fewer surprises: Debian 13 ships glibc
