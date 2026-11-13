@@ -16,7 +16,8 @@ from pscan.stage_driver import (
     DEFAULT_MANUAL_VELOCITY_MM_S, velocity_scale,
     decode_home_params, describe_zero,
     decode_stage_axis_params, validate_travel, travel_centre_mm,
-    describe_travel,
+    travel_centre_counts, describe_travel, describe_axis_raw,
+    scale_disagreement,
 )
 
 # How long to wait for a homing seek to report back. Generous on purpose: the
@@ -181,12 +182,17 @@ class SimpleStage:
         payload = self._await_reply(MSG_GET_STAGEAXISPARAMS, dest)
         return decode_stage_axis_params(payload)
 
-    def travel_centre(self, params):
-        """The centre of travel in mm, or (None, reason it is unavailable)."""
-        ok, reason = validate_travel(params, self.scale)
+    def travel_centre(self, axis_id, params):
+        """The centre of travel in COUNTS, or (None, why it is unavailable).
+
+        Reads the position counter itself, because the check that matters is
+        whether the reported limits bracket where the stage actually is.
+        """
+        position = self.get_position_counts(axis_id)
+        ok, reason = validate_travel(params, position)
         if not ok:
             return None, reason
-        return travel_centre_mm(params, self.scale), reason
+        return travel_centre_counts(params), reason
 
     def get_home_params(self, axis_id):
         """Read where this axis's zero will land, or None on no reply."""
@@ -312,7 +318,13 @@ class SimpleStage:
         confirmed = self.wait_for_homed(axis_ids, timeout_s=timeout_s)
         return confirmed, set(axis_ids) - confirmed
 
-    def get_position(self, axis_id):
+    def get_position_counts(self, axis_id):
+        """Raw encoder counts, unscaled. The authority for anything that moves.
+
+        Separate from get_position() because counts need no counts_per_mm to
+        be correct, and comparing a position against the controller's own
+        travel limits has to happen in the controller's own units.
+        """
         dest = 0x20 + axis_id
         self.ser.reset_input_buffer()
         self.ser.write(struct.pack('<HBBBB', MSG_REQ_POSCOUNTER, 0x01, 0x00,
@@ -322,6 +334,12 @@ class SimpleStage:
         if payload is None or len(payload) < 6:
             return None
         _chan, counts = struct.unpack_from('<Hl', payload, 0)
+        return counts
+
+    def get_position(self, axis_id):
+        counts = self.get_position_counts(axis_id)
+        if counts is None:
+            return None
         return counts / self.scale
 
     def move_relative(self, axis_id, distance_mm):
@@ -334,8 +352,16 @@ class SimpleStage:
         self.ser.write(struct.pack('<HBBBB', 0x0448, 0x01, 0x00, dest, 0x01))
 
     def move_absolute(self, axis_id, position_mm):
+        self.move_absolute_counts(axis_id, int(position_mm * self.scale))
+
+    def move_absolute_counts(self, axis_id, counts):
+        """Move to an absolute encoder count, with no scale in the way.
+
+        What C uses. The centre of travel is a midpoint in counts, and going
+        through millimetres to get there would reintroduce exactly the scale
+        error the midpoint does not otherwise care about.
+        """
         dest = 0x20 + axis_id
-        counts = int(position_mm * self.scale)
         data = struct.pack('<Hl', 0x01, counts)
         header = struct.pack('<HBBBB', 0x0450, 0x06, 0x00, dest | 0x80, 0x01)
         self.ser.write(header + data)
@@ -345,6 +371,13 @@ class SimpleStage:
 # ==========================================
 # 3. Main CLI Application
 # ==========================================
+def counts_to_mm(counts, scale):
+    """Encoder counts to mm, preserving 'unknown' rather than inventing zero."""
+    if counts is None or not scale:
+        return None
+    return counts / scale
+
+
 def format_position(pos):
     """Render a position, or say it is unknown. A failed read is not zero."""
     if pos is None:
@@ -366,8 +399,13 @@ def main():
     # Not 'or 0.0'. A position the controller did not report is unknown, and
     # showing it as 0.00000 mm claimed the stage was sitting exactly on zero -
     # the one reading most likely to be acted on, and the easiest to believe.
-    x_pos = stage.get_position(1)
-    y_pos = stage.get_position(2)
+    # Counts are read first and millimetres derived from them, rather than the
+    # other way round: counts are what the travel limits are compared against
+    # and what a move is commanded in, so they are the thing that has to be
+    # right even when the mm scale is not.
+    pos_counts = {axis: stage.get_position_counts(axis) for axis in (1, 2)}
+    x_pos = counts_to_mm(pos_counts[1], stage.scale)
+    y_pos = counts_to_mm(pos_counts[2], stage.scale)
 
     x_enabled = True
     y_enabled = True
@@ -402,13 +440,14 @@ def main():
         # travel depends on the offset below, which lives in the controller.
         print(f" Zero   X: {describe_zero(zero[1])}")
         print(f" Zero   Y: {describe_zero(zero[2])}")
-        print(f" Travel X: {describe_travel(travel[1], stage.scale)}")
-        print(f" Travel Y: {describe_travel(travel[2], stage.scale)}")
+        print(f" Travel X: {describe_travel(travel[1], stage.scale, pos_counts[1])}")
+        print(f" Travel Y: {describe_travel(travel[2], stage.scale, pos_counts[2])}")
         print("==================================================")
         print("   Up/Down/L/R : Jog Axes   |  J : Set Step Size")
         print("   G           : Go To Abs  |  C : Centre of Travel")
         print("   1 / 2       : Toggle X/Y |  R : Refresh Pos")
-        print("   H           : Home Stage |  Q : Quit")
+        print("   H           : Home Stage |  D : Dump Raw Axis")
+        print("   Q           : Quit")
         print("==================================================")
         print(f" [MSG] {msg}")
         
@@ -450,6 +489,30 @@ def main():
                 except ValueError:
                     msg = "Invalid coordinates entered. Move cancelled."
 
+            elif key_str == 'd':
+                # Every decoded field, raw. The 0x04F2 layout is transcribed
+                # from third-party libraries rather than Thorlabs' manual, so
+                # when C refuses this is what says whether the read is
+                # garbage or merely disagrees with pscan's mm scale.
+                print("\n --- REQ_STAGEAXISPARAMS (0x04F1) raw ---")
+                for axis, label in ((1, 'X'), (2, 'Y')):
+                    params = stage.get_stage_axis_params(axis)
+                    print(f" {label}: {describe_axis_raw(params)}")
+                    print(f"    position counter: "
+                          f"{stage.get_position_counts(axis)} counts")
+                    if params:
+                        centre = travel_centre_counts(params)
+                        print(f"    midpoint would be: {centre} counts")
+                        ok, why = validate_travel(
+                            params, stage.get_position_counts(axis))
+                        print(f"    usable for C: {ok} - {why}")
+                        warn = scale_disagreement(params, stage.scale)
+                        if warn:
+                            print(f"    scale: {warn}")
+                print(" --- press any key to continue ---")
+                get_key()
+                msg = "Raw axis parameters dumped above."
+
             elif key_str == 'r':
                 zero = {axis: stage.get_home_params(axis) for axis in (1, 2)}
                 travel = {axis: stage.get_stage_axis_params(axis)
@@ -476,7 +539,8 @@ def main():
                         skipped.append(label)
                         continue
 
-                    centre, reason = stage.travel_centre(travel[axis_id])
+                    centre, reason = stage.travel_centre(axis_id,
+                                                         travel[axis_id])
                     if centre is None:
                         refused.append(f"{label}: {reason}")
                         continue
@@ -493,13 +557,15 @@ def main():
                         refused.append(f"{label}: not homed - press H first")
                         continue
 
-                    stage.move_absolute(axis_id, centre)
-                    moved.append(f"{label} to {centre:.5f}")
+                    stage.move_absolute_counts(axis_id, centre)
+                    centre_mm = travel_centre_mm(travel[axis_id])
+                    moved.append(f"{label} to {centre_mm:.5f} mm "
+                                 f"({centre} counts)")
                     time.sleep(0.1)
 
                 parts = []
                 if moved:
-                    parts.append(f"Centring {', '.join(moved)} mm.")
+                    parts.append(f"Centring {', '.join(moved)}.")
                 if skipped:
                     parts.append(f"{'/'.join(skipped)} disabled, left alone.")
                 if refused:
@@ -570,11 +636,13 @@ def main():
                 else: msg = "Y-Axis is disabled! Press '2' to enable."
                 
             if needs_refresh:
-                time.sleep(0.2) 
-                real_x = stage.get_position(1)
-                real_y = stage.get_position(2)
-                if real_x is not None: x_pos = real_x
-                if real_y is not None: y_pos = real_y
+                time.sleep(0.2)
+                for axis in (1, 2):
+                    counts = stage.get_position_counts(axis)
+                    if counts is not None:
+                        pos_counts[axis] = counts
+                x_pos = counts_to_mm(pos_counts[1], stage.scale)
+                y_pos = counts_to_mm(pos_counts[2], stage.scale)
                 needs_refresh = False
 
     os.system('cls' if os.name == 'nt' else 'clear')

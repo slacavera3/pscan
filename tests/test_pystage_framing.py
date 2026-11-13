@@ -26,7 +26,8 @@ from pscan.stage_driver import (
     STATUS_HOMED, STATUS_HOMING,
     decode_home_params, describe_zero,
     decode_stage_axis_params, validate_travel, travel_centre_mm,
-    describe_travel,
+    travel_centre_counts, describe_travel, describe_axis_raw,
+    scale_disagreement,
 )
 
 SCALE = 34304.0  # what SimpleStage uses, and what the rig is calibrated to
@@ -312,40 +313,107 @@ class TestTravelDecoding(unittest.TestCase):
 class TestTravelValidation(unittest.TestCase):
     """cnts_per_unit is the load-bearing check: it proves the byte offsets."""
 
-    def test_wrong_cnts_per_unit_is_refused(self):
+    def test_garbage_cnts_per_unit_is_refused(self):
+        """A misaligned read lands on a serial number, not a resolution."""
         params = decode_stage_axis_params(
-            stageaxis(0, int(SCALE * 110), cnts_per_unit=2048)[6:])
-        ok, reason = validate_travel(params, SCALE)
+            stageaxis(0, int(SCALE * 110), cnts_per_unit=1634692198)[6:])
+        ok, reason = validate_travel(params, position_counts=0)
         self.assertFalse(ok)
-        self.assertIn('field offsets are wrong', reason)
+        self.assertIn('not a plausible', reason)
 
     def test_good_read_is_accepted(self):
         params = decode_stage_axis_params(stageaxis(0, int(SCALE * 110))[6:])
-        ok, reason = validate_travel(params, SCALE)
+        ok, reason = validate_travel(params, position_counts=int(SCALE * 12))
         self.assertTrue(ok)
         self.assertIn('110', reason)
 
+    def test_position_outside_the_span_is_refused(self):
+        """The frame check: limits that do not bracket the stage are not its limits."""
+        params = decode_stage_axis_params(stageaxis(0, int(SCALE * 110))[6:])
+        ok, reason = validate_travel(params,
+                                     position_counts=int(-SCALE * 40))
+        self.assertFalse(ok)
+        self.assertIn('not in the same frame', reason)
+
+    def test_no_position_means_unconfirmed_not_ok(self):
+        params = decode_stage_axis_params(stageaxis(0, int(SCALE * 110))[6:])
+        ok, reason = validate_travel(params, position_counts=None)
+        self.assertFalse(ok)
+        self.assertIn('cannot confirm', reason)
+
     def test_inverted_limits_refused(self):
-        params = decode_stage_axis_params(
-            stageaxis(int(SCALE * 110), 0)[6:])
-        ok, reason = validate_travel(params, SCALE)
+        params = decode_stage_axis_params(stageaxis(int(SCALE * 110), 0)[6:])
+        ok, reason = validate_travel(params, position_counts=0)
         self.assertFalse(ok)
         self.assertIn('not above', reason)
 
     def test_absurd_span_refused(self):
-        params = decode_stage_axis_params(
-            stageaxis(0, int(SCALE * 9000))[6:])
-        ok, reason = validate_travel(params, SCALE)
+        params = decode_stage_axis_params(stageaxis(0, int(SCALE * 9000))[6:])
+        ok, reason = validate_travel(params, position_counts=0)
         self.assertFalse(ok)
         self.assertIn('plausible', reason)
 
     def test_missing_params_refused(self):
-        ok, reason = validate_travel(None, SCALE)
+        ok, reason = validate_travel(None, position_counts=0)
         self.assertFalse(ok)
         self.assertIn('did not report', reason)
 
     def test_describe_travel_says_why_when_unavailable(self):
         self.assertIn('unavailable', describe_travel(None, SCALE))
+
+
+class TestScaleDisagreementIsSeparateFromValidity(unittest.TestCase):
+    """The BBD303 case: controller says 20000, pscan says 34304.
+
+    20000 counts/mm is 50 nm, the MLS203's real resolution. That makes pscan's
+    hardcoded 34304 wrong for the display - but it does not make the travel
+    limits unusable, and it must not stop C working.
+    """
+
+    BBD303 = 20000
+
+    def _params(self):
+        # An MLS203 homed to its forward limit: the span is negative.
+        return decode_stage_axis_params(
+            stageaxis(-110 * self.BBD303, 0, cnts_per_unit=self.BBD303)[6:])
+
+    def test_travel_is_still_valid(self):
+        params = self._params()
+        ok, reason = validate_travel(params,
+                                     position_counts=-40 * self.BBD303)
+        self.assertTrue(ok)
+        self.assertIn('110', reason)
+
+    def test_centre_is_exact_in_counts_regardless_of_scale(self):
+        params = self._params()
+        self.assertEqual(travel_centre_counts(params), -55 * self.BBD303)
+
+    def test_centre_mm_uses_the_controllers_own_resolution(self):
+        params = self._params()
+        self.assertAlmostEqual(travel_centre_mm(params), -55.0, places=4)
+
+    def test_disagreement_is_reported(self):
+        warn = scale_disagreement(self._params(), SCALE)
+        self.assertIsNotNone(warn)
+        self.assertIn('20000', warn)
+        self.assertIn('34304', warn)
+        self.assertIn('1.7152', warn)
+
+    def test_agreement_reports_nothing(self):
+        params = decode_stage_axis_params(stageaxis(0, int(SCALE * 110))[6:])
+        self.assertIsNone(scale_disagreement(params, SCALE))
+
+    def test_garbage_resolution_is_not_a_scale_complaint(self):
+        """Implausible cnts_per_unit is a layout bug, handled by validation."""
+        params = decode_stage_axis_params(
+            stageaxis(0, 100, cnts_per_unit=1634692198)[6:])
+        self.assertIsNone(scale_disagreement(params, SCALE))
+
+    def test_describe_travel_flags_the_disagreement(self):
+        line = describe_travel(self._params(), SCALE,
+                               position_counts=-40 * self.BBD303)
+        self.assertIn('(!)', line)
+        self.assertIn('20000', line)
 
 
 class TestCentreIsTranslationInvariant(unittest.TestCase):
@@ -391,28 +459,47 @@ class TestCentreIsTranslationInvariant(unittest.TestCase):
         self.assertNotAlmostEqual(centre, half_travel, places=2)
         self.assertAlmostEqual(centre, 0.0, places=4)
 
-    def test_no_scale_gives_no_centre(self):
-        params = decode_stage_axis_params(stageaxis(0, int(SCALE * 110))[6:])
-        self.assertIsNone(travel_centre_mm(params, None))
+    def test_centre_mm_prefers_the_controllers_resolution(self):
+        """The passed-in scale is only a fallback; the controller knows better."""
+        params = decode_stage_axis_params(
+            stageaxis(0, 110 * 20000, cnts_per_unit=20000)[6:])
+        self.assertAlmostEqual(travel_centre_mm(params, SCALE), 55.0, places=4)
+
+    def test_no_params_gives_no_centre(self):
         self.assertIsNone(travel_centre_mm(None, SCALE))
+        self.assertIsNone(travel_centre_counts(None))
 
 
 class TestTravelCentreViaStage(unittest.TestCase):
 
-    def test_stage_reports_centre_and_reason(self):
-        stage = stage_with(b'')
+    def test_stage_reports_centre_in_counts(self):
+        stage = stage_with(poscounter(int(SCALE * 12)))
         params = decode_stage_axis_params(stageaxis(0, int(SCALE * 110))[6:])
-        centre, reason = stage.travel_centre(params)
-        self.assertAlmostEqual(centre, 55.0, places=4)
+        centre, reason = stage.travel_centre(1, params)
+        self.assertEqual(centre, int(round(SCALE * 55)))
         self.assertIn('110', reason)
 
-    def test_stage_refuses_a_bad_read(self):
-        stage = stage_with(b'')
+    def test_stage_refuses_an_implausible_resolution(self):
+        stage = stage_with(poscounter(0))
         params = decode_stage_axis_params(
             stageaxis(0, int(SCALE * 110), cnts_per_unit=99)[6:])
-        centre, reason = stage.travel_centre(params)
+        centre, reason = stage.travel_centre(1, params)
         self.assertIsNone(centre)
-        self.assertIn('field offsets are wrong', reason)
+        self.assertIn('not a plausible', reason)
+
+    def test_stage_refuses_when_position_is_outside_the_span(self):
+        stage = stage_with(poscounter(int(-SCALE * 40)))
+        params = decode_stage_axis_params(stageaxis(0, int(SCALE * 110))[6:])
+        centre, reason = stage.travel_centre(1, params)
+        self.assertIsNone(centre)
+        self.assertIn('not in the same frame', reason)
+
+    def test_stage_refuses_when_position_cannot_be_read(self):
+        stage = stage_with(b'')
+        params = decode_stage_axis_params(stageaxis(0, int(SCALE * 110))[6:])
+        centre, reason = stage.travel_centre(1, params)
+        self.assertIsNone(centre)
+        self.assertIn('cannot confirm', reason)
 
 
 class TestPositionDisplay(unittest.TestCase):

@@ -167,7 +167,8 @@ Controls:
    G            go to an absolute X/Y target
    C            go to the geometric centre of travel
    1 / 2        toggle X / Y motor power
-   R            re-read positions and zero from the controller
+   R            re-read positions, zero and travel from the controller
+   D            dump the raw stage-axis parameters (diagnostics)
    H            home the stages and clear safety lockouts
    Q            quit
 
@@ -195,6 +196,15 @@ only - pystage never writes controller parameters. The panel prints the span
 and the centre it will aim for on the `Travel X:` / `Travel Y:` lines, so what
 C is about to do is visible before you press it.
 
+**C commands encoder counts, not millimetres.** A midpoint needs no scale:
+`(min + max) / 2` is exact whatever counts-per-mm is, or is not. This matters
+on a real rig - a BBD303 driving an MLS203 reports `cnts_per_unit = 20000`
+(50 nm), while pscan hardcodes 34304 (the Z8xx/TDC001 figure). Going through
+millimetres with the wrong scale would land the stage 1.7x off; going through
+counts lands it on the centre. The millimetre figures on screen are still
+wrong in that case, and the panel says so with a `(!)` warning rather than
+refusing to work.
+
 C **refuses rather than guessing** when it cannot be sure, and says which axis
 and why:
 
@@ -202,14 +212,26 @@ and why:
   (press H);
 * the controller did not report its travel, or did not report whether it is
   homed;
-* the reported `cnts_per_unit` does not match this rig's counts-per-mm, which
-  means the `0x04F2` field offsets are wrong for that controller and the
-  limits cannot be believed. The field layout is transcribed from two
-  third-party libraries rather than Thorlabs' manual, so this check is what
-  stands between a mis-parse and a move to a wrong absolute position.
+* `cnts_per_unit` is not a plausible encoder resolution, which means the
+  `0x04F2` field offsets are wrong for that controller. The layout is
+  transcribed from two third-party libraries rather than Thorlabs' manual, so
+  this is the check that stands between a mis-parse and a bad absolute move;
+* **the current position lies outside the reported limits.** This is the
+  important one. It tests whether those limits are expressed in the same
+  frame as the position counter - if they are stage descriptors in some other
+  frame, the stage sits outside them and their midpoint is not the centre but
+  a command into a limit.
+
+A `cnts_per_unit` that is plausible but merely *disagrees* with pscan's
+constant is not a refusal. That is a display bug, not a travel bug, and the
+two are reported separately.
 
 C also acts only on *enabled* axes and names any it skipped, so a one-axis
 move is never reported as having centred both.
+
+**D** dumps every decoded `0x04F2` field raw - resolution, limits, the
+position counter, the computed midpoint and whether C would accept it. That is
+the first thing to run when C refuses on a controller you have not used before.
 
 1b. DAQ Card Inspection (pydaq)
 This is the bring-up tool for a new card. Before writing a .con file against

@@ -111,13 +111,27 @@ def decode_home_params(payload, counts_per_mm=None):
 #   cnts_per_unit I, min_pos I, max_pos I, max_accn I, max_dec I, max_vel I,
 #   then padding, 74 bytes in all.
 #
-# Third-party and therefore not to be trusted on its own, which is what
-# cnts_per_unit is for. It sits immediately before min_pos, so if it decodes
-# to the counts-per-mm this rig is known to use, the alignment is right and
-# the two fields after it can be believed. If it decodes to anything else the
-# layout is wrong for this controller and the numbers are garbage - which is
-# why validate_travel() refuses rather than falling back to a guess. Nothing
-# commands a move off an unvalidated read.
+# Third-party and therefore not to be trusted on its own. Two independent
+# checks stand in for a spec:
+#
+#   1. cnts_per_unit must be a plausible encoder resolution. A misaligned read
+#      lands on a serial number or an acceleration limit and produces
+#      something wild; a BBD303 driving an MLS203 reports 20000, which is
+#      1/50 nm and correct for that stage.
+#
+#   2. The current position must lie inside [min_pos, max_pos]. This is the
+#      load-bearing one, because it tests the thing that actually matters:
+#      whether these limits are expressed in the SAME frame as the position
+#      counter. If they are stage descriptors in some other frame, the stage
+#      will generally be sitting outside them and the midpoint would be a
+#      command into a limit. An axis homed to its forward limit reports a
+#      negative span, which is why min/max are read signed.
+#
+# Checking cnts_per_unit against pscan's hardcoded counts-per-mm was the first
+# attempt and was wrong: it conflated "the byte offsets are wrong" with "the
+# mm scale is wrong", refused on a perfectly good read, and said so in a
+# message that sent you after the wrong bug. The two are now separate, and
+# only the first can block a move.
 STAGEAXIS_LEN = 74
 _STAGEAXIS_HEAD = '<HHH16sII'          # through cnts_per_unit, 30 bytes
 _STAGEAXIS_LIMITS_OFFSET = 30
@@ -152,67 +166,133 @@ def decode_stage_axis_params(payload):
     }
 
 
-def validate_travel(params, counts_per_mm, min_span_mm=1.0, max_span_mm=500.0,
-                    tolerance=0.02):
+# A plausible encoder resolution, in counts per mm. An MLS203 reports 20000
+# (50 nm); a Z8xx/TDC001 reports 34304. Anything outside this window is a
+# misaligned read, not a stage.
+MIN_PLAUSIBLE_CNTS_PER_MM = 100
+MAX_PLAUSIBLE_CNTS_PER_MM = 1_000_000
+
+
+def validate_travel(params, position_counts=None, min_span_mm=1.0,
+                    max_span_mm=500.0):
     """Is this travel read safe to command a move from? (ok, reason).
 
-    The cnts_per_unit check is the load-bearing one: it proves the byte
-    offsets are right for this controller. The span checks only catch a
-    reading that is self-consistent but absurd.
+    `position_counts` is the axis's current position counter. Pass it: without
+    it this cannot test whether the limits share a frame with the counter, and
+    says so rather than implying a safety it has not checked.
     """
     if params is None:
         return False, "controller did not report stage axis parameters"
 
-    if not counts_per_mm:
-        return False, "no counts-per-mm to check the reply against"
-
     cnts = params['cnts_per_unit']
-    if cnts <= 0:
-        return False, f"cnts_per_unit is {cnts}"
-    if abs(cnts - counts_per_mm) > tolerance * counts_per_mm:
-        return False, (f"cnts_per_unit is {cnts}, expected ~{counts_per_mm:.0f}"
-                       f" - the 0x04F2 field offsets are wrong for this"
-                       f" controller, so min/max cannot be trusted")
+    if not (MIN_PLAUSIBLE_CNTS_PER_MM <= cnts <= MAX_PLAUSIBLE_CNTS_PER_MM):
+        return False, (f"cnts_per_unit is {cnts}, which is not a plausible "
+                       f"encoder resolution - the 0x04F2 field offsets are "
+                       f"wrong for this controller")
 
-    span_counts = params['max_counts'] - params['min_counts']
-    if span_counts <= 0:
-        return False, (f"max_counts {params['max_counts']} is not above "
-                       f"min_counts {params['min_counts']}")
+    lo, hi = params['min_counts'], params['max_counts']
+    if hi <= lo:
+        return False, (f"max_counts {hi} is not above min_counts {lo}")
 
-    span_mm = span_counts / counts_per_mm
+    span_mm = (hi - lo) / cnts
     if not (min_span_mm <= span_mm <= max_span_mm):
         return False, (f"travel of {span_mm:.3f} mm is outside the plausible "
                        f"{min_span_mm:g}-{max_span_mm:g} mm window")
 
+    if position_counts is None:
+        return False, ("cannot confirm the limits share a frame with the "
+                       "position counter without a position reading")
+
+    if not (lo <= position_counts <= hi):
+        return False, (f"the stage is at {position_counts} counts, outside "
+                       f"the reported {lo}..{hi} - these limits are not in "
+                       f"the same frame as the position counter, so their "
+                       f"midpoint is not the centre")
+
     return True, f"{span_mm:.5f} mm of travel"
 
 
-def travel_centre_mm(params, counts_per_mm):
-    """The geometric centre of travel, in the controller's own coordinates.
+def scale_disagreement(params, counts_per_mm, tolerance=0.02):
+    """A sentence about the mm scale being wrong, or None if it agrees.
 
-    The midpoint of the reported span, NOT half the travel from zero. That is
-    the whole point: min and max arrive in the same frame as the position
-    counter, so their midpoint is the centre of the stage wherever homing
-    happened to put zero - a stage homed to its reverse limit and one carrying
-    a 55 mm home offset both give the right answer. Half-travel-from-zero only
-    works for the first of those.
+    Separate from validate_travel on purpose. The controller knowing its own
+    encoder resolution better than a hardcoded constant does not make its
+    travel limits unusable - it makes the millimetre numbers on screen wrong,
+    which is a different bug with a different fix.
     """
     if params is None or not counts_per_mm:
         return None
-    return ((params['min_counts'] + params['max_counts']) / 2.0) / counts_per_mm
+    cnts = params['cnts_per_unit']
+    if not (MIN_PLAUSIBLE_CNTS_PER_MM <= cnts <= MAX_PLAUSIBLE_CNTS_PER_MM):
+        return None
+    if abs(cnts - counts_per_mm) <= tolerance * counts_per_mm:
+        return None
+    return (f"controller says {cnts} counts/mm, pscan is using "
+            f"{counts_per_mm:.0f} - every mm figure here is out by a factor "
+            f"of {counts_per_mm / cnts:.4f}")
 
 
-def describe_travel(params, counts_per_mm):
+def travel_centre_counts(params):
+    """The geometric centre of travel, in ENCODER COUNTS.
+
+    Counts, not millimetres, because the centre is a midpoint and a midpoint
+    needs no scale: (min + max) / 2 is exact whatever counts_per_mm is, or
+    is not. Converting to mm and back through a scale that may be wrong - as
+    pscan's hardcoded 34304 is on a BBD303 reporting 20000 - would land the
+    stage somewhere else entirely. mm are for the display only.
+
+    It is the midpoint of the reported span, NOT half the travel from zero.
+    That is what makes it invariant to where homing put zero: a stage homed
+    to its reverse limit and one carrying a home offset both give the right
+    answer, where half-travel-from-zero is right only for the first.
+    """
+    if params is None:
+        return None
+    return int(round((params['min_counts'] + params['max_counts']) / 2.0))
+
+
+def travel_centre_mm(params, counts_per_mm=None):
+    """The centre in mm, for display. Uses the controller's own resolution.
+
+    counts_per_mm overrides only if the controller's figure is unusable.
+    """
+    centre = travel_centre_counts(params)
+    if centre is None:
+        return None
+    scale = params['cnts_per_unit'] or counts_per_mm
+    if not scale:
+        return None
+    return centre / scale
+
+
+def describe_travel(params, counts_per_mm, position_counts=None):
     """One line of travel and centre for a UI, or why there is none."""
-    ok, reason = validate_travel(params, counts_per_mm)
+    ok, reason = validate_travel(params, position_counts)
     if not ok:
         return f"unavailable - {reason}"
 
-    low = params['min_counts'] / counts_per_mm
-    high = params['max_counts'] / counts_per_mm
-    centre = travel_centre_mm(params, counts_per_mm)
+    scale = params['cnts_per_unit']
+    low = params['min_counts'] / scale
+    high = params['max_counts'] / scale
+    centre = travel_centre_mm(params)
     name = params['part_no'] or 'unnamed axis'
-    return (f"{low:.5f} to {high:.5f} mm, centre {centre:.5f} mm  [{name}]")
+
+    line = f"{low:.5f} to {high:.5f} mm, centre {centre:.5f} mm  [{name}]"
+    warning = scale_disagreement(params, counts_per_mm)
+    if warning:
+        line += f"  (!) {warning}"
+    return line
+
+
+def describe_axis_raw(params):
+    """Every decoded field, for confirming the 0x04F2 layout on real hardware."""
+    if params is None:
+        return "no reply to REQ_STAGEAXISPARAMS (0x04F1)"
+    return (f"chan={params['chan_ident']} stage_id={params['stage_id']} "
+            f"axis_id={params['axis_id']} part='{params['part_no']}' "
+            f"serial={params['serial_num']} "
+            f"cnts_per_unit={params['cnts_per_unit']} "
+            f"min={params['min_counts']} max={params['max_counts']}")
 
 
 def describe_zero(params):

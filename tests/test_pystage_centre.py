@@ -226,14 +226,30 @@ class TestCentreRefusesRatherThanGuessing(unittest.TestCase):
         self.assertAlmostEqual(fake.mm(2), 7.0, places=4)
         self.assertIn('did not report stage axis parameters', out)
 
-    def test_wrong_offsets_detected_via_cnts_per_unit(self):
+    def test_garbage_layout_detected_and_stage_not_moved(self):
         """A controller whose 0x04F2 layout differs must not move the stage."""
-        fake = FakeController(cnts_per_unit=2048,
+        fake = FakeController(cnts_per_unit=1634692198,
                               position={1: int(SCALE * 12), 2: int(SCALE * 7)})
         out = drive(fake, ['c'])
         self.assertAlmostEqual(fake.mm(1), 12.0, places=4)
         self.assertAlmostEqual(fake.mm(2), 7.0, places=4)
-        self.assertIn('field offsets are wrong', out)
+        self.assertIn('not a plausible', out)
+
+    def test_limits_in_a_different_frame_are_not_trusted(self):
+        """Limits that do not bracket the stage are not this stage's limits.
+
+        The failure this prevents: an axis homed to its forward limit, whose
+        counter therefore runs negative, against limits reported as a
+        positive 0..travel span. The midpoint of those would be a command
+        straight into the far limit.
+        """
+        fake = FakeController(
+            travel={1: (0, int(SCALE * 110)), 2: (0, int(SCALE * 75))},
+            position={1: int(-SCALE * 40), 2: int(-SCALE * 30)})
+        out = drive(fake, ['c'])
+        self.assertAlmostEqual(fake.mm(1), -40.0, places=4)
+        self.assertAlmostEqual(fake.mm(2), -30.0, places=4)
+        self.assertIn('not in the same frame', out)
 
     def test_unknown_homed_state_is_not_moved(self):
         fake = FakeController(answer_status=False,
@@ -249,6 +265,63 @@ class TestCentreRefusesRatherThanGuessing(unittest.TestCase):
         self.assertAlmostEqual(fake.mm(1), 55.0, places=4)
         self.assertAlmostEqual(fake.mm(2), 7.0, places=4)
         self.assertIn('disabled, left alone', out)
+
+
+class TestRealBBD303(unittest.TestCase):
+    """The rig as it actually reports itself.
+
+    A BBD303 driving an MLS203 reports cnts_per_unit = 20000 (50 nm), not
+    pscan's hardcoded 34304, and both axes home to the FORWARD limit - so the
+    position counter runs negative and the travel span is -110..0 mm.
+
+    C must still work. The centre is a midpoint in counts and a midpoint needs
+    no scale, so a wrong counts-per-mm makes the millimetres on screen wrong
+    without making the move wrong.
+    """
+
+    CNTS = 20000
+
+    def _rig(self, x_mm=-42.0, y_mm=-25.0):
+        return FakeController(
+            travel={1: (-110 * self.CNTS, 0), 2: (-75 * self.CNTS, 0)},
+            zero_offset={1: 0, 2: 0},
+            position={1: int(x_mm * self.CNTS), 2: int(y_mm * self.CNTS)},
+            cnts_per_unit=self.CNTS)
+
+    def test_c_reaches_the_true_centre_in_counts(self):
+        fake = self._rig()
+        drive(fake, ['c'])
+        self.assertEqual(fake.position[1], -55 * self.CNTS)
+        self.assertEqual(fake.position[2], int(-37.5 * self.CNTS))
+
+    def test_c_is_not_derailed_by_the_wrong_mm_scale(self):
+        """Going via mm with 34304 would land ~1.7x off. Counts do not."""
+        fake = self._rig()
+        drive(fake, ['c'])
+        wrong = int(-55.0 * SCALE)          # what an mm round-trip would give
+        self.assertNotEqual(fake.position[1], wrong)
+        self.assertEqual(fake.position[1], -55 * self.CNTS)
+
+    def test_c_is_idempotent_on_the_real_rig(self):
+        fake = self._rig()
+        drive(fake, ['c', 'c'])
+        self.assertEqual(fake.position[1], -55 * self.CNTS)
+
+    def test_panel_warns_that_the_mm_scale_disagrees(self):
+        out = drive(self._rig(), [])
+        self.assertIn('(!)', out)
+        self.assertIn('20000', out)
+        self.assertIn('34304', out)
+
+    def test_panel_shows_the_negative_span(self):
+        out = drive(self._rig(), [])
+        self.assertIn('-110.00000 to 0.00000 mm, centre -55.00000 mm', out)
+
+    def test_dump_key_reports_the_raw_fields(self):
+        out = drive(self._rig(), ['d', 'x'])
+        self.assertIn('cnts_per_unit=20000', out)
+        self.assertIn(f'min={-110 * self.CNTS}', out)
+        self.assertIn('usable for C: True', out)
 
 
 class TestPanelShowsTheTarget(unittest.TestCase):
