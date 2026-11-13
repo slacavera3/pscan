@@ -1061,7 +1061,11 @@ def main():
     scope_ip = next((act['params']['ip'] for act in acquisition_pipeline if act['type'] == 'scope'), None)
     ixon_in_pipeline = any(act['type'] == 'ixon' for act in acquisition_pipeline + setup_pipeline + teardown_pipeline)
     
-    counts_per_mm = 34304.0
+    # Resolved from the controller once it is connected, not hardcoded here.
+    # This was 34304.0 - the Z8xx/TDC001 DC-servo figure - on a rig whose
+    # BBD303 reports 20000, so every scan came out stretched by 1.7152. A
+    # uniformly rescaled map looks entirely sensible, which is why it lasted.
+    counts_per_mm = None
 
     if dry_run:
         print_dry_run(
@@ -1145,6 +1149,21 @@ def main():
             from pscan.stage_driver import ThorlabsStage
             stage = ThorlabsStage()
             stage.connect()
+
+            # Settle what a millimetre is before anything is commanded in
+            # millimetres. Raises CalibrationUnknown rather than guessing:
+            # refusing to start is recoverable, a drawer of maps with the
+            # wrong pitch is not.
+            # APT_AXES holds ids (0, 1); the driver addresses bays by name,
+            # the same mapping AptAxis makes.
+            apt_axis_id = next(a for a in APT_AXES if a in stage_params)
+            apt_axis = 'x' if apt_axis_id == APT_AXES[0] else 'y'
+            counts_per_mm, cal_source, cal_notes = stage.counts_per_mm(
+                apt_axis, what='this scan')
+            print(f"\nStage scale: {counts_per_mm:.1f} counts/mm "
+                  f"({cal_source})")
+            for note in cal_notes:
+                print(f"  [note] {note}")
 
         # Builds the axis nest and opens any analog-output card it needs. A
         # card already opened for an a2d block is reused, not reopened: on a

@@ -426,6 +426,10 @@ class ThorlabsStage:
             return None
 
         msg_id = struct.unpack_from('<H', header, 0)[0]
+        # The sixth header byte is the bay that sent the reply (0x21 for X,
+        # 0x22 for Y), which is what lets a question asked of one axis reject
+        # an answer from the other.
+        source = header[5]
         payload = b''
         if header[4] & 0x80:
             length = struct.unpack_from('<H', header, 2)[0]
@@ -433,7 +437,7 @@ class ThorlabsStage:
                 payload = self._read_exactly(length, timeout_s)
                 if payload is None:
                     return None
-        return msg_id, payload
+        return msg_id, payload, source
 
     def get_position(self, axis, counts_per_mm, timeout_s=0.5):
         dest = self._get_dest_channel(axis)
@@ -450,10 +454,11 @@ class ThorlabsStage:
             if packet is None:
                 return None
 
-            msg_id, payload = packet
+            msg_id, payload, source = packet
             # An unsolicited MOVE_COMPLETED can land ahead of our reply, so
             # keep reading until the packet we asked for shows up.
-            if msg_id == MSG_GET_POSCOUNTER and len(payload) >= 6:
+            if (msg_id == MSG_GET_POSCOUNTER and source == dest
+                    and len(payload) >= 6):
                 _, counts = struct.unpack_from('<Hl', payload, 0)
                 return counts / counts_per_mm
 
@@ -482,8 +487,45 @@ class ThorlabsStage:
             packet = self._read_packet(timeout_s=remaining)
             if packet is None:
                 return False
-            if packet[0] == MSG_MOVE_STOPPED:
+            if packet[0] == MSG_MOVE_STOPPED and packet[2] == dest:
                 return True
+
+    def get_stage_axis_params(self, axis, timeout_s=0.5):
+        """Read STAGEAXISPARAMS (0x04F2) for this axis, or None.
+
+        The same read pystage does. It lives here as well so the scan path
+        and the jog tool resolve counts-per-mm from the same place rather
+        than each carrying its own constant - which is exactly how main.py
+        came to be running 34304 against a stage reporting 20000.
+        """
+        dest = self._get_dest_channel(axis)
+        self.ser.reset_input_buffer()
+        self.ser.write(struct.pack('<HBBBB', MSG_REQ_STAGEAXISPARAMS, 0x01,
+                                   0x00, dest, self.SOURCE_PC))
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            packet = self._read_packet(timeout_s=remaining)
+            if packet is None:
+                return None
+            msg_id, payload, source = packet
+            if msg_id == MSG_GET_STAGEAXISPARAMS and source == dest:
+                return decode_stage_axis_params(payload)
+
+    def counts_per_mm(self, axis, calibration=None, what='this scan'):
+        """The counts-per-mm to use for this axis, or raise.
+
+        Raises CalibrationUnknown rather than falling back, because the
+        caller is about to record positions.
+        """
+        from pscan.calibrate import require_counts_per_mm
+        params = self.get_stage_axis_params(axis)
+        axis_id = 1 if self._get_dest_channel(axis) == self.DEST_CH1 else 2
+        return require_counts_per_mm(params, axis_id,
+                                     calibration=calibration, what=what)
 
     def stop_all(self, profiled=True):
         """Stop every axis, reporting but not raising on individual failures.

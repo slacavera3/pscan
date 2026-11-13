@@ -10,11 +10,13 @@ import tempfile
 import unittest
 
 from pscan.calibrate import (
-    LEGACY_COUNTS_PER_MM, SOURCE_CONTROLLER, SOURCE_LEGACY, SOURCE_MANUAL,
-    SOURCE_SPAN, compare, counts_per_mm_for, default_travel_mm,
-    describe_source, from_controller, from_manual, from_span,
-    load_calibration, make_record, measure_manual, measure_span, rig_key,
-    run_calibration, save_calibration, wait_until_still,
+    KNOWN_COUNTS_PER_MM, LEGACY_COUNTS_PER_MM, SOURCE_CATALOGUE,
+    SOURCE_CONTROLLER, SOURCE_LEGACY, SOURCE_MANUAL, SOURCE_SPAN,
+    CalibrationUnknown, catalogue_counts_per_mm, compare, counts_per_mm_for,
+    default_travel_mm, describe_source, from_controller, from_manual,
+    from_span, load_calibration, make_record, measure_manual, measure_span,
+    require_counts_per_mm, resolve_counts_per_mm, rig_key, run_calibration,
+    save_calibration, wait_until_still,
 )
 
 MLS203 = {'part_no': 'MLS203', 'serial_num': 94000123,
@@ -278,6 +280,129 @@ class TestMeasurementProcedures(unittest.TestCase):
         self.assertIsNone(measure_span(FakeAxis(), 1,
                                        dict(MLS203, min_counts=0,
                                             max_counts=0)))
+
+
+class TestCatalogue(unittest.TestCase):
+    """counts-per-mm is a property of the stage model, so it belongs in a table."""
+
+    def test_mls203(self):
+        self.assertEqual(catalogue_counts_per_mm(MLS203), 20000.0)
+
+    def test_case_and_whitespace_tolerated(self):
+        self.assertEqual(
+            catalogue_counts_per_mm(dict(MLS203, part_no=' mls203 ')), 20000.0)
+
+    def test_unlisted_part_is_not_guessed(self):
+        self.assertIsNone(
+            catalogue_counts_per_mm(dict(MLS203, part_no='DDS600')))
+        self.assertIsNone(catalogue_counts_per_mm(None))
+
+    def test_catalogue_is_not_34304(self):
+        """The whole point. 34304 is a different controller family."""
+        for part, value in KNOWN_COUNTS_PER_MM.items():
+            self.assertNotEqual(value, 34304.0, part)
+
+
+class TestResolve(unittest.TestCase):
+
+    def test_controller_preferred_and_corroborated(self):
+        value, source, notes = resolve_counts_per_mm(MLS203, 1,
+                                                     calibration={})
+        self.assertEqual(value, 20000.0)
+        self.assertEqual(source, SOURCE_CONTROLLER)
+        self.assertTrue(any('agree' in n for n in notes))
+
+    def test_catalogue_used_when_controller_is_silent(self):
+        quiet = dict(MLS203, cnts_per_unit=0)
+        value, source, notes = resolve_counts_per_mm(quiet, 1, calibration={})
+        self.assertEqual(value, 20000.0)
+        self.assertEqual(source, SOURCE_CATALOGUE)
+
+    def test_disagreement_is_reported_loudly(self):
+        """A controller configured for the wrong stage must not pass quietly."""
+        odd = dict(MLS203, cnts_per_unit=34304)
+        value, source, notes = resolve_counts_per_mm(odd, 1, calibration={})
+        self.assertEqual(value, 34304)
+        self.assertTrue(any('DISAGREEMENT' in n for n in notes))
+
+    def test_stored_measurement_overrides_and_says_so(self):
+        cal = {'94000123:MLS203:1': make_record(19500, SOURCE_MANUAL)}
+        value, source, notes = resolve_counts_per_mm(MLS203, 1,
+                                                     calibration=cal)
+        self.assertEqual(value, 19500)
+        self.assertEqual(source, SOURCE_MANUAL)
+        self.assertTrue(any('overrides' in n for n in notes))
+
+    def test_nothing_known_resolves_to_nothing(self):
+        value, source, _notes = resolve_counts_per_mm(None, 1, calibration={})
+        self.assertIsNone(value)
+        self.assertIsNone(source)
+
+    def test_unlisted_silent_controller_resolves_to_nothing(self):
+        unknown = {'part_no': 'DDS600', 'serial_num': 1, 'cnts_per_unit': 0}
+        value, _source, _notes = resolve_counts_per_mm(unknown, 1,
+                                                       calibration={})
+        self.assertIsNone(value)
+
+
+class TestRequireRefusesRatherThanGuessing(unittest.TestCase):
+
+    def test_raises_when_unknown(self):
+        with self.assertRaises(CalibrationUnknown) as ctx:
+            require_counts_per_mm(None, 1, calibration={}, what='this scan')
+        self.assertIn('silently wrong', str(ctx.exception))
+        self.assertIn('--calibrate', str(ctx.exception))
+
+    def test_never_falls_back_to_34304(self):
+        """The regression that corrupted every map on this rig."""
+        with self.assertRaises(CalibrationUnknown):
+            require_counts_per_mm({'part_no': 'DDS600', 'serial_num': 1,
+                                   'cnts_per_unit': 0}, 1, calibration={})
+
+    def test_returns_the_figure_when_known(self):
+        value, source, _notes = require_counts_per_mm(MLS203, 1,
+                                                      calibration={})
+        self.assertEqual(value, 20000.0)
+        self.assertEqual(source, SOURCE_CONTROLLER)
+
+    def test_an_internally_inconsistent_controller_is_refused(self):
+        """part_no and cnts_per_unit come from one record; both cannot be right."""
+        odd = dict(MLS203, cnts_per_unit=34304)
+        with self.assertRaises(CalibrationUnknown) as ctx:
+            require_counts_per_mm(odd, 1, calibration={})
+        self.assertIn('ambiguous', str(ctx.exception))
+        self.assertIn('disagrees with itself', str(ctx.exception))
+
+    def test_a_stored_measurement_settles_the_ambiguity(self):
+        odd = dict(MLS203, cnts_per_unit=34304)
+        cal = {'94000123:MLS203:1': make_record(20000, SOURCE_MANUAL)}
+        value, source, _notes = require_counts_per_mm(odd, 1, calibration=cal)
+        self.assertEqual(value, 20000.0)
+        self.assertEqual(source, SOURCE_MANUAL)
+
+    def test_an_unlisted_part_cannot_conflict(self):
+        """No catalogue entry means nothing to contradict; the controller stands."""
+        unlisted = dict(MLS203, part_no='DDS600', cnts_per_unit=10000)
+        value, source, _notes = require_counts_per_mm(unlisted, 1,
+                                                      calibration={})
+        self.assertEqual(value, 10000)
+        self.assertEqual(source, SOURCE_CONTROLLER)
+
+
+class TestJogToolStillHasALabelledFallback(unittest.TestCase):
+    """pystage may jog on a guess; it records nothing. Scans may not."""
+
+    def test_fallback_is_labelled_not_silent(self):
+        value, source = counts_per_mm_for(None, 1, calibration={})
+        self.assertEqual(value, LEGACY_COUNTS_PER_MM)
+        self.assertEqual(source, SOURCE_LEGACY)
+        self.assertIn('UNCALIBRATED', describe_source(value, source))
+
+    def test_catalogue_reaches_the_jog_tool_too(self):
+        quiet = dict(MLS203, cnts_per_unit=0)
+        value, source = counts_per_mm_for(quiet, 1, calibration={})
+        self.assertEqual(value, 20000.0)
+        self.assertEqual(source, SOURCE_CATALOGUE)
 
 
 class FakeRig:

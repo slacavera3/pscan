@@ -241,13 +241,30 @@ hardcoded **34304**, which is the Z8xx/TDC001 DC-servo figure; a BBD303
 driving an MLS203 reports **20000** (50 nm). A wrong value rescales every
 position silently - the data look perfectly healthy and the microns are wrong.
 
-pystage now resolves it per axis, in this order, and **prints which source it
-used** on the `Scale X:` / `Scale Y:` lines, because a number whose provenance
-nobody can see is how 34304 survived:
+`pscan/calibrate.py` holds the **one resolver the whole codebase goes
+through** — the scan path, the jog tool and flyscan — so they cannot drift
+apart, which they had: `main.py` carried its own literal while flyscan refused
+to default at all. The order is:
 
-1. a stored calibration for this controller serial + stage part + axis;
+1. a stored measurement for this controller serial + stage part + axis;
 2. the controller's own `cnts_per_unit` from `0x04F2`;
-3. 34304, announced as `UNCALIBRATED fallback`.
+3. `KNOWN_COUNTS_PER_MM`, pscan's per-part-number catalogue (`MLS203` →
+   20000). This belongs in a table because it is a property of the stage
+   model's encoder, not of an individual unit — every MLS203 has the same one,
+   so a new rig inherits it with nothing to do.
+
+**There is no fallback for anything that records data.** `require_counts_per_mm()`
+raises rather than guessing, and `pscan` refuses to start a scan it cannot
+scale. A run that refuses is recoverable; a drawer of maps with the wrong
+pitch is not. A controller whose `part_no` and `cnts_per_unit` contradict each
+other is refused too — both come from the same record, so it disagrees with
+itself, and picking a side silently is exactly how 34304 survived. A stored
+measurement settles it, because that is a deliberate human answer.
+
+Only pystage's jog UI keeps the old 34304 as a last resort, announced as
+`UNCALIBRATED fallback`, because jogging records nothing. It prints which
+source it used on the `Scale X:` / `Scale Y:` lines either way — a number
+whose provenance nobody can see is how this lasted.
 
 Calibrate with `pystage --calibrate`, or **K** from inside the UI:
 

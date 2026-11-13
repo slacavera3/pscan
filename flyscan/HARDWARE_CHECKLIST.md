@@ -7,29 +7,42 @@ Ordered by how badly a wrong answer corrupts data.
 
 ---
 
-## 1. `counts_per_mm` for the MLSA02 — BLOCKING
+## 1. `counts_per_mm` for the MLS203 — RESOLVED: 20000 counts/mm
 
-**Assumed:** nothing. `VelocityCalibration` deliberately has no default.
+**Settled.** The BBD303 reports it itself. `STAGEAXISPARAMS` (`0x04F1`/`0x04F2`)
+carries a `cnts_per_unit` field, and on this rig it reads **20000 counts/mm**,
+i.e. 50 nm — consistent with the stage's quoted 0.25 µm repeatability. None of
+the three routes below turned out to be necessary: the controller knew all
+along and nothing had asked it.
 
-**Currently in pscan:** `counts_per_mm = 34304.0`, hardcoded in
-`pscan/main.py`. That is the Z8xx / TDC001 **DC-servo** figure, which is a
-different controller family from a BBD303 driving a direct-drive stage. It
-may still be right for your setup, but it should not be assumed.
+(The earlier heading said MLSA02. That is the spacer bracket, not the stage.)
 
-**Why it matters:** scales every commanded position *and*, through the
-calibration, every velocity. A wrong value stretches or compresses the whole
-map uniformly, which is easy to miss because the data still looks sensible.
+**What it was:** `counts_per_mm = 34304.0`, hardcoded in `pscan/main.py` and
+threaded into every APT axis move in every scan. 34304 is the Z8xx / TDC001
+**DC-servo** figure — a different controller family entirely. **Every scan
+taken on this rig before this was fixed is spatially stretched by a uniform
+factor of 1.7152**: a commanded 10 µm step was really 17.152 µm. As predicted
+here, it was easy to miss, because a uniformly rescaled map still looks
+entirely sensible.
 
-**How to settle it, best first:**
-1. Your own lab wiki lists `BBD302: Benchtop DC controller, hardcoded for 2
-   axis MLS203` at `/home/scan/source/hardware/apt_control`. That is working
-   code for very nearly this pairing — read the constant out of it. This is
-   the most reliable source available and it is already on your machines.
-2. Thorlabs APT Communications Protocol PDF (Rev 27+), the conversion-factors
-   section, which tabulates `EncCnt` per stage.
-3. Empirically: command a 1.000 mm move and measure actual travel against a
-   dial indicator, or image a calibration target with known feature spacing
-   and compare commanded to apparent pitch.
+**How it is resolved now,** in `pscan/calibrate.py`, through one resolver that
+`main.py`, `stage_driver.py` and flyscan all share:
+
+1. a stored measurement for this controller serial + stage part + axis;
+2. the controller's own `cnts_per_unit`;
+3. `KNOWN_COUNTS_PER_MM`, pscan's per-part-number catalogue — a property of
+   the stage model's encoder, so every MLS203 inherits it.
+
+There is **no fallback**. Anything that records spatial data calls
+`require_counts_per_mm()`, which raises rather than guessing, and a controller
+whose `part_no` and `cnts_per_unit` contradict each other is refused too
+rather than resolved by coin-toss. Only `pystage`'s jog UI keeps a fallback,
+labelled `UNCALIBRATED`, because it records nothing.
+
+**Still worth doing once:** confirm 20000 against a dial indicator with
+`pystage --calibrate`. A stored measurement takes precedence over both the
+controller and the catalogue, and it is the only thing that would catch a
+controller whose flash was configured for the wrong stage.
 
 **Note:** web searches did not yield MLS203 counts/mm, max velocity or
 acceleration. The obsolete Thorlabs catalog pages give repeatability

@@ -46,10 +46,33 @@ KNOWN_TRAVEL_MM = {
     'MLS203': (110.0, 75.0),   # (x, y)
 }
 
+# Encoder resolution per stage model, in counts per mm.
+#
+# This belongs in a table because it is a property of the stage model's
+# encoder, not of an individual unit: every MLS203 has the same one. Keyed by
+# the part number the controller reports, so a stage is identified by what it
+# says it is rather than by which rig it happens to be plugged into.
+#
+# MLS203 = 20000 counts/mm, i.e. 50 nm, read off a BBD303 driving the pair on
+# this rig and consistent with the stage's quoted 0.25 um repeatability.
+#
+# It is emphatically NOT 34304. That is the Z8xx/TDC001 DC-servo figure, a
+# different controller family entirely, and it sat hardcoded in pscan/main.py
+# stretching every scan on this rig by 1.7152 - invisibly, because a
+# uniformly rescaled map still looks perfectly sensible.
+KNOWN_COUNTS_PER_MM = {
+    'MLS203': 20000.0,
+}
+
 SOURCE_CONTROLLER = 'controller'
+SOURCE_CATALOGUE = 'catalogue'
 SOURCE_SPAN = 'span'
 SOURCE_MANUAL = 'manual'
 SOURCE_LEGACY = 'legacy-default'
+
+
+class CalibrationUnknown(RuntimeError):
+    """counts-per-mm could not be established, and guessing is not safe."""
 
 # Agreement within this fraction counts as corroboration rather than conflict.
 AGREEMENT_TOLERANCE = 0.02
@@ -195,27 +218,145 @@ def compare(records):
     return lines
 
 
-def counts_per_mm_for(params, axis_id, calibration=None,
-                      fallback=LEGACY_COUNTS_PER_MM):
-    """Resolve the figure to use: stored, else controller, else the default.
+def catalogue_counts_per_mm(params):
+    """The table figure for this part number, or None if it is not listed."""
+    if not params:
+        return None
+    part = (params.get('part_no') or '').upper().strip()
+    return KNOWN_COUNTS_PER_MM.get(part)
 
-    Returns (counts_per_mm, source). The source is returned, not discarded,
-    so a UI can say where the number came from - the whole problem with
-    34304 was that nothing ever said.
+
+def catalogue_conflict(params):
+    """A sentence when the controller contradicts the catalogue, else None.
+
+    Both fields come out of the same STAGEAXISPARAMS record, so disagreement
+    means that record is internally inconsistent - a controller configured
+    for one stage with another attached, most likely. Which of the two is
+    right is genuinely unknowable from here, so nothing picks a winner.
     """
+    declared = from_controller(params)
+    catalogue = catalogue_counts_per_mm(params)
+    if not declared or not catalogue:
+        return None
+
+    value = declared['counts_per_mm']
+    if abs(value - catalogue) <= AGREEMENT_TOLERANCE * catalogue:
+        return None
+
+    part = (params or {}).get('part_no') or 'unknown part'
+    return (f"the controller calls this stage a {part} but reports "
+            f"{value:.1f} counts/mm, where a {part} is {catalogue:.1f}")
+
+
+def resolve_counts_per_mm(params, axis_id, calibration=None):
+    """(value, source, notes), with value None when nothing can be established.
+
+    The single resolver every part of pscan goes through, so the scan path,
+    the jog tool and flyscan cannot drift apart - which they had, main.py
+    carrying its own literal while flyscan refused to default at all.
+
+    Order: a stored measurement for this exact rig, then the controller's own
+    cnts_per_unit, then the catalogue for this part number. Never 34304.
+    """
+    notes = []
     if calibration is None:
         calibration = load_calibration()
 
-    key = rig_key(params, axis_id)
-    stored = calibration.get(key)
-    if stored and stored.get('counts_per_mm'):
-        return float(stored['counts_per_mm']), stored.get('source', 'stored')
-
     declared = from_controller(params)
-    if declared:
-        return declared['counts_per_mm'], SOURCE_CONTROLLER
+    declared_value = declared['counts_per_mm'] if declared else None
+    catalogue = catalogue_counts_per_mm(params)
+    part = (params or {}).get('part_no') or 'unknown part'
 
-    return float(fallback), SOURCE_LEGACY
+    # Cross-checked before anything is chosen, so a disagreement is reported
+    # whichever source ends up winning.
+    if declared_value and catalogue:
+        if abs(declared_value - catalogue) <= AGREEMENT_TOLERANCE * catalogue:
+            notes.append(f"controller and catalogue agree for {part} "
+                         f"({declared_value:.1f} counts/mm)")
+        else:
+            # Says what disagrees, not what was chosen: the caller is told
+            # the source separately, and a stored measurement may yet
+            # override both.
+            notes.append(
+                f"DISAGREEMENT for {part}: controller says "
+                f"{declared_value:.1f} counts/mm, pscan's catalogue says "
+                f"{catalogue:.1f} - check the controller is configured for "
+                f"the stage actually attached")
+
+    stored = calibration.get(rig_key(params, axis_id))
+    if stored and stored.get('counts_per_mm'):
+        value = float(stored['counts_per_mm'])
+        if declared_value and abs(value - declared_value) > (
+                AGREEMENT_TOLERANCE * declared_value):
+            notes.append(f"stored measurement {value:.1f} overrides the "
+                         f"controller's {declared_value:.1f} counts/mm")
+        return value, stored.get('source', 'stored'), notes
+
+    if declared_value:
+        return declared_value, SOURCE_CONTROLLER, notes
+
+    if catalogue:
+        notes.append(f"controller reported no usable cnts_per_unit; using "
+                     f"pscan's catalogue figure for {part}")
+        return catalogue, SOURCE_CATALOGUE, notes
+
+    return None, None, notes
+
+
+def require_counts_per_mm(params, axis_id, calibration=None,
+                          what='this scan'):
+    """Resolve, or raise. For anything that records spatial data.
+
+    Deliberately without a fallback. pscan hardcoded 34304 and ran it on a
+    stage that reports 20000, stretching every map by 1.7152 - and because a
+    uniformly rescaled map still looks sensible, nothing ever caught it. A run
+    that refuses to start is recoverable; a drawer of quietly wrong data is
+    not.
+    """
+    value, source, notes = resolve_counts_per_mm(params, axis_id, calibration)
+    if value is None:
+        raise CalibrationUnknown(
+            f"counts-per-mm is not known for axis {axis_id}, and {what} would "
+            f"record positions that are silently wrong.\n"
+            f"  The controller reported no usable cnts_per_unit, and its part "
+            f"number is not in pscan's catalogue.\n"
+            f"  Settle it with 'pystage --calibrate', or add the stage to "
+            f"KNOWN_COUNTS_PER_MM in pscan/calibrate.py.")
+
+    # A stored figure is a deliberate human answer, so it settles a conflict
+    # the controller's own record cannot. Without one, refuse: picking either
+    # side of an inconsistency and carrying on is how 34304 survived.
+    if source not in (SOURCE_MANUAL, SOURCE_SPAN, 'stored'):
+        conflict = catalogue_conflict(params)
+        if conflict:
+            raise CalibrationUnknown(
+                f"counts-per-mm is ambiguous for axis {axis_id}, and {what} "
+                f"would record positions that are silently wrong.\n"
+                f"  {conflict}.\n"
+                f"  Both figures come from the same controller record, so it "
+                f"disagrees with itself - usually a controller set up for a "
+                f"different stage than the one attached.\n"
+                f"  Settle it with 'pystage --calibrate', which measures the "
+                f"stage you actually have and takes precedence.")
+
+    return value, source, notes
+
+
+def counts_per_mm_for(params, axis_id, calibration=None,
+                      fallback=LEGACY_COUNTS_PER_MM):
+    """Like resolve_counts_per_mm, but with a labelled last-resort fallback.
+
+    Returns (counts_per_mm, source). For the jog UI, where an approximate
+    scale is still useful and nothing is being recorded - the fallback is
+    reported as UNCALIBRATED rather than passed off as a real figure.
+    Anything that writes spatial data uses require_counts_per_mm() instead
+    and refuses.
+    """
+    value, source, _notes = resolve_counts_per_mm(params, axis_id,
+                                                  calibration)
+    if value is None:
+        return float(fallback), SOURCE_LEGACY
+    return value, source
 
 
 # --- Procedures that move the stage ---------------------------------------
@@ -426,6 +567,7 @@ def describe_source(counts_per_mm, source):
         SOURCE_MANUAL: 'measured on this rig',
         SOURCE_SPAN: 'from limit-to-limit travel',
         SOURCE_CONTROLLER: 'declared by the controller',
+        SOURCE_CATALOGUE: "from pscan's stage catalogue",
         SOURCE_LEGACY: 'UNCALIBRATED fallback - run pystage --calibrate',
     }.get(source, source)
     return f"{counts_per_mm:.1f} counts/mm ({note})"

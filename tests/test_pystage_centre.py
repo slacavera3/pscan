@@ -35,7 +35,8 @@ class FakeController:
 
     def __init__(self, travel=None, zero_offset=None, homed=None,
                  position=None, cnts_per_unit=int(SCALE),
-                 answer_stageaxis=True, answer_status=True):
+                 answer_stageaxis=True, answer_status=True,
+                 part_no=b'MLS203'):
         self.travel = travel or {1: (0, int(SCALE * 110)),
                                  2: (0, int(SCALE * 75))}
         self.zero_offset = zero_offset or {1: 0, 2: 0}
@@ -44,6 +45,7 @@ class FakeController:
         self.cnts_per_unit = cnts_per_unit
         self.answer_stageaxis = answer_stageaxis
         self.answer_status = answer_status
+        self.part_no = part_no
 
         self.out = bytearray()
         self._in = bytearray()
@@ -132,7 +134,7 @@ class FakeController:
         elif msg_id == 0x04F1 and self.answer_stageaxis:      # REQ_STAGEAXIS
             lo, hi = self.travel[axis]
             payload = struct.pack('<HHH16sIIiiIII', 0x01, 0x20, axis,
-                                  b'MLS203', 123456, self.cnts_per_unit,
+                                  self.part_no, 123456, self.cnts_per_unit,
                                   lo, hi, 1000, 1000, 230531)
             payload += b'\x00' * (74 - len(payload))
             self.out += _long(0x04F2, payload, dest)
