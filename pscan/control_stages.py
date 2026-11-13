@@ -10,8 +10,13 @@ from pscan.stage_driver import (
     MSG_REQ_POSCOUNTER, MSG_GET_POSCOUNTER,
     MSG_MOVE_HOME, MSG_MOVE_HOMED,
     MSG_REQ_HOMEPARAMS, MSG_GET_HOMEPARAMS,
+    MSG_REQ_STATUSBITS, MSG_GET_STATUSBITS,
+    MSG_REQ_STAGEAXISPARAMS, MSG_GET_STAGEAXISPARAMS,
+    STATUS_HOMED, STATUS_HOMING,
     DEFAULT_MANUAL_VELOCITY_MM_S, velocity_scale,
     decode_home_params, describe_zero,
+    decode_stage_axis_params, validate_travel, travel_centre_mm,
+    describe_travel,
 )
 
 # How long to wait for a homing seek to report back. Generous on purpose: the
@@ -137,6 +142,51 @@ class SimpleStage:
             return None
         _chan, min_v, accel, max_v = struct.unpack_from('<Hlll', payload, 0)
         return {'min': min_v, 'accel': accel, 'max': max_v}
+
+    def get_status_bits(self, axis_id):
+        """Read this axis's status word, or None on no reply."""
+        dest = 0x20 + axis_id
+        self.ser.reset_input_buffer()
+        self.ser.write(struct.pack('<HBBBB', MSG_REQ_STATUSBITS, 0x01, 0x00,
+                                   dest, 0x01))
+
+        payload = self._await_reply(MSG_GET_STATUSBITS, dest)
+        if payload is None or len(payload) < 6:
+            return None
+        _chan, bits = struct.unpack_from('<HL', payload, 0)
+        return bits
+
+    def is_homed(self, axis_id):
+        """True / False / None, where None means the controller did not say.
+
+        Asked because an absolute move to 'the centre of travel' is only
+        meaningful once homing has fixed the coordinate frame. An axis homed
+        in a previous session is still homed, so this is read from the
+        controller rather than assumed false at startup.
+        """
+        bits = self.get_status_bits(axis_id)
+        if bits is None:
+            return None
+        if bits & STATUS_HOMING:
+            return False
+        return bool(bits & STATUS_HOMED)
+
+    def get_stage_axis_params(self, axis_id):
+        """Read the stage's travel limits, or None on no reply."""
+        dest = 0x20 + axis_id
+        self.ser.reset_input_buffer()
+        self.ser.write(struct.pack('<HBBBB', MSG_REQ_STAGEAXISPARAMS, 0x01,
+                                   0x00, dest, 0x01))
+
+        payload = self._await_reply(MSG_GET_STAGEAXISPARAMS, dest)
+        return decode_stage_axis_params(payload)
+
+    def travel_centre(self, params):
+        """The centre of travel in mm, or (None, reason it is unavailable)."""
+        ok, reason = validate_travel(params, self.scale)
+        if not ok:
+            return None, reason
+        return travel_centre_mm(params, self.scale), reason
 
     def get_home_params(self, axis_id):
         """Read where this axis's zero will land, or None on no reply."""
@@ -323,12 +373,14 @@ def main():
     y_enabled = True
     needs_refresh = False
 
-    # Read once up front and again on R/H. Shown because 'go to zero' is
-    # otherwise unexplainable: where zero sits is stored in the controller,
-    # differs between a BBD20x and a BBD30x that were set up separately, and
-    # nothing in pscan writes it.
-    zero_x = stage.get_home_params(1)
-    zero_y = stage.get_home_params(2)
+    # Read once up front and again on R/H. Shown rather than kept internal
+    # because C is otherwise unexplainable: both where zero sits and how far
+    # the stage travels are stored in the controller, differ between a BBD20x
+    # and a BBD30x that were set up separately, and nothing in pscan writes
+    # them. The panel showing the centre it will aim for is also the preview
+    # of what C is about to do.
+    zero = {axis: stage.get_home_params(axis) for axis in (1, 2)}
+    travel = {axis: stage.get_stage_axis_params(axis) for axis in (1, 2)}
 
     while True:
         os.system('cls' if os.name == 'nt' else 'clear')
@@ -348,11 +400,13 @@ def main():
         # 'Zero' rather than 'centre', because that is all this is: the
         # encoder origin that H last defined. Whether it is the middle of
         # travel depends on the offset below, which lives in the controller.
-        print(f" Zero X: {describe_zero(zero_x)}")
-        print(f" Zero Y: {describe_zero(zero_y)}")
+        print(f" Zero   X: {describe_zero(zero[1])}")
+        print(f" Zero   Y: {describe_zero(zero[2])}")
+        print(f" Travel X: {describe_travel(travel[1], stage.scale)}")
+        print(f" Travel Y: {describe_travel(travel[2], stage.scale)}")
         print("==================================================")
         print("   Up/Down/L/R : Jog Axes   |  J : Set Step Size")
-        print("   G           : Go To Abs  |  C : Go To Zero (0,0)")
+        print("   G           : Go To Abs  |  C : Centre of Travel")
         print("   1 / 2       : Toggle X/Y |  R : Refresh Pos")
         print("   H           : Home Stage |  Q : Quit")
         print("==================================================")
@@ -397,34 +451,60 @@ def main():
                     msg = "Invalid coordinates entered. Move cancelled."
 
             elif key_str == 'r':
-                zero_x = stage.get_home_params(1)
-                zero_y = stage.get_home_params(2)
-                msg = "Positions and zero refreshed directly from hardware."
+                zero = {axis: stage.get_home_params(axis) for axis in (1, 2)}
+                travel = {axis: stage.get_stage_axis_params(axis)
+                          for axis in (1, 2)}
+                msg = ("Positions, zero and travel refreshed directly from "
+                       "hardware.")
                 needs_refresh = True
 
             elif key_str == 'c':
-                # Report per axis what was actually commanded. This used to
-                # skip a disabled axis and then announce "Commanded Center
-                # (0.0, 0.0)" regardless, which is how a one-axis move came
-                # to look like a two-axis centre that half worked.
-                moved, skipped = [], []
+                # The geometric centre of travel, computed as the MIDPOINT of
+                # the span the controller reports - not as half the travel
+                # from zero. The midpoint is invariant to where homing put
+                # zero, so a stage homed to its reverse limit and one
+                # carrying a home offset both land in the same physical
+                # place. That invariance is the requirement.
+                #
+                # This used to move to absolute (0,0) and call it "Center",
+                # which on a stage whose zero sits on a limit switch is a
+                # corner.
+                moved, skipped, refused = [], [], []
                 for axis_id, enabled, label in ((1, x_enabled, 'X'),
                                                 (2, y_enabled, 'Y')):
-                    if enabled:
-                        stage.move_absolute(axis_id, 0.0)
-                        moved.append(label)
-                        time.sleep(0.1)
-                    else:
+                    if not enabled:
                         skipped.append(label)
+                        continue
 
-                if not moved:
-                    msg = ("Nothing commanded: both axes are disabled. "
-                           "Press '1'/'2' to enable.")
-                else:
-                    msg = f"Commanded {'+'.join(moved)} to zero."
-                    if skipped:
-                        msg += (f" {'/'.join(skipped)} SKIPPED - disabled, so"
-                                f" this is NOT both axes.")
+                    centre, reason = stage.travel_centre(travel[axis_id])
+                    if centre is None:
+                        refused.append(f"{label}: {reason}")
+                        continue
+
+                    # An absolute move means nothing in a frame homing has
+                    # not fixed yet, and could drive into a limit. Refusing
+                    # is the safe answer and H is one keystroke away.
+                    homed = stage.is_homed(axis_id)
+                    if homed is None:
+                        refused.append(f"{label}: controller did not say "
+                                       f"whether it is homed")
+                        continue
+                    if not homed:
+                        refused.append(f"{label}: not homed - press H first")
+                        continue
+
+                    stage.move_absolute(axis_id, centre)
+                    moved.append(f"{label} to {centre:.5f}")
+                    time.sleep(0.1)
+
+                parts = []
+                if moved:
+                    parts.append(f"Centring {', '.join(moved)} mm.")
+                if skipped:
+                    parts.append(f"{'/'.join(skipped)} disabled, left alone.")
+                if refused:
+                    parts.append(f"REFUSED - {'; '.join(refused)}.")
+                msg = ' '.join(parts) if parts else "Nothing to do."
                 needs_refresh = True
 
             elif key_str == 'h':
@@ -453,10 +533,12 @@ def main():
                     msg = ("No axis confirmed homing. Check the controller is"
                            " enabled and not already at its limit.")
 
-                # Zero has just been redefined, so the stored offset is worth
-                # re-reading rather than showing what it was before.
-                zero_x = stage.get_home_params(1)
-                zero_y = stage.get_home_params(2)
+                # Zero has just been redefined, so both the stored offset and
+                # the travel limits expressed against it are worth re-reading
+                # rather than showing what they were before.
+                zero = {axis: stage.get_home_params(axis) for axis in (1, 2)}
+                travel = {axis: stage.get_stage_axis_params(axis)
+                          for axis in (1, 2)}
                 needs_refresh = True
                 
             elif key == '\x1b[C' or key == b'\xe0M':

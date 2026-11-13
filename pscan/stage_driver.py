@@ -7,10 +7,12 @@ import sys
 
 # Inbound APT message IDs.
 MSG_GET_POSCOUNTER = 0x0412
+MSG_GET_STATUSBITS = 0x042A
 MSG_GET_HOMEPARAMS = 0x0442
 MSG_MOVE_HOMED     = 0x0444
 MSG_MOVE_COMPLETED = 0x0464
 MSG_MOVE_STOPPED   = 0x0466
+MSG_GET_STAGEAXISPARAMS = 0x04F2
 
 # Outbound.
 MSG_REQ_POSCOUNTER = 0x0411
@@ -18,8 +20,15 @@ MSG_MOVE_STOP = 0x0465
 MSG_SET_VELPARAMS = 0x0413
 MSG_REQ_VELPARAMS = 0x0414
 MSG_GET_VELPARAMS = 0x0415
+MSG_REQ_STATUSBITS = 0x0429
 MSG_REQ_HOMEPARAMS = 0x0441
 MSG_MOVE_HOME      = 0x0443
+MSG_REQ_STAGEAXISPARAMS = 0x04F1
+
+# Motor status bits. Only the two that say whether a coordinate frame exists
+# yet: an absolute move means nothing until the axis has been homed.
+STATUS_HOMING = 0x00000200
+STATUS_HOMED  = 0x00000400
 
 # APT velocity scaling for brushless (BBD) controllers is
 # counts_per_mm * T * 65536, where T is the controller's sampling interval.
@@ -89,6 +98,121 @@ def decode_home_params(payload, counts_per_mm=None):
         'offset_counts': offset,
         'offset_mm': (offset / counts_per_mm) if counts_per_mm else None,
     }
+
+
+# --- Stage travel, for a 'go to the centre' that survives being moved ---
+#
+# STAGEAXISPARAMS (0x04F2, called PMDSTAGEAXISPARAMS in older revisions of the
+# protocol) is the only thing on the wire that reports a stage's travel. The
+# field layout below is NOT from Thorlabs' manual - it is transcribed from two
+# third-party libraries, thorpy and pystage_apt, which declare it identically:
+#
+#   chan_ident H, stage_id H, axis_id H, part_no_axis 16s, serial_num I,
+#   cnts_per_unit I, min_pos I, max_pos I, max_accn I, max_dec I, max_vel I,
+#   then padding, 74 bytes in all.
+#
+# Third-party and therefore not to be trusted on its own, which is what
+# cnts_per_unit is for. It sits immediately before min_pos, so if it decodes
+# to the counts-per-mm this rig is known to use, the alignment is right and
+# the two fields after it can be believed. If it decodes to anything else the
+# layout is wrong for this controller and the numbers are garbage - which is
+# why validate_travel() refuses rather than falling back to a guess. Nothing
+# commands a move off an unvalidated read.
+STAGEAXIS_LEN = 74
+_STAGEAXIS_HEAD = '<HHH16sII'          # through cnts_per_unit, 30 bytes
+_STAGEAXIS_LIMITS_OFFSET = 30
+
+# Signed, deliberately, though both libraries declare these unsigned. A stage
+# whose travel straddles zero reports a negative min_pos, and read unsigned
+# that arrives as ~4.29e9 and gets thrown out by validation for no reason. No
+# real travel approaches 2^31 counts, so reading signed is correct where
+# unsigned is correct and also correct where it is not.
+_STAGEAXIS_LIMITS = '<ii'
+
+
+def decode_stage_axis_params(payload):
+    """Unpack a GET_STAGEAXISPARAMS payload. Validate before trusting it."""
+    if payload is None or len(payload) < _STAGEAXIS_LIMITS_OFFSET + 8:
+        return None
+
+    chan, stage_id, axis_id, part_no, serial, cnts = struct.unpack_from(
+        _STAGEAXIS_HEAD, payload, 0)
+    min_pos, max_pos = struct.unpack_from(
+        _STAGEAXIS_LIMITS, payload, _STAGEAXIS_LIMITS_OFFSET)
+
+    return {
+        'chan_ident': chan,
+        'stage_id': stage_id,
+        'axis_id': axis_id,
+        'part_no': part_no.split(b'\x00')[0].decode('ascii', 'replace').strip(),
+        'serial_num': serial,
+        'cnts_per_unit': cnts,
+        'min_counts': min_pos,
+        'max_counts': max_pos,
+    }
+
+
+def validate_travel(params, counts_per_mm, min_span_mm=1.0, max_span_mm=500.0,
+                    tolerance=0.02):
+    """Is this travel read safe to command a move from? (ok, reason).
+
+    The cnts_per_unit check is the load-bearing one: it proves the byte
+    offsets are right for this controller. The span checks only catch a
+    reading that is self-consistent but absurd.
+    """
+    if params is None:
+        return False, "controller did not report stage axis parameters"
+
+    if not counts_per_mm:
+        return False, "no counts-per-mm to check the reply against"
+
+    cnts = params['cnts_per_unit']
+    if cnts <= 0:
+        return False, f"cnts_per_unit is {cnts}"
+    if abs(cnts - counts_per_mm) > tolerance * counts_per_mm:
+        return False, (f"cnts_per_unit is {cnts}, expected ~{counts_per_mm:.0f}"
+                       f" - the 0x04F2 field offsets are wrong for this"
+                       f" controller, so min/max cannot be trusted")
+
+    span_counts = params['max_counts'] - params['min_counts']
+    if span_counts <= 0:
+        return False, (f"max_counts {params['max_counts']} is not above "
+                       f"min_counts {params['min_counts']}")
+
+    span_mm = span_counts / counts_per_mm
+    if not (min_span_mm <= span_mm <= max_span_mm):
+        return False, (f"travel of {span_mm:.3f} mm is outside the plausible "
+                       f"{min_span_mm:g}-{max_span_mm:g} mm window")
+
+    return True, f"{span_mm:.5f} mm of travel"
+
+
+def travel_centre_mm(params, counts_per_mm):
+    """The geometric centre of travel, in the controller's own coordinates.
+
+    The midpoint of the reported span, NOT half the travel from zero. That is
+    the whole point: min and max arrive in the same frame as the position
+    counter, so their midpoint is the centre of the stage wherever homing
+    happened to put zero - a stage homed to its reverse limit and one carrying
+    a 55 mm home offset both give the right answer. Half-travel-from-zero only
+    works for the first of those.
+    """
+    if params is None or not counts_per_mm:
+        return None
+    return ((params['min_counts'] + params['max_counts']) / 2.0) / counts_per_mm
+
+
+def describe_travel(params, counts_per_mm):
+    """One line of travel and centre for a UI, or why there is none."""
+    ok, reason = validate_travel(params, counts_per_mm)
+    if not ok:
+        return f"unavailable - {reason}"
+
+    low = params['min_counts'] / counts_per_mm
+    high = params['max_counts'] / counts_per_mm
+    centre = travel_centre_mm(params, counts_per_mm)
+    name = params['part_no'] or 'unnamed axis'
+    return (f"{low:.5f} to {high:.5f} mm, centre {centre:.5f} mm  [{name}]")
 
 
 def describe_zero(params):
