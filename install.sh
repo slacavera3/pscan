@@ -583,16 +583,29 @@ install_nidaqmx() {
             echo " ->           with 'pydaq list' afterwards which one has it."
         fi
 
-        # Ubuntu 24.04 (noble), not 22.04 (jammy).
+        # Pick the Ubuntu release by GLIBC, not a fixed guess.
         #
-        # The closer the libc, the fewer surprises: Debian 13 ships glibc
-        # ~2.41, noble 2.39, jammy 2.35. Jammy was picked here when "closest
-        # supported LTS" was a guess rather than a comparison.
+        # NI's packages link against the glibc of the Ubuntu they were built
+        # for, and glibc is forward-compatible but not backward: a binary
+        # built against 2.39 will not run on 2.36. So the target has to track
+        # the machine, or pscan works on one Debian and not the next.
         #
-        # NI_UBUNTU=2204 overrides, since which releases NI publishes for
-        # changes over time.
-        ubu="${NI_UBUNTU:-2404}"
-        echo " ->           Targeting Ubuntu $ubu packages."
+        #   Debian 13 trixie    glibc ~2.41  ->  Ubuntu 24.04 noble  2.39
+        #   Debian 12 bookworm  glibc ~2.36  ->  Ubuntu 22.04 jammy  2.35
+        #
+        # This was hardcoded to 2404, which is right for trixie and wrong for
+        # bookworm - noble's packages want a newer glibc than bookworm has.
+        # Unknown or newer Debian gets the newest we know of, which is the
+        # right way to be wrong: too new fails loudly at apt, too old links
+        # against a glibc that is quietly missing symbols.
+        case "${release%%.*}" in
+            12) ubu_default=2204 ;;
+            13) ubu_default=2404 ;;
+            *)  ubu_default=2404 ;;
+        esac
+        ubu="${NI_UBUNTU:-$ubu_default}"
+        echo " ->           $distro $release -> targeting Ubuntu $ubu packages."
+        echo " ->           (NI_UBUNTU=<rel> overrides, e.g. NI_UBUNTU=2404)"
     fi
 
     sudo apt install -y curl unzip
@@ -796,11 +809,42 @@ if have_lib libnidaqmx; then
         break
     done
 elif grep -qls '^0x1093$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
-    # Say nothing is needed, rather than nothing at all. Someone who reads
-    # about iommu=pt elsewhere should be able to tell it was considered.
-    echo " ->   NI card present but NI-DAQmx is not installed, so comedi"
-    echo " ->   drives it. comedi needs no IOMMU change; boot config"
-    echo " ->   untouched."
+    # Which NI card decides whether this is fine or a dead end.
+    #
+    # comedi's ni_pcimio covers the E and M series and NO X Series at all.
+    # Every X Series board reports the same generic PCI device id, 0xc4c4,
+    # which is also why lspci calls a PCIe-6351 a "PXIe/PCIe Device" with no
+    # model name. So the id is how to tell them apart.
+    #
+    # This said "so comedi drives it" for any NI card, which is simply untrue
+    # for an X Series and would send someone looking for a comedi node that
+    # can never appear.
+    _xseries=""
+    for _v in /sys/bus/pci/devices/*/vendor; do
+        [ -e "$_v" ] || continue
+        [ "$(cat "$_v" 2>/dev/null)" = "0x1093" ] || continue
+        if [ "$(cat "$(dirname "$_v")/device" 2>/dev/null)" = "0xc4c4" ]; then
+            _xseries="$(basename "$(dirname "$_v")")"
+            break
+        fi
+    done
+
+    if [ -n "$_xseries" ]; then
+        echo " ->"
+        echo " -> [WARNING] $_xseries is an NI X SERIES card, and comedi has"
+        echo " ->           no driver for those - ni_pcimio covers the E and"
+        echo " ->           M series only. Without NI-DAQmx this card cannot"
+        echo " ->           be reached at all, by pscan or anything else."
+        echo " ->"
+        echo " ->             PSCAN_FORCE_DAQMX=1 bash install.sh"
+        echo " ->"
+        echo " ->           Boot config untouched for now; iommu=pt is only"
+        echo " ->           needed once NI's driver owns the card."
+    else
+        echo " ->   NI card present and NI-DAQmx is not installed, so comedi"
+        echo " ->   drives it. comedi needs no IOMMU change; boot config"
+        echo " ->   untouched."
+    fi
 fi
 
 # --- 2. Setup Tucsen SDK Drivers ---
