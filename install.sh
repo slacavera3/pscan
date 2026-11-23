@@ -21,8 +21,26 @@ echo "======================================================="
 # reports whether a calibration exists.
 #
 # Every driver step is idempotent, so re-running this costs seconds.
+# --comedi / --daqmx choose which NI driver to install. Neither is normally
+# needed: the DEFAULT IS TO DETECT, because which driver a rig needs is a
+# property of the card in it, not a preference.
+#
+#   X Series card present  ->  NI-DAQmx, because comedi cannot drive one
+#   E/M Series only        ->  comedi, and DAQmx is left alone
+#   no NI card             ->  neither
+#
+# This used to be PSCAN_FORCE_DAQMX=1, an env var that had to be known about
+# and remembered. A machine whose only DAQ card is an X Series would install
+# cleanly, report success, and leave the card unreachable - with the fix one
+# line in the output, easily read past. An installer that can see which card
+# is fitted should not need telling.
+#
+#   --daqmx   install it whatever is fitted
+#   --comedi  never install it, even for an X Series (it then says the card
+#             is unreachable rather than quietly doing nothing)
 DRIVERS_ONLY=0
 CALIBRATE=0
+NI_DRIVER=auto
 for _arg in "$@"; do
     case "$_arg" in
         --drivers-only)
@@ -33,8 +51,23 @@ for _arg in "$@"; do
             CALIBRATE=1
             echo " MODE: will calibrate counts-per-mm after installing"
             ;;
+        --daqmx)
+            NI_DRIVER=daqmx
+            echo " MODE: installing NI-DAQmx regardless of which card is fitted"
+            ;;
+        --comedi)
+            NI_DRIVER=comedi
+            echo " MODE: comedi only; NI-DAQmx will not be installed"
+            ;;
         --help|-h)
-            echo "usage: bash install.sh [--drivers-only] [--calibrate]"
+            echo "usage: bash install.sh [--comedi|--daqmx] [--drivers-only] [--calibrate]"
+            echo ""
+            echo "  By default the NI driver is chosen by the card fitted:"
+            echo "  an X Series board needs NI-DAQmx (comedi has no driver"
+            echo "  for one), anything else uses comedi."
+            echo ""
+            echo "  --daqmx         install NI-DAQmx whatever is fitted"
+            echo "  --comedi        never install NI-DAQmx"
             echo "  --drivers-only  system drivers only, no Python packages"
             echo "  --calibrate     after installing, measure counts-per-mm."
             echo "                  MOVES THE STAGE. Clear the sample first."
@@ -45,6 +78,11 @@ for _arg in "$@"; do
             ;;
     esac
 done
+
+# The old env var still works, so anything scripted against it keeps running.
+if [ -n "${PSCAN_FORCE_DAQMX:-}" ] && [ "$NI_DRIVER" = "auto" ]; then
+    NI_DRIVER=daqmx
+fi
 
 # ldconfig lives in /sbin, which is NOT on a normal user's PATH on Debian and
 # Ubuntu. Calling it bare makes every "is this library installed?" check come
@@ -111,6 +149,27 @@ ldconfig_p() {
     else
         return 1
     fi
+}
+
+# Is an NI X SERIES board fitted?
+#
+# The question that decides which driver a rig needs, because comedi's
+# ni_pcimio covers the E and M series and none of the X Series.
+#
+# Every X Series board reports the same generic PCI device id, 0xc4c4 - which
+# is also why lspci shows a PCIe-6351 as a bare "PXIe/PCIe Device" with no
+# model name. The model lives in the SUBSYSTEM id, and is not needed here:
+# the family is the whole question.
+has_xseries_card() {
+    local vendor
+    for vendor in /sys/bus/pci/devices/*/vendor; do
+        [ -e "$vendor" ] || continue
+        [ "$(cat "$vendor" 2>/dev/null)" = "0x1093" ] || continue
+        if [ "$(cat "$(dirname "$vendor")/device" 2>/dev/null)" = "0xc4c4" ]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 have_lib() {
@@ -251,10 +310,14 @@ echo -e "\n[1.7/6] Checking NI-DAQmx..."
 # comes from that feed. Both halves are automated here so this stays the
 # one-liner it is supposed to be.
 #
+# Whether to install it at all is decided by the card fitted - see NI_DRIVER
+# at the top of this script, and --comedi / --daqmx to override.
+#
 # Env overrides:
-#   PSCAN_SKIP_DAQMX=1    never install it
-#   PSCAN_FORCE_DAQMX=1   install even with no NI card currently seated
+#   PSCAN_SKIP_DAQMX=1    never install it (same as --comedi)
+#   PSCAN_FORCE_DAQMX=1   install it regardless (same as --daqmx)
 #   NI_RELEASE=2025Q1     pin the release whose zip is fetched
+#   NI_UBUNTU=2204        pin which Ubuntu's packages to use
 
 # Hand any NI card back from vfio-pci to whichever driver claims it.
 #
@@ -506,23 +569,49 @@ install_nidaqmx() {
         return 0
     fi
 
-    if [ -n "${PSCAN_SKIP_DAQMX:-}" ]; then
-        echo " -> PSCAN_SKIP_DAQMX is set. Skipping."
+    if [ -n "${PSCAN_SKIP_DAQMX:-}" ] || [ "$NI_DRIVER" = "comedi" ]; then
+        if [ "$NI_DRIVER" = "comedi" ] && has_xseries_card; then
+            echo " -> [WARNING] --comedi was given, but this machine has an NI"
+            echo " ->           X SERIES card, which comedi cannot drive at"
+            echo " ->           all. It will be unreachable. Re-run without"
+            echo " ->           --comedi, or with --daqmx, to use it."
+        else
+            echo " -> Not installing NI-DAQmx (comedi only)."
+        fi
         return 0
     fi
 
     # Don't pull a large vendor driver with kernel modules onto a machine that
     # has no NI card in it. A comedi-only rig needs none of this.
-    if [ -z "${PSCAN_FORCE_DAQMX:-}" ]; then
+    if [ "$NI_DRIVER" != "daqmx" ]; then
         if ! lspci 2>/dev/null | grep -qi "National Instruments"; then
             echo " -> No NI PCI/PCIe card found by lspci, so NI-DAQmx is not"
             echo " -> being installed. comedi cards are unaffected."
-            echo " -> Seat the card and re-run this script, or force it with:"
-            echo " ->   PSCAN_FORCE_DAQMX=1 bash install.sh"
+            echo " -> Seat the card and re-run, or force it with:"
+            echo " ->   bash install.sh --daqmx"
             return 0
         fi
+
         echo " -> NI card detected by lspci:"
         lspci 2>/dev/null | grep -i "National Instruments" | sed 's/^/ ->   /'
+
+        # An E or M series card works on comedi, which is already installed
+        # and needs no vendor repository, no kernel modules and no signing
+        # key. Only an X Series actually requires this.
+        if ! has_xseries_card; then
+            echo " ->"
+            echo " -> This is not an X Series card, so comedi drives it and"
+            echo " -> NI-DAQmx is not needed. Not installing it: the two"
+            echo " -> drivers both claim NI boards and only one can own a"
+            echo " -> card, so adding it could take this one from comedi."
+            echo " ->"
+            echo " -> Install it anyway with:  bash install.sh --daqmx"
+            return 0
+        fi
+
+        echo " ->"
+        echo " -> That is an X SERIES card. comedi has no driver for one, so"
+        echo " -> NI-DAQmx is the only way to reach it. Installing."
     fi
 
     local distro release ubu
@@ -536,7 +625,10 @@ install_nidaqmx() {
     # from it and damage the system. That is a decision for a person, not an
     # installer, so it needs an explicit opt-in.
     if [ "$distro" != "Ubuntu" ]; then
-        if [ -z "${PSCAN_FORCE_DAQMX:-}" ]; then
+        # An X Series card gets it anyway: unsupported-but-working beats a
+        # card nothing can reach. Detection already established that is the
+        # situation, so there is nothing left for a person to decide.
+        if [ "$NI_DRIVER" != "daqmx" ] && ! has_xseries_card; then
             echo " -> [WARNING] This machine is '$distro $release'. NI supports"
             echo " ->           Ubuntu, RHEL and openSUSE - NOT Debian - and"
             echo " ->           there is no Debian registration package."
@@ -550,7 +642,7 @@ install_nidaqmx() {
             echo " ->           their modules against whatever kernel is here,"
             echo " ->           and the feed is pinned so it cannot replace"
             echo " ->           Debian packages. It is worth trying:"
-            echo " ->             PSCAN_FORCE_DAQMX=1 bash install.sh"
+            echo " ->             bash install.sh --daqmx"
             echo " ->"
             echo " ->           With Secure Boot on you will need to enrol a"
             echo " ->           DKMS signing key once; this script says how"
@@ -559,9 +651,14 @@ install_nidaqmx() {
         fi
 
         echo " -> [WARNING] '$distro $release' is not supported by NI."
-        echo " ->           PSCAN_FORCE_DAQMX is set, so trying NI's Ubuntu"
-        echo " ->           packages. The apt feed is pinned below so it"
-        echo " ->           cannot replace Debian system libraries."
+        if has_xseries_card; then
+            echo " ->           Installing anyway: the card fitted is an X"
+            echo " ->           Series and nothing else can drive it."
+        else
+            echo " ->           Installing anyway, as asked."
+        fi
+        echo " ->           The apt feed is pinned below so it cannot"
+        echo " ->           replace Debian system libraries."
 
         # If comedi currently drives an NI card here, say so before changing
         # anything. Two kernel drivers cannot bind the same PCI function:
@@ -819,24 +916,14 @@ elif grep -qls '^0x1093$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
     # This said "so comedi drives it" for any NI card, which is simply untrue
     # for an X Series and would send someone looking for a comedi node that
     # can never appear.
-    _xseries=""
-    for _v in /sys/bus/pci/devices/*/vendor; do
-        [ -e "$_v" ] || continue
-        [ "$(cat "$_v" 2>/dev/null)" = "0x1093" ] || continue
-        if [ "$(cat "$(dirname "$_v")/device" 2>/dev/null)" = "0xc4c4" ]; then
-            _xseries="$(basename "$(dirname "$_v")")"
-            break
-        fi
-    done
-
-    if [ -n "$_xseries" ]; then
+    if has_xseries_card; then
         echo " ->"
-        echo " -> [WARNING] $_xseries is an NI X SERIES card, and comedi has"
-        echo " ->           no driver for those - ni_pcimio covers the E and"
-        echo " ->           M series only. Without NI-DAQmx this card cannot"
-        echo " ->           be reached at all, by pscan or anything else."
+        echo " -> [WARNING] This is an NI X SERIES card, and comedi has no"
+        echo " ->           driver for those - ni_pcimio covers the E and M"
+        echo " ->           series only. Without NI-DAQmx it cannot be"
+        echo " ->           reached at all, by pscan or anything else."
         echo " ->"
-        echo " ->             PSCAN_FORCE_DAQMX=1 bash install.sh"
+        echo " ->             bash install.sh --daqmx"
         echo " ->"
         echo " ->           Boot config untouched for now; iommu=pt is only"
         echo " ->           needed once NI's driver owns the card."
