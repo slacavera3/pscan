@@ -27,13 +27,32 @@
 ##      range handling is wrong;
 ##   4. a trace lands per coordinate, in step with the axis.
 ##
+## HOW TO READ THIS FILE
+##
+## The scope block sits INSIDE the axis block, and that is what says it
+## runs once per voltage:
+##
+##   for each of 6 ao0 levels          <- action d2a
+##       capture one trace            <- action picoscope
+##
+## 6 x 1 = 6 traces. See examples/nested_loops.con for the general rules;
+## the two that matter here are that only a loop (an axis block, or
+## 'count') may contain other blocks, and that every recording block must
+## sit at the same depth.
+##
 ## Run it in this order:
 ##
 ##   pscan --dry-run examples/bringup_picoscope.con
 ##   pscan --timer   examples/bringup_picoscope.con
 ##
-## --dry-run opens nothing and prints the grid and the output files. Do it
-## first; it catches a typo in this file before anything drives 5 V.
+## --dry-run opens nothing and prints the nest, the grid and the output
+## files. Do it first; it catches a typo in this file before anything
+## drives 5 V. It also prints the line
+##
+##   This config NESTS its blocks, so the file decides the order
+##
+## which is how you confirm the hierarchy parsed as written rather than
+## being read by the flat positional rule.
 ##
 ## WHAT THE OPENING LOG SHOULD SAY. There is no 'pydaq list' for a
 ## PicoScope - the first run IS the detection - so read these two lines
@@ -100,24 +119,19 @@
 ## fields. That is the point of the format being shared.
 
 ## ---------------------------------------------------------------------
-## One trace per coordinate. Raise this to average at a point.
-## ---------------------------------------------------------------------
-action count
-count 1
-end
-
-## ---------------------------------------------------------------------
-## The output axis: ao0 over 0..5 V in 1 V steps, 6 points.
+## THE SWEEP: ao0 over 0..5 V in 1 V steps, 6 points.
 ##
 ## Deliberately 0..5 and not 0..10, so the whole sweep sits inside the
 ## +/-5 V scope range below and nothing has to be guessed about headroom.
 ##
 ## 'device Dev1' is whatever 'pydaq list' reported. 'restore' returns ao0
-## to 0 V at the end rather than leaving the card driving 5 V into the
-## scope afterwards.
+## to 0 V when this loop ends rather than leaving the card driving 5 V
+## into the scope afterwards.
 ##
 ## Axis 98, not the default 99: 99 prints as "Z/piezo" in the log, which
-## would be misleading here.
+## would be misleading here. In a nested file the number no longer decides
+## the order - the nesting does - but it still names the axis in the log
+## and is what 'restore' belongs to.
 ## ---------------------------------------------------------------------
 action d2a
 axis 98
@@ -129,69 +143,115 @@ scan 0.0 5.0 1.0
 limits 0.0 5.0
 settle 0.01
 restore
+
+    ## -----------------------------------------------------------------
+    ## ONE CAPTURE AT EACH LEVEL. Inside the axis block, so it runs once
+    ## per voltage; that is the whole of what the nesting says.
+    ##
+    ## Every setting is here because a USB scope has no front panel to
+    ## inherit one from - that is the difference from 'action scope'.
+    ##
+    ## 'series'/'serial' are commented out: with one unit attached pscan
+    ## finds it and names it in the log. Uncomment and paste in what the
+    ## error prints if you ever have two plugged in.
+    ##
+    ## 'v_max 5.0' is the FULL SCALE in volts, so the range is +/-5 V.
+    ## pscan picks the narrowest range the unit offers that contains it,
+    ## and refuses rather than quietly widening if nothing fits. For a
+    ## real photodiode measurement, drop this to the smallest value your
+    ## signal fits inside: the range is the resolution.
+    ##
+    ## 'coupling dc' MATTERS HERE and is the classic bring-up trap: AC
+    ## coupling removes exactly the DC level this file is trying to
+    ## measure, so every trace would read ~0 V and look like a dead
+    ## cable.
+    ##
+    ## 'trigger none' is deliberate, not an omission. A DC level has no
+    ## edge to trigger on, so each capture starts the moment pscan asks
+    ## for it. Writing it explicitly is what distinguishes "I meant
+    ## untriggered" from "I forgot" - leaving the line out does the same
+    ## thing but prints a config warning. For anything PULSED, see the
+    ## block at the bottom.
+    ##
+    ## 1000 samples at 1 MS/s is a 1 ms record, far more than a DC level
+    ## needs; it is sized so --timer reports something representative of
+    ## a real capture rather than of an empty one.
+    ## -----------------------------------------------------------------
+    action picoscope
+    ## series ps5000a
+    ## serial GQ123/456
+    channels A
+    v_max 5.0
+    coupling dc
+    sample_rate 1e6
+    n_samples 1000
+    trigger none
+    captures 1
+    averages 1
+    timeout 5.0
+    end
+
 end
 
 ## ---------------------------------------------------------------------
-## The PicoScope. Every setting is here because a USB scope has no front
-## panel to inherit one from - that is the whole difference from
-## 'action scope'.
+## WHERE 'count' WOULD GO, AND WHAT IT WOULD MEAN
 ##
-## 'series'/'serial' are commented out: with one unit attached pscan finds
-## it and names it in the log. Uncomment and paste in what the error
-## prints if you ever have two plugged in.
+## Two placements, two different experiments. Both give 24 traces; they
+## are not the same measurement.
 ##
-## 'v_max 5.0' is the FULL SCALE in volts, so the range is +/-5 V. pscan
-## picks the narrowest range the unit offers that contains it, and refuses
-## rather than quietly widening if nothing fits. For a real photodiode
-## measurement, drop this to the smallest value your signal fits inside:
-## the range is the resolution.
+## AVERAGE EACH POINT - count inside the axis, around the scope block:
 ##
-## 'coupling dc' MATTERS HERE and is the classic bring-up trap: AC
-## coupling removes exactly the DC level this file is trying to measure,
-## so every trace would read ~0 V and look like a dead cable.
+##   action d2a
+##   axis 98
+##   ...
+##       action count
+##       count 4
+##           action picoscope
+##           ...
+##           end
+##       end
+##   end
 ##
-## 'trigger none' is deliberate, not an omission. A DC level has no edge
-## to trigger on, so each capture starts the moment pscan asks for it.
-## Writing it explicitly is what distinguishes "I meant untriggered" from
-## "I forgot" - leaving the line out does the same thing but prints a
-## config warning. For anything PULSED, see the block at the bottom.
+## REPEAT THE WHOLE SWEEP - count outside the axis. For a bring-up this
+## is the more useful of the two: it tells you whether trace N reads N
+## volts EVERY time, which is the drift and repeatability question, and
+## the four passes can be compared instead of averaged blindly:
 ##
-## 1000 samples at 1 MS/s is a 1 ms record, which is far more than a DC
-## level needs; it is sized so --timer reports something representative of
-## a real capture rather than of an empty one.
-## ---------------------------------------------------------------------
-action picoscope
-## series ps5000a
-## serial GQ123/456
-channels A
-v_max 5.0
-coupling dc
-sample_rate 1e6
-n_samples 1000
-trigger none
-captures 1
-averages 1
-timeout 5.0
-end
-
+##   action count
+##   count 4
+##       action d2a
+##       axis 98
+##       ...
+##           action picoscope
+##           ...
+##           end
+##       end
+##   end
+##
+## Note that averaging inside the scope block is a third thing again:
+## 'averages 100' means the UNIT captures 100 segments and pscan means
+## them into one written row, which is faster than four pscan traces
+## because the stage and the software never see them - but it also cannot
+## be undone later, and it says nothing about drift.
+##
 ## ---------------------------------------------------------------------
 ## NEXT, ONCE THE ABOVE READS 0..5 V CORRECTLY
 ##
-## Replace the block above with something like this for a real pulsed
-## measurement. Nothing else in the file changes.
+## Replace the picoscope block with something like this for a real pulsed
+## measurement. The nesting does not change.
 ##
-## action picoscope
-## channels A, B
-## v_max 0.2, 5.0          ## signal on a tight range, monitor on a wide one
-## coupling dc, dc
-## sample_rate 50e6
-## n_samples 5000
-## pretrigger 10           ## keep 10% of the record BEFORE the trigger
-## trigger B 1.5 rising    ## or 'trigger ext 1.5 rising' for the EXT input
-## captures 1              ## segments WRITTEN per trace (scp.multitraces)
-## averages 100            ## segments AVERAGED into each row (scp.n_averages)
-## timeout 5.0             ## a missed trigger pads the trace and carries on
-## end
+##     action picoscope
+##     channels A, B
+##     v_max 0.2, 5.0          ## signal tight, monitor wide
+##     coupling dc, dc
+##     sample_rate 50e6
+##     n_samples 5000
+##     pretrigger 10           ## keep 10% of the record BEFORE the trigger
+##     trigger B 1.5 rising    ## or 'trigger ext 1.5 rising' for EXT in
+##     captures 1              ## segments WRITTEN per trace (scp.multitraces)
+##     averages 100            ## segments AVERAGED into each row (scp.n_averages)
+##     timeout 5.0             ## a missed trigger pads the trace and carries on
+##     end
 ##
 ## Two things to know before trusting that one:
 ##

@@ -400,6 +400,67 @@ class TestNestingValidation(unittest.TestCase):
         self.assertNotIn('a2d', LOOP_TYPES)
         self.assertIn('a2d', DATA_TYPES)
 
+    def test_a_picoscope_nests_like_any_other_recording_block(self):
+        self.check("""
+            action d2a
+            axis 98
+            channel 0
+            scan 0 5 1
+              action count
+              count 4
+                action picoscope
+                channels A
+                trigger none
+                end
+              end
+            end
+        """)
+
+    def test_a_picoscope_is_a_recording_block_and_not_a_loop(self):
+        """Which is what subjects it to the same-depth rule below.
+
+        A new instrument that was left out of DATA_TYPES would parse, run,
+        and quietly produce a file with a different trace count from the
+        a2d beside it - the exact outcome that rule exists to prevent.
+        """
+        self.assertIn('picoscope', DATA_TYPES)
+        self.assertNotIn('picoscope', LOOP_TYPES)
+
+    def test_a_picoscope_at_a_different_depth_from_an_a2d_is_refused(self):
+        self.rejects("""
+            action d2a
+            axis 98
+            scan 0 5 1
+              action picoscope
+              channels A
+              trigger none
+              end
+              action count
+              count 2
+                action a2d
+                channel 0
+                end
+              end
+            end
+        """, "different depths")
+
+    def test_blocks_nested_inside_a_picoscope_are_refused(self):
+        # It records; it does not loop. Nesting here would read as though
+        # the inner block ran per trace.
+        self.rejects("""
+            action d2a
+            axis 98
+            scan 0 5 1
+              action picoscope
+              channels A
+              trigger none
+                action delay
+                time 1
+                end
+              end
+            end
+        """, "only", "loops")
+
 
 class TestFlatPlansKeepTodaysOrder(unittest.TestCase):
     """A flat config must run exactly as it runs now.
@@ -494,6 +555,25 @@ class TestFlatPlansKeepTodaysOrder(unittest.TestCase):
         order = plan_order(build_plan(parse_con_tree(str(path))), iterations=2)
         self.assertEqual(order,
                          ["d2a[0]", "  a2d", "d2a[1]", "  a2d", "d2a restore"])
+
+    def test_the_picoscope_bringup_file_is_written_as_a_nest(self):
+        """And stays one.
+
+        The scope block sitting INSIDE the axis block is what says it runs
+        once per voltage. Written flat it happens to produce the same six
+        traces today, through the positional rule, which is exactly why a
+        flattened version of this file would not fail anything else - hence
+        the explicit assertion that it nests.
+        """
+        path = REPO / "examples" / "bringup_picoscope.con"
+        roots = parse_con_tree(str(path))
+        self.assertTrue(has_nesting(roots), "the example was flattened")
+
+        order = plan_order(build_plan(roots), iterations=2)
+        self.assertEqual(
+            order,
+            ["d2a[0]", "  picoscope", "d2a[1]", "  picoscope", "d2a restore"],
+        )
 
 
 class TestNestingChangesTheExperiment(unittest.TestCase):
