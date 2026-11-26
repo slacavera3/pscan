@@ -52,6 +52,16 @@ WEBCAM_DISCARD_FRAMES = 3
 MAX_CONSECUTIVE_DROPS = 10
 
 
+#: Scope block type -> the output stream it writes, as <base>_<stream>.dat
+#: plus the matching .m. Two entries because a bench may have a LeCroy on the
+#: network and a PicoScope on USB, and a run may use either or both; they get
+#: separate files, in the same format, written by the same pscan.scope_io.
+SCOPE_STREAMS = {
+    'scope': 'scope0',
+    'picoscope': 'pico0',
+}
+
+
 class AcquisitionAborted(RuntimeError):
     """Raised when a trace cannot be recorded without desynchronising the file."""
 
@@ -117,10 +127,15 @@ try:
 except ImportError:
     ANDOR_AVAILABLE = False
 
-def run_pipeline_sequence(pipeline, scope, ixon, tucsen, base_filename,
+def run_pipeline_sequence(pipeline, scopes, ixon, tucsen, base_filename,
                           total_a2d_blocks, global_total_traces,
                           call_state, silent_acq=False, timer_mode=False):
     """Run one pass of a pipeline.
+
+    `scopes` maps a scope block type to its open driver - see SCOPE_STREAMS.
+    It used to be the single LeCroy session; a USB PicoScope is a second
+    instrument with the same contract, and both are driven by one branch
+    below rather than one branch each.
 
     The a2d session is no longer passed in: each 'action a2d' block carries
     its own, resolved by open_a2d_sessions() before the scan starts, because
@@ -164,9 +179,13 @@ def run_pipeline_sequence(pipeline, scope, ixon, tucsen, base_filename,
                 if ret:
                     cv2.imwrite(img_filename, frame)
                 
-        elif act_type == 'scope' and scope:
-            output_name = f"{base_filename}_scope0"
-            ok = scope.acquire_multi_channel(
+        elif act_type in SCOPE_STREAMS and scopes.get(act_type):
+            # One branch for the LeCroy and the PicoScope: both drivers hold
+            # to the same contract, and both write through pscan.scope_io, so
+            # the only thing that differs here is which file they write.
+            device = scopes[act_type]
+            output_name = f"{base_filename}_{SCOPE_STREAMS[act_type]}"
+            ok = device.acquire_multi_channel(
                 channels=p['channels'], output_base_name=output_name,
                 save_for_matlab=True, is_first_trace=is_first,
                 total_loops=global_total_traces,
@@ -181,17 +200,17 @@ def run_pipeline_sequence(pipeline, scope, ixon, tucsen, base_filename,
             else:
                 if is_first:
                     raise AcquisitionAborted(
-                        "The first scope trace failed, so there is no trace "
-                        "geometry to pad with and no .m file was written. "
-                        "Check the trigger and re-run."
+                        f"The first {act_type} trace failed, so there is no "
+                        f"trace geometry to pad with and no .m file was "
+                        f"written. Check the trigger and re-run."
                     )
-                if not scope.write_placeholder_trace(output_name):
+                if not device.write_placeholder_trace(output_name):
                     raise AcquisitionAborted(
-                        "A scope trace failed and no placeholder could be "
-                        "written; aborting rather than letting the .dat "
-                        "desynchronise from the coordinate grid."
+                        f"A {act_type} trace failed and no placeholder could "
+                        f"be written; aborting rather than letting the .dat "
+                        f"desynchronise from the coordinate grid."
                     )
-                note_dropped_trace(call_state, 'scope')
+                note_dropped_trace(call_state, act_type)
 
         elif act_type == 'a2d':
             session = p.get('session')
@@ -647,6 +666,23 @@ def describe_action(action):
     if t == 'scope':
         line = f"scope    {', '.join(p['channels'])} @ {p['ip']}"
         return line + (f"  (sweeps {p['sweeps']})" if p.get('sweeps') else "  (sweeps: scope default)")
+    if t == 'picoscope':
+        where = p.get('series') or 'auto-detect'
+        if p.get('serial'):
+            where += f" {p['serial']}"
+        rate = (p.get('sample_rate') or 1e6) / 1e6
+        ranges = p.get('v_max')
+        span = (", ".join(f"+/-{v:g}V" for v in ranges) if ranges
+                else "+/-5V (default)")
+        trigger = p.get('trigger')
+        edge = (f"{trigger['source']} {trigger['level']:g}V "
+                f"{trigger['direction']}" if trigger else "untriggered")
+        shape = f"{p.get('captures') or 1} capture(s)"
+        if p.get('averages'):
+            shape += f" x {p['averages']} averages"
+        return (f"picoscope {', '.join(p['channels'])}, {span}, "
+                f"{p.get('n_samples') or 1000} samples @ {rate:g} MS/s, "
+                f"{edge}, {shape}, on {where}")
     if t == 'a2d':
         card = p.get('backend') or 'auto'
         if p.get('device'):
@@ -696,6 +732,15 @@ def predicted_outputs(base, pipelines, total_a2d_blocks, total_traces):
         outputs.append(("scope metadata", f"{base}_scope0.m", None))
         outputs.append(("segment trigger times", f"{base}_scope0_trigtime.dat",
                         "only written in Sequence mode"))
+
+    if any(a['type'] == 'picoscope' for a in pipelines):
+        # Same format as the LeCroy's files, under its own name so a run can
+        # use both instruments. No trigtime sidecar: block mode cannot report
+        # the time between segment triggers, only the sub-sample offset
+        # within one, and half of that pair is worse than none.
+        stream = f"{base}_{SCOPE_STREAMS['picoscope']}"
+        outputs.append(("picoscope data", f"{stream}.dat", None))
+        outputs.append(("picoscope metadata", f"{stream}.m", None))
 
     for action in pipelines:
         if action['type'] == 'a2d':
@@ -1059,6 +1104,14 @@ def main():
 
 
     scope_ip = next((act['params']['ip'] for act in acquisition_pipeline if act['type'] == 'scope'), None)
+    # The USB scope is configured entirely from its block - there is no front
+    # panel to read settings off - so the whole params dict is what opens it.
+    pico_params = next(
+        (act['params'] for act in
+         setup_pipeline + acquisition_pipeline + teardown_pipeline
+         if act['type'] == 'picoscope'),
+        None
+    )
     ixon_in_pipeline = any(act['type'] == 'ixon' for act in acquisition_pipeline + setup_pipeline + teardown_pipeline)
     
     # Resolved from the controller once it is connected, not hardcoded here.
@@ -1111,7 +1164,10 @@ def main():
     # came up. Construction and connection happen inside the try, because when
     # they sat outside it a failure part way through left earlier devices
     # running - a streaming Tucsen, or the iXon with its shutter open.
-    scope = stage = ixon = tucsen = None
+    scope = pico = stage = ixon = tucsen = None
+    # Filled in as each one comes up, and handed to every pipeline run. A
+    # type with no open device simply does not fire its branch.
+    scopes = {}
     axes = []
     # Shared across every APT axis so the "repeated settle timeouts" advice
     # fires once for the run rather than once per axis.
@@ -1140,6 +1196,15 @@ def main():
             from pscan.lecroy_driver import LeCroyScope
             scope = LeCroyScope(scope_ip)
             scope.connect()
+            scopes['scope'] = scope
+        if pico_params:
+            print("\nOpening USB session to PicoScope...")
+            from pscan.picoscope_driver import PicoScope
+            pico = PicoScope.from_block(pico_params)
+            # Raises rather than guessing when no unit, or more than one, is
+            # attached - before the sample has been driven anywhere.
+            pico.connect()
+            scopes['picoscope'] = pico
         # Opened before anything moves, so a missing card - or a config that
         # is ambiguous about which of two cards it means - stops the run
         # before the sample has been driven anywhere.
@@ -1205,7 +1270,7 @@ def main():
         if setup_pipeline:
             print("\nExecuting Pre-Scan Initialization Commands...")
             run_pipeline_sequence(
-                setup_pipeline, scope, ixon, tucsen, base_filename,
+                setup_pipeline, scopes, ixon, tucsen, base_filename,
                 total_a2d_blocks, global_total_traces, call_state,
                 timer_mode=timer_mode
             )
@@ -1253,7 +1318,7 @@ def main():
             )
 
             run_pipeline_sequence(
-                compiled_list(blocks), scope, ixon, tucsen, base_filename,
+                compiled_list(blocks), scopes, ixon, tucsen, base_filename,
                 total_a2d_blocks, global_total_traces, call_state,
                 silent_acq=True, timer_mode=timer_mode
             )
@@ -1271,7 +1336,7 @@ def main():
             and so does anything a nested config puts between rows.
             """
             run_pipeline_sequence(
-                compiled_list([block]), scope, ixon, tucsen, base_filename,
+                compiled_list([block]), scopes, ixon, tucsen, base_filename,
                 total_a2d_blocks, global_total_traces, call_state,
                 timer_mode=timer_mode
             )
@@ -1294,7 +1359,7 @@ def main():
         if teardown_pipeline:
             print("\nExecuting Post-Scan Teardown Commands...")
             run_pipeline_sequence(
-                teardown_pipeline, scope, ixon, tucsen, base_filename,
+                teardown_pipeline, scopes, ixon, tucsen, base_filename,
                 total_a2d_blocks, global_total_traces, call_state,
                 timer_mode=timer_mode
             )
@@ -1323,19 +1388,23 @@ def main():
 
         print("\nExecuting Hardware Disconnects & Saving Files...")
 
-        # Correct the .m while the scope still holds the first trace's
+        # Correct each .m while its scope still holds the first trace's
         # metadata, before it is torn down.
-        def correct_metadata():
-            if scope.finalize_matlab_metadata():
+        def correct_metadata(device, stream):
+            if device.finalize_matlab_metadata():
                 print(
-                    f" -> Rewrote {base_filename}_scope0.m for the "
-                    f"{scope.traces_written} trace(s) actually recorded."
+                    f" -> Rewrote {base_filename}_{stream}.m for the "
+                    f"{device.traces_written} trace(s) actually recorded."
                 )
 
-        if scope:
-            safe_teardown("Metadata rewrite", correct_metadata)
+        for act_type, device in scopes.items():
+            safe_teardown(
+                f"{act_type} metadata rewrite",
+                lambda d=device, s=SCOPE_STREAMS[act_type]: correct_metadata(d, s)
+            )
 
         if scope: safe_teardown("Scope disconnect", scope.disconnect)
+        if pico: safe_teardown("PicoScope disconnect", pico.disconnect)
         if stage: safe_teardown("Stage disconnect", stage.disconnect)
         if ixon: safe_teardown("iXon shutdown", ixon.shutdown)
         if tucsen: safe_teardown("Tucsen shutdown", tucsen.shutdown)

@@ -313,6 +313,241 @@ class TestA2DKeys(unittest.TestCase):
         self.assertTrue(any("explicit volts win" in w for w in warnings))
 
 
+class TestPicoScopeBlock(unittest.TestCase):
+    """'action picoscope': the USB scope's settings all live in the config.
+
+    A LeCroy is asked what it is set to; a PicoScope has no front panel, so a
+    typo here is the difference between the data and what the config claims
+    - which is why so much of this block is checked before anything opens.
+    """
+
+    def compile_block(self, body):
+        _, actions, warnings = compile_con(body)
+        return actions[0]['params'], warnings
+
+    def assert_rejected(self, body, fragment):
+        with self.assertRaises(ValueError) as caught:
+            compile_con(body)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_a_minimal_block_compiles_with_everything_else_unset(self):
+        # Unset means "the driver's default", not a value invented here: the
+        # defaults live next to the code that uses them.
+        p, _ = self.compile_block("""
+            action picoscope
+            channels A, B
+            end
+        """)
+        self.assertEqual(p['channels'], ['A', 'B'])
+        for key in ('series', 'serial', 'resolution', 'v_max', 'coupling',
+                    'sample_rate', 'n_samples', 'pretrigger', 'timeout',
+                    'captures', 'averages', 'trigger'):
+            self.assertIsNone(p[key], f"{key} invented a default")
+
+    def test_every_key_compiles(self):
+        p, _ = self.compile_block("""
+            action picoscope
+            series ps5000a
+            serial AB123/456
+            resolution 12
+            channels A, C
+            v_max 0.2, 5.0
+            coupling ac, dc
+            sample_rate 5e6
+            n_samples 4096
+            pretrigger 25
+            trigger C -0.5 falling
+            timeout 2.5
+            captures 10
+            averages 4
+            end
+        """)
+        self.assertEqual(p['series'], 'ps5000a')
+        self.assertEqual(p['serial'], 'AB123/456')
+        self.assertEqual(p['resolution'], 12)
+        self.assertEqual(p['channels'], ['A', 'C'])
+        self.assertEqual(p['v_max'], [0.2, 5.0])
+        self.assertEqual(p['coupling'], ['ac', 'dc'])
+        self.assertEqual(p['sample_rate'], 5e6)
+        self.assertEqual(p['n_samples'], 4096)
+        self.assertEqual(p['pretrigger'], 25.0)
+        self.assertEqual(p['timeout'], 2.5)
+        self.assertEqual(p['captures'], 10)
+        self.assertEqual(p['averages'], 4)
+        self.assertEqual(
+            p['trigger'],
+            {'source': 'C', 'level': -0.5, 'direction': 'falling'},
+        )
+
+    def test_averages_is_also_reachable_as_sweeps(self):
+        # So a config can say what it says in an 'action scope' block, and so
+        # the orchestrator hands either instrument its count the same way.
+        p, _ = self.compile_block("""
+            action picoscope
+            channels A
+            sweeps 250
+            end
+        """)
+        self.assertEqual(p['averages'], 250)
+        self.assertEqual(p['sweeps'], 250)
+
+    def test_commas_are_optional_everywhere(self):
+        p, _ = self.compile_block("""
+            action picoscope
+            channels A B
+            v_max 1 2
+            end
+        """)
+        self.assertEqual(p['channels'], ['A', 'B'])
+        self.assertEqual(p['v_max'], [1.0, 2.0])
+
+    def test_trigger_none_is_an_explicit_untriggered_capture(self):
+        # Which also silences the warning that an omitted trigger raises.
+        p, warnings = self.compile_block("""
+            action picoscope
+            channels A
+            trigger none
+            end
+        """)
+        self.assertIsNone(p['trigger'])
+        self.assertFalse([w for w in warnings if 'trigger' in w])
+
+    def test_omitting_the_trigger_warns(self):
+        _, warnings = self.compile_block("""
+            action picoscope
+            channels A
+            end
+        """)
+        self.assertTrue(any("no 'trigger'" in w for w in warnings))
+
+    def test_a_lecroy_channel_name_is_refused(self):
+        self.assert_rejected("""
+            action picoscope
+            channels C1, F1
+            end
+        """, "single letters")
+
+    def test_a_channel_the_series_does_not_have_is_refused(self):
+        self.assert_rejected("""
+            action picoscope
+            series ps5000a
+            channels A, F
+            end
+        """, "does not exist on a ps5000a")
+
+    def test_the_same_channel_twice_is_refused(self):
+        self.assert_rejected("""
+            action picoscope
+            channels A, A
+            end
+        """, "same channel twice")
+
+    def test_a_non_a_series_is_refused_by_name(self):
+        self.assert_rejected("""
+            action picoscope
+            series ps2000
+            channels A
+            end
+        """, "not one pscan drives")
+
+    def test_a_per_channel_list_of_the_wrong_length_is_refused(self):
+        self.assert_rejected("""
+            action picoscope
+            channels A, B, C
+            v_max 1.0, 2.0
+            end
+        """, "one per channel")
+
+    def test_more_volts_than_any_range_is_refused(self):
+        self.assert_rejected("""
+            action picoscope
+            channels A
+            v_max 500
+            end
+        """, "wider than any PicoScope range")
+
+    def test_a_trigger_on_an_unrecorded_channel_is_refused(self):
+        # A PicoScope can only trigger on a channel that is switched on, so
+        # this would arm something that never fires.
+        self.assert_rejected("""
+            action picoscope
+            channels A
+            trigger B 0.5 rising
+            end
+        """, "which it does not record")
+
+    def test_a_malformed_trigger_line_says_what_it_wanted(self):
+        self.assert_rejected("""
+            action picoscope
+            channels A
+            trigger A rising
+            end
+        """, "three values")
+
+    def test_an_unknown_edge_is_refused(self):
+        self.assert_rejected("""
+            action picoscope
+            channels A
+            trigger A 0.5 sideways
+            end
+        """, "trigger edge must be")
+
+    def test_the_external_input_may_be_the_trigger_source(self):
+        p, _ = self.compile_block("""
+            action picoscope
+            channels A
+            trigger ext 1.0 rising
+            end
+        """)
+        self.assertEqual(p['trigger']['source'], 'ext')
+
+    def test_a_pretrigger_outside_0_to_100_is_refused(self):
+        self.assert_rejected("""
+            action picoscope
+            channels A
+            pretrigger 120
+            end
+        """, "0..100")
+
+    def test_zero_samples_is_refused(self):
+        self.assert_rejected("""
+            action picoscope
+            channels A
+            n_samples 0
+            end
+        """, "at least 1")
+
+    def test_resolution_on_a_series_without_one_warns(self):
+        _, warnings = self.compile_block("""
+            action picoscope
+            series ps2000a
+            channels A
+            resolution 12
+            end
+        """)
+        self.assertTrue(any("switchable ADC" in w for w in warnings))
+
+    def test_an_unknown_key_is_refused_rather_than_ignored(self):
+        self.assert_rejected("""
+            action picoscope
+            channels A
+            v_mxa 1.0
+            end
+        """, "does not understand the key 'v_mxa'")
+
+    def test_two_picoscope_blocks_are_refused(self):
+        # They would write the same <base>_pico0.dat and interleave.
+        self.assert_rejected("""
+            action picoscope
+            channels A
+            end
+
+            action picoscope
+            channels B
+            end
+        """, "more than one 'action picoscope'")
+
+
 class TestLegacyPiezoUnchanged(unittest.TestCase):
     """An existing .con file must scan exactly what it always scanned."""
 

@@ -556,6 +556,13 @@ class RasterScan:
                 'commanded_at_perf': motion['commanded_at'],
                 'launch_mm': motion['launch_mm'],
                 'target_mm': motion['target_mm'],
+                # Where the segment trigger times came from. A LeCroy
+                # timestamps every segment in its TRIGTIME array, so they are
+                # measured; a PicoScope's block mode does not report them at
+                # all and they are derived from the delay clock. Recorded per
+                # line because what you can conclude about position jitter
+                # depends entirely on which it was.
+                'trigtime_source': line.get('trigtime_source', 'measured'),
                 'achieved_segments': achieved['segments'],
                 'achieved_points_per_segment': achieved['points_per_segment'],
                 'achieved_horiz_interval_s': achieved['horiz_interval'],

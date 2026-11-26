@@ -1,0 +1,207 @@
+## =====================================================================
+## USB PicoScope bring-up - DAQ analog out into a scope input
+## =====================================================================
+##
+## The first thing to run on a rig that has never had a PicoScope on it.
+## It drives ao0 on the PCIe-6351 from 0 to +5 V in 1 V steps and captures
+## a trace on PicoScope channel A at every step. With ao0 wired to A it is
+## SELF-CHECKING: trace N must read N volts, so a wrong range, a wrong
+## scaling or a wrong channel is obvious without a meter.
+##
+##   >>> WIRE AO 0 TO PICOSCOPE CHANNEL A with a BNC cable before running.
+##
+##   >>> AND CHECK NOTHING ELSE IS ON ao0. This drives a real +5 V. If a
+##   >>> galvo, piezo or amplifier is connected, change 'scan' and
+##   >>> 'limits' to a safe span first.
+##
+## Without the cable it still runs and still proves the mechanics, but A
+## floats and every trace reads near zero.
+##
+## WHAT THIS IS ACTUALLY TESTING, in order:
+##
+##   1. pscan can find and open the unit at all (the PicoSDK libraries are
+##      installed, the cable is in, the serial is readable);
+##   2. the range and coupling in this file reach the hardware;
+##   3. the ADC counts in the .dat convert to the right volts through
+##      scp.vgain - which is the one thing that is silently wrong if the
+##      range handling is wrong;
+##   4. a trace lands per coordinate, in step with the axis.
+##
+## Run it in this order:
+##
+##   pscan --dry-run examples/bringup_picoscope.con
+##   pscan --timer   examples/bringup_picoscope.con
+##
+## --dry-run opens nothing and prints the grid and the output files. Do it
+## first; it catches a typo in this file before anything drives 5 V.
+##
+## WHAT THE OPENING LOG SHOULD SAY. There is no 'pydaq list' for a
+## PicoScope - the first run IS the detection - so read these two lines
+## before trusting anything after them:
+##
+##   -> PicoScope 5244D (serial GQ123/456), ps5000a driver 2.1.x, via
+##      /opt/picoscope/lib/libps5000a.so.2
+##   -> PicoScope armed: A at +/-5V, 1000 samples @ 1 MS/s (asked 1 MS/s),
+##      1 capture(s)
+##
+## The model and serial are read off the unit, not out of this file, so
+## they confirm WHICH box answered. The second line is the configuration
+## that actually took: if the achieved rate differs from the asked rate,
+## the unit has no such timebase and the delay axis in the .m is the
+## achieved one.
+##
+## IF IT DOES NOT OPEN, the message says which of three things happened:
+##
+##   "no PicoSDK library could be loaded"  the driver packages are not
+##       installed. Run 'bash install.sh' with the scope plugged in; see
+##       README under OSCILLOSCOPES. Nothing to do with the cable.
+##   "no PicoScope was found on USB"  the libraries are there and no unit
+##       answered. Check the cable and the light. A 2000/3000 series unit
+##       WITHOUT an 'A' in the model number uses a different PicoSDK
+##       library and is not driven by pscan at all.
+##   "N PicoScope units are attached"  more than one is plugged in, and
+##       pscan refuses to guess which one you meant. It prints the exact
+##       'series' and 'serial' lines to paste into the block below.
+##
+## --timer is the other half of the point: it breaks each trace down so
+## you can see what a USB capture really costs per coordinate on this rig,
+## rather than taking an estimate for it. Compare against
+## examples/bringup_6351.con, which does the same for the NI card.
+##
+## EXPECTED OUTPUT
+##
+##   bringup_picoscope_pico0.dat   6 traces x 1000 samples x int16 = 12000 bytes
+##   bringup_picoscope_pico0.m     the geometry and the volts scaling
+##
+## There is no _trigtime.dat: this capture is untriggered, and a PicoScope
+## writes no trigger-time sidecar even when it is triggered. See README.
+##
+## The .m should say points_per_trace=1000, n_traces=6, n_channels=1,
+## multitraces=1 and n_averages=[1]. Check the data without leaving the
+## shell - the mean of each trace should climb 0, 1, 2, 3, 4, 5:
+##
+##   python3 -c "
+##   import re, numpy as np
+##   m = open('bringup_picoscope_pico0.m').read()
+##   g = float(re.search(r'scp\.vgain=\[([^,\]]+)', m).group(1))
+##   o = float(re.search(r'scp\.voff=\[([^,\]]+)', m).group(1))
+##   d = np.fromfile('bringup_picoscope_pico0.dat', dtype=np.int16).reshape(-1, 1000)
+##   for i, t in enumerate(d):
+##       v = g * t.astype(float) - o
+##       print(f'{i:3d}  set {i:5.1f} V   read {v.mean():+8.4f} V   sd {v.std():.5f}')
+##   "
+##
+## A reading that is a constant FACTOR out (every trace 2x or 0.5x) is a
+## range problem. A reading that is right but noisy at the millivolt level
+## is just 8-bit resolution on a +/-5 V range - 39 mV per count - which is
+## why a real measurement uses the narrowest range that fits the signal.
+##
+## Reload in MATLAB exactly as a LeCroy run: same .dat layout, same .m
+## fields. That is the point of the format being shared.
+
+## ---------------------------------------------------------------------
+## One trace per coordinate. Raise this to average at a point.
+## ---------------------------------------------------------------------
+action count
+count 1
+end
+
+## ---------------------------------------------------------------------
+## The output axis: ao0 over 0..5 V in 1 V steps, 6 points.
+##
+## Deliberately 0..5 and not 0..10, so the whole sweep sits inside the
+## +/-5 V scope range below and nothing has to be guessed about headroom.
+##
+## 'device Dev1' is whatever 'pydaq list' reported. 'restore' returns ao0
+## to 0 V at the end rather than leaving the card driving 5 V into the
+## scope afterwards.
+##
+## Axis 98, not the default 99: 99 prints as "Z/piezo" in the log, which
+## would be misleading here.
+## ---------------------------------------------------------------------
+action d2a
+axis 98
+backend daqmx
+device Dev1
+channel 0
+units volts
+scan 0.0 5.0 1.0
+limits 0.0 5.0
+settle 0.01
+restore
+end
+
+## ---------------------------------------------------------------------
+## The PicoScope. Every setting is here because a USB scope has no front
+## panel to inherit one from - that is the whole difference from
+## 'action scope'.
+##
+## 'series'/'serial' are commented out: with one unit attached pscan finds
+## it and names it in the log. Uncomment and paste in what the error
+## prints if you ever have two plugged in.
+##
+## 'v_max 5.0' is the FULL SCALE in volts, so the range is +/-5 V. pscan
+## picks the narrowest range the unit offers that contains it, and refuses
+## rather than quietly widening if nothing fits. For a real photodiode
+## measurement, drop this to the smallest value your signal fits inside:
+## the range is the resolution.
+##
+## 'coupling dc' MATTERS HERE and is the classic bring-up trap: AC
+## coupling removes exactly the DC level this file is trying to measure,
+## so every trace would read ~0 V and look like a dead cable.
+##
+## 'trigger none' is deliberate, not an omission. A DC level has no edge
+## to trigger on, so each capture starts the moment pscan asks for it.
+## Writing it explicitly is what distinguishes "I meant untriggered" from
+## "I forgot" - leaving the line out does the same thing but prints a
+## config warning. For anything PULSED, see the block at the bottom.
+##
+## 1000 samples at 1 MS/s is a 1 ms record, which is far more than a DC
+## level needs; it is sized so --timer reports something representative of
+## a real capture rather than of an empty one.
+## ---------------------------------------------------------------------
+action picoscope
+## series ps5000a
+## serial GQ123/456
+channels A
+v_max 5.0
+coupling dc
+sample_rate 1e6
+n_samples 1000
+trigger none
+captures 1
+averages 1
+timeout 5.0
+end
+
+## ---------------------------------------------------------------------
+## NEXT, ONCE THE ABOVE READS 0..5 V CORRECTLY
+##
+## Replace the block above with something like this for a real pulsed
+## measurement. Nothing else in the file changes.
+##
+## action picoscope
+## channels A, B
+## v_max 0.2, 5.0          ## signal on a tight range, monitor on a wide one
+## coupling dc, dc
+## sample_rate 50e6
+## n_samples 5000
+## pretrigger 10           ## keep 10% of the record BEFORE the trigger
+## trigger B 1.5 rising    ## or 'trigger ext 1.5 rising' for the EXT input
+## captures 1              ## segments WRITTEN per trace (scp.multitraces)
+## averages 100            ## segments AVERAGED into each row (scp.n_averages)
+## timeout 5.0             ## a missed trigger pads the trace and carries on
+## end
+##
+## Two things to know before trusting that one:
+##
+##   * captures and averages both take more than one capture per trace.
+##     'captures' writes them all, as LeCroy Sequence mode does;
+##     'averages' means them into one row. They compose, and the ceiling
+##     is the unit's capture memory split that many ways - pscan asks and
+##     refuses with the numbers rather than shortening the record.
+##   * a trigger that never fires is a DROPPED trace, not a hang: after
+##     'timeout' seconds the trace is padded, its index is recorded in
+##     bringup_picoscope_dropped.txt, and the scan carries on. Ten in a
+##     row aborts the run. If that file exists after a scan, read it
+##     before analysing anything.

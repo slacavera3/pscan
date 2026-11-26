@@ -125,15 +125,44 @@ def report(config, slow_step_s=DEFAULT_SLOW_STEP_S):
     out.append(f"  output: {config.output_path}")
 
     out.append("\nSCOPE")
-    out.append(
-        f"  SEQ ON,{plan.segments} - {plan.points_per_segment} points per "
-        f"segment over a {plan.segment_seconds * 1e6:.0f} us window "
-        f"at {plan.sample_rate_hz / 1e6:g} MS/s"
-    )
-    out.append(
-        f"  confirm your scope accepts {plan.segments} segments; "
-        f"configure_line() refuses a short grant rather than misaligning"
-    )
+    out.append(f"  {config.scope_label}")
+    if config.scope_kind == 'picoscope':
+        pico = config.picoscope
+        out.append(
+            f"  {plan.segments} rapid-block captures - "
+            f"{plan.points_per_segment} points per segment over a "
+            f"{plan.segment_seconds * 1e6:.0f} us window "
+            f"at {plan.sample_rate_hz / 1e6:g} MS/s"
+        )
+        ranges = ", ".join(
+            f"{c}=+/-{pico['v_max'].get(c.upper(), 5.0):g}V"
+            f"/{pico['coupling'].get(c.upper(), 'dc')}"
+            for c in config.channels.channels
+        )
+        out.append(f"  {ranges}")
+        trigger = pico['trigger']
+        out.append(
+            f"  trigger {trigger['source']} {trigger['level']:g}V "
+            f"{trigger['direction']} - and it never self-triggers, so a "
+            f"missing delay clock fails the line instead of filling it with "
+            f"something that is not a sweep"
+        )
+        out.append(
+            f"  segment times come from the {plan.delay_rate_hz / 1e3:g} kHz "
+            f"delay clock, not from the scope: block mode does not timestamp "
+            f"captures, so the capture count is read back every line to "
+            f"prove no sweep was missed"
+        )
+    else:
+        out.append(
+            f"  SEQ ON,{plan.segments} - {plan.points_per_segment} points per "
+            f"segment over a {plan.segment_seconds * 1e6:.0f} us window "
+            f"at {plan.sample_rate_hz / 1e6:g} MS/s"
+        )
+        out.append(
+            f"  confirm your scope accepts {plan.segments} segments; "
+            f"configure_line() refuses a short grant rather than misaligning"
+        )
 
     if config.autofocus is not None:
         out.append("\nFOCUS")
@@ -219,7 +248,7 @@ def _apply_velocity(stage, plan, calibration):
 
 def run_scan(config, args):
     """Connect, scan, tear down. Returns a process exit code."""
-    from flyscan.scope import FlyScope
+    from flyscan.scope import FlyPicoScope, FlyScope
     from flyscan.stage import FlyStage, VelocityCalibration
 
     plan = config.plan
@@ -276,8 +305,21 @@ def run_scan(config, args):
                 f"the stage got to."
             )
 
-        print(f"Connecting to scope at {config.scope_ip}...")
-        scope = FlyScope(config.scope_ip, transfer_mb_s=config.transfer_mb_s)
+        print(f"Connecting to {config.scope_label}...")
+        if config.scope_kind == 'picoscope':
+            pico = config.picoscope
+            scope = FlyPicoScope(
+                channels=config.channels.channels,
+                series=pico['series'], serial=pico['serial'],
+                v_max=pico['v_max'], coupling=pico['coupling'],
+                trigger=pico['trigger'],
+                resolution_bits=pico['resolution'],
+                timeout_s=pico['timeout'],
+                transfer_mb_s=config.transfer_mb_s,
+            )
+        else:
+            scope = FlyScope(config.scope_ip,
+                             transfer_mb_s=config.transfer_mb_s)
         scope.connect()
 
         writer = build_writer(config.output_path, plan,

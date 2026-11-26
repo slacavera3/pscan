@@ -1,12 +1,11 @@
 import vxi11
 import struct
 import numpy as np
-import os
 import math
 import re
 import time
-import threading
-import queue
+
+from pscan.scope_io import ScopeTraceWriter
 
 class LeCroyScope:
     def __init__(self, ip_address):
@@ -14,40 +13,33 @@ class LeCroyScope:
         self.instr = None
         self.required_triggers = 1
         self.active_sweeps_target = 1000
-        self.last_trace_shape = None
-        self.last_trigtime_shape = None
         self._last_sweeps_seen = None
 
         # Trace on/off state of each configured channel as found at the start
         # of the run, so disconnect() can restore it.
         self._prior_traces = {}
 
-        # Everything finalize_matlab_metadata() needs to rewrite the .m with a
-        # truthful trace count, captured on the first trace.
-        self._m_context = None
-        self.traces_written = 0
+        # The .dat, its trigtime sidecar and the .m are written by
+        # pscan.scope_io, which is the one place that format is decided - a
+        # USB PicoScope trace and a LeCroy trace have to be byte-compatible,
+        # and they cannot be if each driver carries its own copy of the
+        # writer. This driver's job is ADC counts plus what they mean.
+        self._writer = ScopeTraceWriter()
 
-        # Async Writer Thread Setup
-        self.write_queue = queue.Queue()
-        self.writer_thread = threading.Thread(target=self._async_writer, daemon=True)
-        self.writer_thread.start()
+    # The orchestrator reads these off the scope object, and so does the
+    # placeholder path, so they stay on this class and defer to the writer
+    # that actually knows what is on disk.
+    @property
+    def traces_written(self):
+        return self._writer.traces_written
 
-    def _async_writer(self):
-        """Background thread that safely drains the disk write queue."""
-        while True:
-            task = self.write_queue.get()
-            if task is None:  # Poison pill to gracefully shutdown
-                self.write_queue.task_done()
-                break
-            
-            filename, mode, data = task
-            try:
-                with open(filename, mode) as f:
-                    f.write(data)
-            except Exception as e:
-                print(f"\n[ERROR] Scope Async Write Failed for {filename}: {e}")
-            finally:
-                self.write_queue.task_done()
+    @property
+    def last_trace_shape(self):
+        return self._writer.last_trace_shape
+
+    @property
+    def last_trigtime_shape(self):
+        return self._writer.last_trigtime_shape
 
     def connect(self):
         if self.instr is None:
@@ -62,9 +54,7 @@ class LeCroyScope:
 
     def disconnect(self):
         # 1. Flush the writer queue safely (wait for all pending disk writes to finish)
-        self.write_queue.put(None)
-        if self.writer_thread.is_alive():
-            self.writer_thread.join(timeout=3.0)
+        self._writer.flush()
 
         # 2. Cleanup hardware
         if self.instr is not None:
@@ -83,101 +73,12 @@ class LeCroyScope:
             self.instr = None
 
     def write_placeholder_trace(self, output_base_name):
-        """Append a zero-filled trace matching the last successful geometry.
-
-        Used when an acquisition fails mid-scan: writing nothing would leave
-        the .dat one trace short, so every later trace would map to the wrong
-        coordinate. Padding keeps trace index and coordinate aligned. The
-        padded indices are logged to <base>_dropped.txt by the caller, since
-        zeros are otherwise indistinguishable from real data.
-        """
-        if self.last_trace_shape is None:
-            return False
-
-        blank = np.zeros(self.last_trace_shape, dtype=np.int16)
-        self.write_queue.put((f"{output_base_name}.dat", "ab", blank.tobytes()))
-
-        # The trigtime sidecar is appended per trace, so it has to be padded
-        # in step or it drifts out of alignment with the .dat.
-        if self.last_trigtime_shape is not None:
-            blank_tt = np.full(self.last_trigtime_shape, np.nan, dtype=np.float64)
-            self.write_queue.put((
-                f"{output_base_name}_trigtime.dat", "ab", blank_tt.tobytes()
-            ))
-
-        # A placeholder still occupies a trace slot in the file.
-        self.traces_written += 1
-        return True
+        """Append a zero-filled trace matching the last successful geometry."""
+        return self._writer.write_placeholder_trace(output_base_name)
 
     def finalize_matlab_metadata(self):
-        """Rewrite the .m with the trace count actually recorded.
-
-        The .m is written on the first trace from the predicted grid size, so
-        an aborted or short run left it claiming more traces than the .dat
-        holds - and the trigtime sidecar with it, since a loader derives the
-        sidecar length from n_traces. Called at teardown however the run ends.
-        Returns True only if it had to correct something.
-        """
-        ctx = self._m_context
-        if ctx is None:
-            return False
-
-        actual = self.traces_written * ctx['segments'] * len(ctx['channels'])
-        if actual == ctx['summary']['n_traces']:
-            return False
-
-        self._write_multi_matlab_metadata(
-            ctx['base'], ctx['channels'], ctx['metas'],
-            dict(ctx['summary'], n_traces=actual),
-            segments=ctx['segments'], sweeps=ctx['sweeps'],
-            trigtime_rows=ctx['trigtime_rows'],
-        )
-
-        # Record what is now on disk so a repeat call is a no-op.
-        ctx['summary']['n_traces'] = actual
-        return True
-
-    def _write_multi_matlab_metadata(self, base_fn, channels, metas, sum_meta,
-                                     segments, sweeps, trigtime_rows=0):
-        m_filename = f"{base_fn}.m"
-        dat_filename = f"{base_fn}.dat"
-        func_name = os.path.basename(base_fn).replace('-', '_')
-
-        vgain_str = ",".join([f"{m['v_gain']:e}" for m in metas])
-        voff_str = ",".join([f"{m['v_offset']:e}" for m in metas])
-        ch_str = ",".join([f"'{ch}'" for ch in channels])
-
-        # Safely parse the sweeps into a comma-separated string for the MATLAB array
-        if isinstance(sweeps, list):
-            sweeps_str = ",".join(map(str, sweeps))
-        else:
-            sweeps_str = str(sweeps)
-
-        # Empty name means no sidecar was written, which is the normal case
-        # for single-shot / real-time acquisitions.
-        tt_name = f"{base_fn}_trigtime.dat" if trigtime_rows else ""
-
-        m_content = f"""% scope metadata file version 1.0 June 2026
-function scp={func_name}()
-scp.version=1.0;
-scp.hint={sum_meta['h_interval']:e};
-scp.hoff={sum_meta['h_offset']:e};
-scp.vgain=[{vgain_str}];
-scp.voff=[{voff_str}];
-scp.points_per_trace={sum_meta['points']};
-scp.n_traces={sum_meta['n_traces']};
-scp.n_channels={len(channels)};
-scp.format=2;
-scp.dataname='{dat_filename}';
-scp.n_averages=[{sweeps_str}];
-scp.multitraces={segments};
-scp.channels={{{ch_str}}};
-scp.trigtimename='{tt_name}';
-scp.trigtime_rows_per_trace={trigtime_rows};
-scp.trigtime_cols=2;
-"""
-        with open(m_filename, "w") as f:
-            f.write(m_content)
+        """Rewrite the .m with the trace count actually recorded."""
+        return self._writer.finalize_matlab_metadata()
 
     def _report_sweep_shortfall(self, channels, sweeps_done):
         """Warn when the scope accumulated fewer sweeps than were asked for.
@@ -417,7 +318,6 @@ scp.trigtime_cols=2;
         pts_per_seg = shapes[0][1]
         stacked = np.stack(adc_data_list, axis=1)
         flat_matrix = stacked.reshape(-1, pts_per_seg)
-        binary_bytes = flat_matrix.tobytes()
 
         sweeps_done = [m['sweeps_done'] for m in meta_list]
         self._report_sweep_shortfall(channels, sweeps_done)
@@ -427,63 +327,24 @@ scp.trigtime_cols=2;
         # copy is enough.
         trigtime = meta_list[0]['trigtime']
 
-        # Remember the geometry so a later failed trace can be padded rather
-        # than skipped, which would shift every subsequent trace in the file.
-        self.last_trace_shape = flat_matrix.shape
-        self.last_trigtime_shape = None if trigtime is None else trigtime.shape
-
         if save_for_matlab:
-            dat_filename = f"{output_base_name}.dat"
-            mode = "wb" if is_first_trace else "ab"
+            fm = meta_list[0]
+            # Sweep counts come from SWEEPS_PER_ACQ in the waveform itself
+            # rather than from the configured F1:DEF? target.
+            self._writer.record_trace(
+                output_base_name, channels, meta_list, flat_matrix,
+                is_first_trace=is_first_trace, total_loops=total_loops,
+                h_interval=fm['h_interval'], h_offset=fm['h_offset'],
+                points=fm['points'], segments=fm['n_traces'],
+                sweeps=sweeps_done, trigtime=trigtime,
+            )
+        else:
+            # Still remember the geometry, so a later failed trace can be
+            # padded rather than skipped - skipping would shift every
+            # subsequent trace in the file.
+            self._writer.remember_geometry(
+                flat_matrix.shape,
+                None if trigtime is None else trigtime.shape,
+            )
 
-            if is_first_trace:
-                self.traces_written = 0
-            self.traces_written += 1
-
-            # Toss the heavy binary payload into the background queue instantly
-            self.write_queue.put((dat_filename, mode, binary_bytes))
-
-            # Trigger timing goes to a sidecar rather than into the .dat, so
-            # the existing binary layout and MATLAB loader keep working.
-            if trigtime is not None:
-                self.write_queue.put((
-                    f"{output_base_name}_trigtime.dat", mode, trigtime.tobytes()
-                ))
-
-            if is_first_trace:
-                fm = meta_list[0]
-                tot_traces = total_loops * fm['n_traces'] * len(channels)
-                
-                summary_meta = {
-                    'h_interval': fm['h_interval'],
-                    'h_offset': fm['h_offset'],
-                    'points': fm['points'],
-                    'n_traces': tot_traces
-                }
-                
-                trigtime_rows = 0 if trigtime is None else trigtime.shape[0]
-
-                # Sweep counts now come from SWEEPS_PER_ACQ in the waveform
-                # itself rather than from the configured F1:DEF? target.
-                self._write_multi_matlab_metadata(
-                    output_base_name, channels, meta_list, summary_meta,
-                    segments=fm['n_traces'], sweeps=sweeps_done,
-                    trigtime_rows=trigtime_rows
-                )
-
-                # Keep only the fields the writer reads, so this does not pin
-                # the per-channel trigtime arrays for the whole run.
-                self._m_context = {
-                    'base': output_base_name,
-                    'channels': list(channels),
-                    'metas': [
-                        {'v_gain': m['v_gain'], 'v_offset': m['v_offset']}
-                        for m in meta_list
-                    ],
-                    'summary': dict(summary_meta),
-                    'segments': fm['n_traces'],
-                    'sweeps': list(sweeps_done),
-                    'trigtime_rows': trigtime_rows,
-                }
-                
         return True

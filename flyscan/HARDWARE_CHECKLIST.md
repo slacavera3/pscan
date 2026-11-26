@@ -270,6 +270,16 @@ diagnostic captures.
 
 ## 12b. The trigger is never configured — only inherited
 
+**On a LeCroy.** This item does not apply to the USB PicoScope path: a
+PicoScope has no front panel, so there is nothing to inherit. `FlyPicoScope`
+sets the source, level, edge, range and coupling of every channel from the
+`action scope_line` block on every line, and the block refuses to parse
+without a `trigger` line — so the position-to-sample mapping is stated in the
+config file rather than left on trust. There is also no `TRMD AUTO` to worry
+about: `auto_trigger_ms` is 0, which means the unit never self-triggers, and
+a line whose triggers do not arrive fails instead of filling with segments
+that are not delay sweeps. The rest of this item is about the LeCroy.
+
 **This is a gap in the code, found chasing item 13.** The complete set of
 SCPI that `scope.py` sends is `CHDR OFF`, `CFMT`, `SEQ ON,n,pts`, `TDIV`,
 `MSIZ`, `CLSW`, `TRMD SINGLE`, `ARM`, `WAIT`, `WFSU`, `Cn:WF?`. Nothing sets

@@ -39,6 +39,9 @@ REUSED_ACTIONS = ('count', 'apt_stage', 'script', 'webcam', 'delay')
 REJECTED_ACTIONS = {
     'scope': ("pscan's step-and-settle scope block; a fly scan uses "
               "'action scope_line' instead"),
+    'picoscope': ("pscan's step-and-settle USB scope block; a fly scan uses "
+                  "'action scope_line' with a 'usb' line instead, which "
+                  "drives the same instrument a line at a time"),
     'a2d': "the NI card cannot sample per pixel at kHz pixel rates",
     'ixon': "no camera can expose per pixel at kHz pixel rates",
     'tucsen': "no camera can expose per pixel at kHz pixel rates",
@@ -59,10 +62,19 @@ FLY_SCHEMAS = {
         'optional': ['runup', 'limits', 'unidirectional', 'spot', 'bin',
                      'acceleration'],
     },
+    # 'ip' is not required any more: a fly line can run on a USB PicoScope
+    # instead, which is named by 'usb' (and optionally 'series'/'serial')
+    # rather than by an address. Exactly one of the two has to identify the
+    # instrument, which _scope_interface() below enforces - the schema cannot
+    # express "one of these two groups".
     'scope_line': {
-        'required': ['ip', 'channels', 'roles', 'sample_rate',
-                     'segment_window'],
-        'optional': ['sparsing', 'delay_rate', 'rep_rate', 'transfer_rate'],
+        'required': ['channels', 'roles', 'sample_rate', 'segment_window'],
+        'optional': ['ip', 'sparsing', 'delay_rate', 'rep_rate',
+                     'transfer_rate',
+                     # The USB scope. It has no front panel, so what a LeCroy
+                     # inherits from its knobs has to be said here.
+                     'usb', 'series', 'serial', 'v_max', 'coupling',
+                     'trigger', 'resolution', 'timeout'],
     },
     'autofocus': {
         'required': ['coarse'],
@@ -235,11 +247,16 @@ class FlyConfig:
 
     def __init__(self, path, plan, channels, scope_ip, sample_rate_hz,
                  transfer_mb_s, autofocus, setup_pipeline, teardown_pipeline,
-                 count, warnings, spot_um=None):
+                 count, warnings, spot_um=None, scope_kind='lecroy',
+                 picoscope=None):
         self.path = path
         self.plan = plan
         self.channels = channels
         self.scope_ip = scope_ip
+        # 'lecroy' (VXI-11, named by scope_ip) or 'picoscope' (USB, described
+        # by the picoscope dict). cli.run_scan() picks the class from this.
+        self.scope_kind = scope_kind
+        self.picoscope = picoscope or {}
         self.sample_rate_hz = sample_rate_hz
         self.transfer_mb_s = transfer_mb_s
         self.autofocus = autofocus
@@ -256,9 +273,19 @@ class FlyConfig:
         """Default output beside the config, as pscan names its outputs."""
         return os.path.splitext(self.path)[0] + '.h5'
 
+    @property
+    def scope_label(self):
+        """How the instrument is addressed, for a log line."""
+        if self.scope_kind != 'picoscope':
+            return f"LeCroy {self.scope_ip}"
+        where = self.picoscope.get('series') or 'auto-detect'
+        if self.picoscope.get('serial'):
+            where += f" {self.picoscope['serial']}"
+        return f"PicoScope on USB ({where})"
+
     def summary(self):
         parts = [self.plan.summary(),
-                 f"scope {self.scope_ip}, channels "
+                 f"scope {self.scope_label}, channels "
                  + ", ".join(f"{c}={self.channels.roles[c]}"
                              f"/sp{self.channels.sparsing[c]}"
                              for c in self.channels.channels)]
@@ -410,6 +437,205 @@ def _build_channels(body, present, label):
     )
 
 
+def _scope_interface(body, present, label):
+    """Which instrument an 'action scope_line' block describes.
+
+    Decided by how it is ADDRESSED, because that is the one thing the two
+    cannot share: a LeCroy has a network address and a PicoScope has a USB
+    serial number. Stated rather than inferred from the channel names, which
+    would make 'channels A, B' mean a different instrument from 'C1, C2' -
+    a surprise worth avoiding.
+    """
+    usb_keys = sorted(present & {'usb', 'series', 'serial'})
+    if 'ip' in present and usb_keys:
+        raise FlyConfigError(
+            f"{label} names both an 'ip' and {', '.join(usb_keys)}, so which "
+            f"instrument it means is ambiguous. A fly line runs on one scope: "
+            f"keep 'ip' for a LeCroy over the network, or 'usb' for a "
+            f"PicoScope."
+        )
+    if 'ip' in present:
+        return 'lecroy'
+    if usb_keys:
+        return 'picoscope'
+    raise FlyConfigError(
+        f"{label} names no instrument. Give 'ip <address>' for a LeCroy over "
+        f"the network, or 'usb' for a PicoScope over USB (with an optional "
+        f"'series'/'serial' when more than one is attached)."
+    )
+
+
+def _aligned(body, key, names, label, cast=str):
+    """A per-channel list, aligned with the 'channels' line. {} when absent.
+
+    One value applies to every channel, which is how a four-channel block
+    says "all of them on the same range" without repeating itself.
+    """
+    values = _csv(body, key)
+    if not values:
+        return {}
+    if len(values) == 1:
+        values = values * len(names)
+    if len(values) != len(names):
+        raise FlyConfigError(
+            f"{label} has {len(names)} channel(s) but {len(values)} "
+            f"'{key}' value(s). Give one for all of them, or one per channel "
+            f"in the same order as 'channels'."
+        )
+    try:
+        return {name: cast(value) for name, value in zip(names, values)}
+    except ValueError:
+        raise FlyConfigError(
+            f"{label} '{key} {' '.join(values)}' is not all numbers"
+        ) from None
+
+
+def _build_picoscope(body, present, label, names, warnings):
+    """The PicoScope settings a fly line needs, validated before anything opens.
+
+    The series table, range ladder, couplings and edges come from the driver
+    rather than being restated here. Importing it opens nothing - the PicoSDK
+    library is loaded in connect().
+    """
+    from pscan import picoscope_driver as pico
+
+    series = None
+    if 'series' in present:
+        series = _field(body, 'series', r'(\S+)').group(1).lower()
+        if series not in pico.SERIES:
+            raise FlyConfigError(
+                f"{label} series '{series}' is not one pscan drives. Use one "
+                f"of: {', '.join(pico.SERIES_ORDER)}. The 2000 and 3000 "
+                f"series WITHOUT an 'A' in the model number use a different "
+                f"PicoSDK library."
+            )
+
+    for name in names:
+        if len(name) != 1 or not ('A' <= name.upper() <= 'H'):
+            raise FlyConfigError(
+                f"{label} channel '{name}' is not a PicoScope input. "
+                f"PicoScope channels are single letters: A, B, C, D (and "
+                f"E..H on a 4000A). 'C1'-style names are LeCroy traces."
+            )
+        if series is not None:
+            available = pico.SERIES[series]['n_channels']
+            if ord(name.upper()) - ord('A') >= available:
+                raise FlyConfigError(
+                    f"{label} channel {name.upper()} does not exist on a "
+                    f"{series} unit, which has {available} input(s)"
+                )
+
+    v_max = _aligned(body, 'v_max', names, label, float)
+    widest = pico.RANGE_VOLTS[
+        pico.SERIES[series]['max_range'] if series
+        else len(pico.RANGE_VOLTS) - 1
+    ]
+    for name, value in v_max.items():
+        if value <= 0:
+            raise FlyConfigError(
+                f"{label} v_max for {name} is the full scale in volts and "
+                f"must be positive, not {value:g}"
+            )
+        if value > widest + 1e-12:
+            raise FlyConfigError(
+                f"{label} v_max {value:g} V is wider than any PicoScope "
+                f"range (the widest is +/-{widest:g} V). Use an attenuating "
+                f"probe."
+            )
+    if not v_max:
+        warnings.append(
+            f"{label} declares no 'v_max', so every channel is set to "
+            f"+/-{pico.DEFAULT_V_MAX:g} V. A PicoScope has no front panel to "
+            f"inherit a range from, so state it - too wide costs resolution "
+            f"and too narrow clips"
+        )
+
+    coupling = _aligned(body, 'coupling', names, label)
+    for name, value in coupling.items():
+        if value.lower() not in pico.COUPLINGS:
+            raise FlyConfigError(
+                f"{label} coupling for {name} must be dc or ac, not '{value}'"
+            )
+
+    # Required. Every segment is one delay sweep, so without a trigger the
+    # segments are not sweeps and the delay axis means nothing.
+    trigger_match = _field(body, 'trigger')
+    if trigger_match is None:
+        raise FlyConfigError(
+            f"{label} needs a 'trigger <source> <level_volts> <edge>' line - "
+            f"the ASOPS delay clock, usually on the external input: "
+            f"'trigger ext 1.0 rising'. A PicoScope inherits no trigger from "
+            f"a front panel, and an untriggered capture is not a delay sweep."
+        )
+    tokens = trigger_match.group(1).replace(',', ' ').split()
+    if len(tokens) != 3:
+        raise FlyConfigError(
+            f"{label} trigger needs three values: "
+            f"'trigger <source> <level_volts> <edge>', for example "
+            f"'trigger ext 1.0 rising'"
+        )
+    source, level, edge = tokens
+    try:
+        level = float(level)
+    except ValueError:
+        raise FlyConfigError(
+            f"{label} trigger level '{level}' is not a number (volts)"
+        ) from None
+    if edge.lower() not in pico.EDGES:
+        raise FlyConfigError(
+            f"{label} trigger edge must be one of "
+            f"{', '.join(sorted(pico.EDGES))}, not '{edge}'"
+        )
+    if source.upper() not in ('EXT', 'EXTERNAL'):
+        if source.upper() not in [n.upper() for n in names]:
+            raise FlyConfigError(
+                f"{label} triggers on channel {source}, which it does not "
+                f"record. A PicoScope can only trigger on a channel that is "
+                f"switched on, or on 'ext'."
+            )
+        warnings.append(
+            f"{label} triggers on channel {source} rather than 'ext'. That "
+            f"works, but it spends an input on the delay clock that could be "
+            f"recording signal"
+        )
+
+    resolution = None
+    if 'resolution' in present:
+        resolution = int(_numbers(body, 'resolution', 1, label)[0])
+        if resolution not in pico.RESOLUTIONS:
+            raise FlyConfigError(
+                f"{label} resolution must be one of "
+                f"{', '.join(str(b) for b in sorted(pico.RESOLUTIONS))} bits, "
+                f"not {resolution}"
+            )
+        if series is not None and not pico.SERIES[series]['resolution_arg']:
+            warnings.append(
+                f"{label} sets 'resolution', but only the 5000A series has a "
+                f"switchable ADC; on a {series} the line has no effect"
+            )
+
+    timeout = None
+    if 'timeout' in present:
+        timeout = _numbers(body, 'timeout', 1, label)[0]
+        if timeout <= 0:
+            raise FlyConfigError(
+                f"{label} timeout must be positive, not {timeout:g}"
+            )
+
+    return {
+        'series': series,
+        'serial': _field(body, 'serial', r'(\S+)').group(1)
+                  if 'serial' in present else None,
+        'v_max': {name.upper(): value for name, value in v_max.items()},
+        'coupling': {name.upper(): value.lower()
+                     for name, value in coupling.items()},
+        'trigger': {'source': source, 'level': level,
+                    'direction': edge.lower()},
+        'resolution': resolution,
+        'timeout': timeout,
+    }
+
+
 def parse_fly_config(path, counts_per_mm):
     """Read a fly-scan .con file into a FlyConfig.
 
@@ -492,16 +718,30 @@ def parse_fly_config(path, counts_per_mm):
     scope_label = "'action scope_line'"
     scope_present = _validate_keys(scope_block, schemas)
 
-    ip_match = _field(scope_body, 'ip', r'(\S+)')
-    scope_ip = ip_match.group(1) if ip_match else ''
-    octets = scope_ip.split('.')
-    if len(octets) != 4 or not all(o.isdigit() and 0 <= int(o) <= 255
-                                   for o in octets):
-        raise FlyConfigError(
-            f"{scope_label} ip '{scope_ip}' is not a dotted-quad address"
-        )
+    scope_kind = _scope_interface(scope_body, scope_present, scope_label)
+    scope_ip = ''
+    picoscope = None
+
+    if scope_kind == 'lecroy':
+        ip_match = _field(scope_body, 'ip', r'(\S+)')
+        scope_ip = ip_match.group(1) if ip_match else ''
+        octets = scope_ip.split('.')
+        if len(octets) != 4 or not all(o.isdigit() and 0 <= int(o) <= 255
+                                       for o in octets):
+            raise FlyConfigError(
+                f"{scope_label} ip '{scope_ip}' is not a dotted-quad address"
+            )
 
     channels = _build_channels(scope_body, scope_present, scope_label)
+
+    if scope_kind == 'picoscope':
+        # Aligned with the 'channels' line rather than with the role order,
+        # so a range sits beside the channel it belongs to in the file.
+        picoscope = _build_picoscope(
+            scope_body, scope_present, scope_label,
+            _csv(scope_body, 'channels'), warnings,
+        )
+
     sample_rate = _numbers(scope_body, 'sample_rate', 1, scope_label)[0]
     segment_window = _numbers(scope_body, 'segment_window', 1, scope_label)[0]
     delay_rate = (_numbers(scope_body, 'delay_rate', 1, scope_label)[0]
@@ -522,8 +762,16 @@ def parse_fly_config(path, counts_per_mm):
             f"outright - a rig running a different laser gets a delay axis "
             f"wrong by the ratio of the two"
         )
-    transfer_mb_s = (_numbers(scope_body, 'transfer_rate', 1, scope_label)[0]
-                     if 'transfer_rate' in scope_present else 4.0)
+    # USB moves a line far faster than VXI-11, so the two defaults differ.
+    # Either way it is only used to size timeouts and the time estimate -
+    # measure yours and state it.
+    if 'transfer_rate' in scope_present:
+        transfer_mb_s = _numbers(scope_body, 'transfer_rate', 1, scope_label)[0]
+    elif scope_kind == 'picoscope':
+        from flyscan.scope import DEFAULT_USB_TRANSFER_MB_S
+        transfer_mb_s = DEFAULT_USB_TRANSFER_MB_S
+    else:
+        transfer_mb_s = 4.0
 
     if channels.roles.get(channels.ac) != ROLE_AC:
         raise FlyConfigError(f"{scope_label} has no 'ac' channel")
@@ -584,6 +832,7 @@ def parse_fly_config(path, counts_per_mm):
     counter = [1]
     return FlyConfig(
         path=path, plan=plan, channels=channels, scope_ip=scope_ip,
+        scope_kind=scope_kind, picoscope=picoscope,
         sample_rate_hz=sample_rate, transfer_mb_s=transfer_mb_s,
         autofocus=autofocus,
         setup_pipeline=compile_pipeline_list(setup_blocks, counter),

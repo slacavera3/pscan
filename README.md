@@ -346,8 +346,8 @@ declared. A block runs:
    * at TEARDOWN (once, after the scan)      if NO core block follows it
    * PER COORDINATE (once per grid point)    otherwise
 
-Core blocks are: apt_stage, d2a_phidget, d2a, count, scope, a2d, webcam,
-delay, ixon, tucsen. In practice only 'action script' is ever non-core, so
+Core blocks are: apt_stage, d2a_phidget, d2a, count, scope, picoscope, a2d,
+webcam, delay, ixon, tucsen. In practice only 'action script' is ever non-core, so
 whether your script runs once or thousands of times depends on where it sits
 relative to the core blocks around it.
 
@@ -520,16 +520,229 @@ Two further things that bite on Linux:
     `pydaq list` sees the card but `pydaq read` fails with a hardware
     error, try that before anything else.
 
+### OSCILLOSCOPES: THE LECROY AND THE PICOSCOPE
+
+Two instruments, two blocks, one output format.
+
+  scope       pscan/lecroy_driver.py     (LeCroyScope)
+              A Waverunner on the lab network, over VXI-11. It is a benchtop
+              instrument with a front panel, so `action scope` names an IP
+              and a few channels and otherwise reads the scope's own settings
+              back out of the waveform it returns.
+
+  picoscope   pscan/picoscope_driver.py  (PicoScope)
+              A USB PicoScope, over Pico's own C libraries with ctypes - the
+              same way the piezo is driven through libphidget21, so there is
+              no Python package to install and nothing to keep in version
+              step. It has no screen and no knobs, so everything the LeCroy
+              is asked to report has to be SAID in the block instead: range,
+              coupling, sample rate, record length, trigger. That is the
+              whole difference between the two blocks.
+
+  pscan/scope_io.py holds what neither should repeat: the .dat layout, the
+  .m sidecar and the background writer. A driver produces ADC counts and
+  says what they mean; it never opens the output file. That is what keeps a
+  PicoScope trace and a LeCroy trace byte-compatible, and it is the only
+  place the scope format is decided.
+
+The two write separate files, so a run may use both:
+
+  <base>_scope0.dat / .m     the LeCroy
+  <base>_pico0.dat  / .m     the PicoScope
+
+Both are int16 ADC counts, one row per (segment, channel), with the volts
+scaling in the .m: `volts = scp.vgain(ch) * counts - scp.voff(ch)`. A MATLAB
+script that reads one reads the other unchanged.
+
+WHICH SERIES ARE SUPPORTED
+
+The 2000A, 3000A, 4000A and 5000A families - libps2000a, libps3000a,
+libps4000a, libps5000a. Their block-mode APIs differ only in a handful of
+places, which the SERIES table in the driver names.
+
+The 2000 and 3000 series WITHOUT an 'A' in the model number are NOT
+supported: libps2000 and libps3000 are a different API, not a variation on
+this one. So a 2206A works and a 2205 does not. The driver says so by name
+when it cannot find a unit, rather than reporting a missing cable.
+
+HOW A UNIT IS CHOSEN
+
+The same rule pscan.daq applies to DAQ cards, for the same reason:
+
+  * exactly one unit attached     -> it is used, and named in the run's log
+  * more than one                 -> the run STOPS, lists them, and prints
+                                     the lines to paste in
+  * none                          -> the run stops and says which libraries
+                                     were missing
+
+Pin a unit with either or both of:
+
+  series ps5000a
+  serial AB123/456
+
+INSTALLING THE DRIVERS (Linux)
+
+`bash install.sh` does it: it adds Pico's apt repository with their current
+signing key, installs the four libps*a packages, and registers
+/opt/picoscope/lib with the dynamic linker if nothing else has - without that
+last step ctypes cannot find a library that is sitting right there.
+
+It will not pull a vendor driver onto a machine with no PicoScope attached.
+If no USB device with Pico's vendor id (0ce9) is present it says so and
+skips. Two env vars steer it:
+
+  PSCAN_SKIP_PICO=1     never install them
+  PSCAN_FORCE_PICO=1    install even with nothing plugged in
+
+Pico officially support Ubuntu and openSUSE Leap on x86-64. On Debian the
+feed may simply have no matching packages, in which case `action picoscope`
+is unavailable and nothing else is affected.
+
+If the package creates a `pico` group, install.sh adds you to it and says to
+log out and back in. Until you do, the scope is only reachable as root.
+
+On Windows, install PicoSDK or the PicoScope application from picotech.com;
+the driver finds the DLLs under C:\Program Files\Pico Technology.
+
+CAPTURES vs AVERAGES
+
+Both take more than one capture per trace; what differs is what reaches the
+file.
+
+  captures 10     ten rapid-block segments, all ten WRITTEN. scp.multitraces
+                  becomes 10, exactly as LeCroy Sequence mode does.
+  averages 100    one hundred segments averaged in software into each row
+                  written. scp.n_averages records 100.
+
+They compose: `captures 10` with `averages 100` captures 1000 segments and
+writes 10 rows, each the mean of 100. Averaging happens in ADC counts, so
+the single scaling the .m declares still maps the file to volts. 'sweeps' is
+accepted as a synonym for 'averages', because that is what the `action
+scope` block calls the same idea.
+
+The ceiling is the unit's capture memory split that many ways, which the
+driver asks about and reports as a refusal naming the numbers - it will not
+quietly shorten the record.
+
+THINGS WORTH KNOWING BEFORE A LONG RUN
+
+* THERE IS NO TRIGTIME SIDECAR. Block mode reports each segment's sub-sample
+  trigger offset but not the time between triggers, and half of a
+  (trigger_time, trigger_offset) pair is worse than none - a loader would
+  read the missing half as zero. So `scp.trigtimename` is empty and
+  `scp.trigtime_rows_per_trace` is 0, as it is for a LeCroy single-shot.
+
+* `sample_rate` is a REQUEST. PicoScope timebases are a discrete ladder whose
+  rungs depend on how many channels are on, so the driver asks the unit and
+  takes the slowest rung that is still at least as fast as asked. The rate
+  actually used is printed when the scope is armed and recorded in
+  `scp.hint`. Asking for more than the unit can do warns and uses its
+  fastest.
+
+* `v_max` is the full scale in volts, and pscan picks the narrowest Pico
+  range that contains it - a tighter range is more resolution. Asking for
+  more than the hardware has fails loudly rather than being quietly widened.
+  Clipping is reported as a warning naming the channels, because a clipped
+  trace is a complete, plausible-looking file with flat peaks.
+
+* WITH NO `trigger` LINE every capture starts the instant pscan asks for it.
+  That is right for a DC measurement and wrong for anything pulsed, so the
+  config parser warns when the line is missing. Write `trigger none` to say
+  you meant it.
+
+* A trigger that never fires is a DROPPED TRACE, not a hang: after `timeout`
+  seconds the trace is padded, the index is recorded in `<base>_dropped.txt`,
+  and the scan carries on. Ten in a row aborts the run.
+
+* ONE picoscope block per config. A second one would write the same
+  <base>_pico0.dat and interleave its traces into the first one's, so it is
+  refused. Put every channel in one block - `channels A, B, C` - with its
+  own `v_max` and `coupling` in the same order.
+
+FLY SCANS USE IT TOO
+
+`flyscan` takes a PicoScope as well, through the same `action scope_line`
+block that names a LeCroy - and through the same hardware binding, since
+flyscan/scope.py's FlyPicoScope is built on pscan/picoscope_driver.py's
+ctypes layer rather than on a second copy of it. One binding per instrument,
+two acquisition policies on top.
+
+Which instrument a block means is decided by how it is ADDRESSED, because
+that is the one thing the two cannot share:
+
+  action scope_line
+  ip 192.168.1.100          <- a LeCroy, over the network
+  ...
+
+  action scope_line
+  usb                       <- a PicoScope, over USB
+  series ps5000a            <- optional, as is 'serial'
+  channels A, B, C
+  roles ac, dc, trigger
+  sparsing 1, 100, 20
+  v_max 0.2, 5.0, 5.0
+  coupling ac, dc, dc
+  trigger ext 1.0 rising    <- REQUIRED: the ASOPS delay clock
+  sample_rate 1e6
+  segment_window 50e-6
+  rep_rate 80e6
+  end
+
+Naming both is refused rather than resolved. Four things differ from the
+LeCroy fly path, and all four are deliberate:
+
+* `trigger` is REQUIRED. Every segment is one delay sweep, so without a
+  trigger the segments are not sweeps and the delay axis means nothing. The
+  unit never self-triggers either (there is no equivalent of `TRMD AUTO` to
+  leave switched on), so a missing delay clock fails the line instead of
+  filling it with something that is not a sweep. This is what makes
+  HARDWARE_CHECKLIST item 12b - "the trigger is never configured, only
+  inherited" - not apply to a PicoScope at all.
+
+* SEGMENT TIMES ARE DERIVED, NOT MEASURED. A LeCroy timestamps every segment
+  in its TRIGTIME array, which is what places each copeak along the line.
+  Block mode has no equivalent: it reports each segment's sub-sample trigger
+  OFFSET and not the time between triggers. The triggers come from the delay
+  clock at a known fixed rate, so segment i is placed at i / delay_rate -
+  exact for a fixed-rate clock, and only wrong if a sweep was MISSED. So the
+  capture count is read back on every line and a short count fails it, which
+  is the same discipline the LeCroy path applies to its segment grant. Every
+  line records `trigtime_source` (`delay_clock+measured_offset`, or
+  `delay_clock` where the unit will not report offsets) so nothing
+  downstream reads the first column as a measurement. The practical cost:
+  a PicoScope fly scan cannot measure trigger jitter, only rule out missed
+  sweeps.
+
+* `sample_rate` is REFUSED rather than substituted if the unit cannot reach
+  it. In pscan a slower rate is a warning; here the sample rate sets the
+  delay resolution, so quietly halving it would quietly halve what the file
+  resolves.
+
+* SPARSING STILL SHRINKS THE TRANSFER. WFSU's SP factor becomes the Pico
+  driver's decimation mode, so the discarded samples never cross the bus,
+  exactly as on the LeCroy. Channels are therefore read back one at a time,
+  each at its own ratio.
+
+`transfer_rate` defaults to 30 MB/s on USB rather than the LeCroy's 4 MB/s.
+Both are only used to size timeouts and the time estimate - measure yours.
+
 ### RUNNING THE TESTS
 
    python -m unittest discover -s tests -t .
 
-No hardware needed. The acquisition path is exercised through tests/fake_card.py
-and the axis walk through fake axes that only record what they were told to do.
-The fake card deliberately lives in tests/ rather than pscan/: source holds one
-driver file per real piece of hardware, and a simulated card that could be
-auto-selected during a scan would produce a full set of plausible .d files
+No hardware needed. The acquisition path is exercised through tests/fake_card.py,
+the USB scope through tests/fake_picoscope.py, and the axis walk through fake
+axes that only record what they were told to do.
+Both fakes deliberately live in tests/ rather than pscan/: source holds one
+driver file per real piece of hardware, and a simulated card or scope that could
+be auto-selected during a scan would produce a full set of plausible .d files
 containing nothing but a synthesised sine.
+
+tests/fake_picoscope.py stands in for the PicoSDK at the ctypes seam, so every
+decision worth testing - which range, which timebase, what reaches the file,
+what happens when a trigger never fires - is covered without a scope on the
+bench. tests/test_picoscope.py also pins the .m text against a literal, because
+that format is read by every analysis script in the lab.
 
 Worth running after any change to the scan loop, the config parser or the
 output format - those three are where a mistake is silent rather than loud.
@@ -695,6 +908,47 @@ action scope
 ip 192.168.1.100
 channels F1, F2
 sweeps 1000, 100
+end
+
+## 7b. PICOSCOPE (USB) ACQUISITION
+## A USB PicoScope has no front panel, so unlike 'action scope' this block
+## carries every setting. Only 'channels' is required; everything below shows
+## its default in the comment. See "OSCILLOSCOPES" above.
+##
+## Writes <base>_pico0.dat and <base>_pico0.m, in the same format the LeCroy
+## path writes - so a run may use both instruments.
+action picoscope
+channels A, B
+## Which unit, when the bench has more than one. Omit both and pscan uses
+## the single attached unit, or stops and lists them if there are two.
+## series ps5000a
+## serial AB123/456
+## resolution 12          ## 5000A only: 8, 12, 14, 15 or 16 bits (default 8)
+##
+## Full scale per channel, in volts; the range is +/-v_max. One value applies
+## to every channel. pscan picks the narrowest Pico range that contains it.
+v_max 0.2, 5.0
+coupling ac, dc           ## default dc
+##
+## A request, not a promise: the unit's timebase ladder decides, and the rate
+## actually used goes in scp.hint. Default 1e6.
+sample_rate 5e6
+n_samples 4096            ## default 1000
+pretrigger 10             ## percent of the record BEFORE the trigger (default 0)
+##
+## trigger <source> <level_volts> <edge>, where source is a channel letter
+## this block records or 'ext' for the external input, and edge is rising,
+## falling, above, below or rising_or_falling. 'trigger none' captures
+## immediately; omitting the line does the same and warns, because that is
+## right for DC and wrong for anything pulsed.
+trigger B 1.5 rising
+timeout 2.0               ## seconds to wait for a capture before padding the trace
+##
+## captures: rapid-block segments WRITTEN per trace (scp.multitraces)
+## averages: segments averaged into each written row (scp.n_averages).
+## 'sweeps' is accepted as a synonym for 'averages'.
+captures 10
+averages 4
 end
 
 ## 8. EXTERNAL SYSTEM SCRIPT

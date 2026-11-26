@@ -297,6 +297,137 @@ else
     fi
 fi
 
+# --- 1.6 Setup PicoScope USB drivers (libps2000a ... libps5000a) ---
+echo -e "\n[1.6/6] Checking PicoScope USB drivers..."
+
+# 'action picoscope' binds to Pico's own C libraries with ctypes, exactly as
+# the piezo binds to libphidget21: nothing to install on the Python side and
+# nothing to keep in version step. What does have to be present is the vendor
+# library, and it comes from Pico's apt repository.
+#
+# Only the four 'A' families are installed, because those are the four
+# pscan/picoscope_driver.py speaks. libps2000 and libps3000 - the 2000/3000
+# series WITHOUT an 'A' in the model number - are a different API and are not
+# driven, so installing them would only make a scope look supported.
+#
+# Env overrides, mirroring the DAQmx ones:
+#   PSCAN_SKIP_PICO=1    never install them
+#   PSCAN_FORCE_PICO=1   install even with no PicoScope plugged in
+PICO_LIBS="libps2000a libps3000a libps4000a libps5000a"
+PICO_LIB_DIR="/opt/picoscope/lib"
+
+# Is a PicoScope on the USB bus? Asked from sysfs, the same way
+# has_xseries_card() asks about the NI board, so it does not depend on lsusb
+# being installed. 0ce9 is Pico Technology's USB vendor id.
+has_picoscope() {
+    local vendor
+    for vendor in /sys/bus/usb/devices/*/idVendor; do
+        [ -e "$vendor" ] || continue
+        [ "$(cat "$vendor" 2>/dev/null)" = "0ce9" ] && return 0
+    done
+    return 1
+}
+
+# All four present, not just one: a half-finished install would otherwise be
+# reported as done, and the series that is missing is exactly the one whose
+# scope is on the bench.
+have_pico_libs() {
+    local lib
+    for lib in ps2000a ps3000a ps4000a ps5000a; do
+        ldconfig_p | grep -q "lib$lib\.so" && continue
+        ls "$PICO_LIB_DIR"/lib$lib.so* >/dev/null 2>&1 && continue
+        return 1
+    done
+    return 0
+}
+
+PICO_OK=0
+if [ "${PSCAN_SKIP_PICO:-0}" = "1" ]; then
+    echo " -> PSCAN_SKIP_PICO=1: skipping PicoScope drivers."
+elif have_pico_libs; then
+    echo " -> PicoSDK libraries already installed. Skipping."
+    PICO_OK=1
+elif ! has_picoscope && [ "${PSCAN_FORCE_PICO:-0}" != "1" ]; then
+    echo " -> No PicoScope on USB (vendor 0ce9), so this step is skipped:"
+    echo " ->   it pulls a vendor driver onto the machine and nothing else"
+    echo " ->   here needs it. Plug the scope in and re-run, or force it"
+    echo " ->   with PSCAN_FORCE_PICO=1 bash install.sh"
+else
+    echo " -> Importing Pico Technology's package signing key..."
+    sudo mkdir -p /usr/share/keyrings
+
+    # Re-imported on every run on purpose. Pico has rotated this key, and a
+    # stale copy fails with a message about the repository rather than about
+    # the key, which sends you looking in the wrong place.
+    if curl -fsSL https://labs.picotech.com/Release.gpg.key \
+        | sudo gpg --dearmor --yes \
+            -o /usr/share/keyrings/picotech-archive-keyring.gpg
+    then
+        # Same reasoning as the NI pin above: this feed is built for Ubuntu,
+        # so on anything else it must supply Pico's own packages and nothing
+        # more. Priority 100 means "only when no other source provides it".
+        echo " -> Pinning Pico's feed so it cannot replace system packages..."
+        sudo tee /etc/apt/preferences.d/pscan-pico-pin >/dev/null <<'PIN'
+# Written by pscan's install.sh.
+# Pico's feed is built for Ubuntu. It must supply Pico's own libps* packages
+# and nothing else, or apt can offer to replace system libraries with
+# Ubuntu builds. Priority 100 = only when no other source provides it.
+Package: *
+Pin: origin labs.picotech.com
+Pin-Priority: 100
+PIN
+
+        echo " -> Registering Pico's apt feed..."
+        echo "deb [signed-by=/usr/share/keyrings/picotech-archive-keyring.gpg] https://labs.picotech.com/picoscope7/debian/ picoscope main" \
+            | sudo tee /etc/apt/sources.list.d/picoscope7.list >/dev/null
+
+        sudo apt update
+        if sudo apt install -y $PICO_LIBS; then
+            PICO_OK=1
+        else
+            echo " -> [ERROR] 'apt install $PICO_LIBS' failed."
+            echo " ->         Pico officially support Ubuntu and openSUSE on"
+            echo " ->         x86-64. On another distribution the feed may"
+            echo " ->         have no matching packages, and 'action"
+            echo " ->         picoscope' will be unavailable. Everything"
+            echo " ->         else is unaffected."
+        fi
+    else
+        echo " -> [ERROR] Could not fetch Pico's signing key from"
+        echo " ->         https://labs.picotech.com/Release.gpg.key"
+        echo " ->         Check network access; 'action picoscope' will be"
+        echo " ->         unavailable until this succeeds."
+    fi
+fi
+
+if [ "$PICO_OK" = "1" ]; then
+    # The libraries live under /opt/picoscope/lib, which is not a default
+    # search path. Whether the package registers it varies, so register it
+    # here if nothing else has: without it ctypes cannot find libps5000a.so
+    # even though it is installed, and the driver reports a missing SDK.
+    if ! ldconfig_p | grep -q "libps5000a\.so" \
+       && ls "$PICO_LIB_DIR"/libps*.so* >/dev/null 2>&1; then
+        echo " -> Adding $PICO_LIB_DIR to the dynamic linker path..."
+        echo "$PICO_LIB_DIR" | sudo tee /etc/ld.so.conf.d/picoscope.conf >/dev/null
+        sudo /sbin/ldconfig
+    fi
+
+    # Pico's packages create a 'pico' group for USB access on some versions
+    # and rely on udev rules on others. Only acted on if the group is really
+    # there, and only reported - a group change does not take effect until
+    # the user logs in again, so claiming success would be a lie.
+    if getent group pico >/dev/null 2>&1; then
+        if id -nG "${SUDO_USER:-$USER}" | tr ' ' '\n' | grep -qx pico; then
+            echo " -> ${SUDO_USER:-$USER} is in the 'pico' group."
+        else
+            sudo usermod -aG pico "${SUDO_USER:-$USER}" 2>/dev/null \
+                && echo " -> Added ${SUDO_USER:-$USER} to the 'pico' group." \
+                && echo " ->   LOG OUT AND BACK IN for that to take effect;" \
+                && echo " ->   until then the scope is only reachable as root."
+        fi
+    fi
+fi
+
 # --- 1.7 Setup NI-DAQmx (the only route to NI X Series cards) ---
 echo -e "\n[1.7/6] Checking NI-DAQmx..."
 
@@ -1148,7 +1279,8 @@ for attr in ("backend_names", "open_device", "close_all", "resolve_range"):
     if not hasattr(daq, attr):
         problems.append(f"pscan.daq is missing {attr}()")
 for mod in ("pscan.main", "pscan.a2d_driver", "pscan.daqmx_driver",
-            "pscan.control_daq", "pscan.config_parser", "flyscan.cli"):
+            "pscan.control_daq", "pscan.config_parser", "pscan.scope_io",
+            "pscan.picoscope_driver", "flyscan.cli"):
     try:
         __import__(mod)
     except Exception as e:

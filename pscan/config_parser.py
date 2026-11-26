@@ -71,6 +71,15 @@ ACTION_SCHEMAS = {
         'required': ['ip', 'channels'],
         'optional': ['sweeps', 'segments', 'averages'],
     },
+    # A USB PicoScope. It has no front panel, so everything the LeCroy is
+    # asked to report about its own settings has to be said here instead -
+    # which is the whole of why this block has more keys than 'scope'.
+    'picoscope': {
+        'required': ['channels'],
+        'optional': ['series', 'serial', 'resolution', 'v_max', 'coupling',
+                     'sample_rate', 'n_samples', 'pretrigger', 'trigger',
+                     'timeout', 'captures', 'averages', 'sweeps'],
+    },
     'a2d': {
         'required': ['channel'],
         'optional': ['range', 'sample_rate', 'n_samples', 'backend', 'device',
@@ -102,8 +111,8 @@ ACTION_SCHEMAS = {
 
 # Blocks that anchor the setup / acquisition / teardown split. See
 # categorize_pipeline().
-CORE_TYPES = ['apt_stage', 'd2a_phidget', 'd2a', 'count', 'scope', 'a2d',
-              'webcam', 'delay', 'ixon', 'tucsen']
+CORE_TYPES = ['apt_stage', 'd2a_phidget', 'd2a', 'count', 'scope',
+              'picoscope', 'a2d', 'webcam', 'delay', 'ixon', 'tucsen']
 
 # Block types that declare a scan axis rather than a pipeline action.
 AXIS_TYPES = ('apt_stage', 'd2a_phidget', 'd2a')
@@ -111,6 +120,11 @@ AXIS_TYPES = ('apt_stage', 'd2a_phidget', 'd2a')
 # Waverunner trace names: input channels, maths functions, memories and the
 # four zoom traces.
 CHANNEL_RE = re.compile(r'^(?:C\d+|F\d+|M\d+|Z\d+|T[A-D])$', re.IGNORECASE)
+
+# PicoScope inputs are single letters: A-D on a 2000A/3000A/5000A, A-H on a
+# 4000A. Which letters actually exist is checked against the series when the
+# block names one.
+PICO_CHANNEL_RE = re.compile(r'^[A-H]$', re.IGNORECASE)
 
 # The APT axes main() actually iterates. Analog-output axes are virtual: they
 # get their own ids and main() nests them inside the stage axes.
@@ -145,7 +159,7 @@ LOOP_TYPES = AXIS_TYPES + ('count',)
 #: Block types that produce a data file. All of them must sit at the same
 #: depth, so every .d file from one run has the same trace count - which is
 #: what keeps the output format and its analysis unchanged.
-DATA_TYPES = ('a2d', 'scope', 'webcam', 'ixon', 'tucsen')
+DATA_TYPES = ('a2d', 'scope', 'picoscope', 'webcam', 'ixon', 'tucsen')
 
 #: What a d2a block's 'units' line may say.
 D2A_UNITS = ('volts', 'um')
@@ -737,6 +751,66 @@ def _optional_text(body, key):
     return match.group(1) if match else None
 
 
+def _value_list(body, key):
+    """A 'key a, b, c' line as a list of tokens, or None when absent.
+
+    Commas are optional, so 'v_max 1.0, 5.0' and 'v_max 1.0 5.0' are the same
+    line - the same leniency the 'channels' line has always had.
+    """
+    match = _field(body, key)
+    if match is None:
+        return None
+    return [v for v in match.group(1).replace(',', ' ').split() if v]
+
+
+def _number_list(body, key, label, cast=float):
+    """A 'key' line as numbers, or None when absent."""
+    tokens = _value_list(body, key)
+    if tokens is None:
+        return None
+    try:
+        return [cast(t) for t in tokens]
+    except ValueError:
+        raise ValueError(
+            f"{label} '{key} {' '.join(tokens)}' is not all numbers"
+        ) from None
+
+
+def _pico_trigger(body, label):
+    """The 'trigger' line as {'source', 'level', 'direction'}, or None.
+
+    Shared by validation and compilation so the two cannot disagree about
+    what a block triggers on - a scan that validated cleanly and then armed
+    a different edge is exactly the kind of difference nobody notices until
+    the data is wrong.
+    """
+    match = _field(body, 'trigger')
+    if match is None:
+        return None
+
+    tokens = match.group(1).replace(',', ' ').split()
+    if len(tokens) == 1 and tokens[0].lower() in ('none', 'off', 'auto'):
+        return None
+
+    if len(tokens) != 3:
+        raise ValueError(
+            f"{label} trigger needs three values: "
+            f"'trigger <source> <level_volts> <edge>', for example "
+            f"'trigger A 0.5 rising' or 'trigger ext -1.0 falling'. Write "
+            f"'trigger none' to capture without waiting for one."
+        )
+
+    source, level, edge = tokens
+    try:
+        level = float(level)
+    except ValueError:
+        raise ValueError(
+            f"{label} trigger level '{level}' is not a number (volts)"
+        ) from None
+
+    return {'source': source, 'level': level, 'direction': edge.lower()}
+
+
 def _optional_backend(body):
     """A block's 'backend' line, with 'auto' normalised to None.
 
@@ -812,6 +886,167 @@ def _d2a_units(body, label, present):
             f"{label} um_per_volt must be positive, not {um_per_volt}"
         )
     return units, um_per_volt
+
+
+def _validate_picoscope(body, label, present):
+    """Check one 'action picoscope' block. Returns its warnings.
+
+    The series table, the range ladder and the legal couplings and edges come
+    from the driver rather than being restated here, so a new series cannot
+    leave the validator rejecting it. Importing that module opens nothing -
+    the PicoSDK library is loaded in connect(), not at import.
+    """
+    from pscan import picoscope_driver as pico
+
+    warnings = []
+
+    series = None
+    if 'series' in present:
+        series = _field(body, 'series', r'(\S+)').group(1).lower()
+        if series not in pico.SERIES:
+            raise ValueError(
+                f"{label} series '{series}' is not one pscan drives. Use one "
+                f"of: {', '.join(pico.SERIES_ORDER)}. The 2000 and 3000 "
+                f"series WITHOUT an 'A' in the model number use a different "
+                f"PicoSDK library and are not supported."
+            )
+
+    names = _value_list(body, 'channels') or []
+    if not names:
+        raise ValueError(f"{label} channels line lists no channels")
+    for name in names:
+        if not PICO_CHANNEL_RE.match(name):
+            raise ValueError(
+                f"{label} channel '{name}' is not a PicoScope input. "
+                f"PicoScope channels are single letters: A, B, C, D (and "
+                f"E..H on a 4000A). 'C1'-style names belong to "
+                f"'action scope'."
+            )
+    upper = [n.upper() for n in names]
+    if len(set(upper)) != len(upper):
+        raise ValueError(f"{label} lists the same channel twice: {', '.join(names)}")
+    if series is not None:
+        available = pico.SERIES[series]['n_channels']
+        last = chr(ord('A') + available - 1)
+        for name in upper:
+            if ord(name) - ord('A') >= available:
+                raise ValueError(
+                    f"{label} channel {name} does not exist on a {series} "
+                    f"unit, which has {available} input(s): A..{last}"
+                )
+
+    # One value for every channel, or one value for all of them.
+    for key in ('v_max', 'coupling'):
+        values = _value_list(body, key)
+        if values is not None and len(values) not in (1, len(upper)):
+            raise ValueError(
+                f"{label} '{key}' lists {len(values)} value(s) for "
+                f"{len(upper)} channel(s). Give one value for all of them, "
+                f"or one per channel in the same order as 'channels'."
+            )
+
+    widest = pico.RANGE_VOLTS[
+        pico.SERIES[series]['max_range'] if series else len(pico.RANGE_VOLTS) - 1
+    ]
+    for value in _number_list(body, 'v_max', label) or []:
+        if value <= 0:
+            raise ValueError(
+                f"{label} v_max is the full scale in volts and must be "
+                f"positive, not {value:g} (the range is +/-v_max)"
+            )
+        if value > widest + 1e-12:
+            raise ValueError(
+                f"{label} v_max {value:g} V is wider than any PicoScope "
+                f"range ({'the ' + series + ' tops out at ' if series else 'the widest is '}"
+                f"+/-{widest:g} V). Use an attenuating probe."
+            )
+
+    for name in _value_list(body, 'coupling') or []:
+        if name.lower() not in pico.COUPLINGS:
+            raise ValueError(
+                f"{label} coupling must be dc or ac, not '{name}'"
+            )
+
+    if 'sample_rate' in present:
+        rate = _require_number(body, 'sample_rate', label)
+        if rate <= 0:
+            raise ValueError(
+                f"{label} sample_rate must be positive, not {rate:g}"
+            )
+
+    for key in ('n_samples', 'captures', 'averages', 'sweeps'):
+        if key in present:
+            value = _require_number(body, key, label, int)
+            if value < 1:
+                raise ValueError(
+                    f"{label} {key} must be at least 1, not {value}"
+                )
+
+    if 'averages' in present and 'sweeps' in present:
+        warnings.append(
+            f"{label} declares both 'averages' and 'sweeps', which are the "
+            f"same key; 'averages' wins."
+        )
+
+    if 'timeout' in present:
+        timeout = _require_number(body, 'timeout', label)
+        if timeout <= 0:
+            raise ValueError(
+                f"{label} timeout must be positive, not {timeout:g}"
+            )
+
+    if 'pretrigger' in present:
+        pre = _require_number(body, 'pretrigger', label)
+        if not 0.0 <= pre <= 100.0:
+            raise ValueError(
+                f"{label} pretrigger is the percentage of the record taken "
+                f"BEFORE the trigger, 0..100, not {pre:g}"
+            )
+
+    if 'resolution' in present:
+        bits = _require_number(body, 'resolution', label, int)
+        if bits not in pico.RESOLUTIONS:
+            raise ValueError(
+                f"{label} resolution must be one of "
+                f"{', '.join(str(b) for b in sorted(pico.RESOLUTIONS))} "
+                f"bits, not {bits}"
+            )
+        if series is not None and not pico.SERIES[series]['resolution_arg']:
+            warnings.append(
+                f"{label} sets 'resolution', but only the 5000A series has a "
+                f"switchable ADC; on a {series} the line has no effect."
+            )
+
+    trigger = _pico_trigger(body, label)
+    if trigger is not None:
+        edge = trigger['direction']
+        if edge not in pico.EDGES:
+            raise ValueError(
+                f"{label} trigger edge must be one of "
+                f"{', '.join(sorted(pico.EDGES))}, not '{edge}'"
+            )
+        source = trigger['source'].upper()
+        if source not in ('EXT', 'EXTERNAL'):
+            if not PICO_CHANNEL_RE.match(source):
+                raise ValueError(
+                    f"{label} trigger source '{trigger['source']}' is "
+                    f"neither a channel letter nor 'ext'"
+                )
+            if source not in upper:
+                raise ValueError(
+                    f"{label} triggers on channel {source}, which it does not "
+                    f"record. A PicoScope can only trigger on a channel that "
+                    f"is switched on, so add {source} to 'channels' or "
+                    f"trigger on one that is there."
+                )
+    elif 'trigger' not in present:
+        warnings.append(
+            f"{label} declares no 'trigger', so every capture starts the "
+            f"instant pscan asks for it rather than on a signal. That is "
+            f"right for a DC measurement and wrong for anything pulsed."
+        )
+
+    return warnings
 
 
 def validate_blocks(all_blocks):
@@ -1018,6 +1253,9 @@ def validate_blocks(all_blocks):
                     f"{label} declares both 'sweeps' and an alias; 'sweeps' wins."
                 )
 
+        elif t == 'picoscope':
+            warnings.extend(_validate_picoscope(body, label, present))
+
         elif t == 'a2d':
             channel = _require_number(body, 'channel', label, int)
             if channel < 0:
@@ -1140,6 +1378,18 @@ def validate_blocks(all_blocks):
                     f"{label} needs a command: 'script <command to run>'"
                 )
 
+    # One USB scope session per run, because every picoscope block would
+    # write the same <base>_pico0.dat: a second block does not produce a
+    # second file, it interleaves its traces into the first one's. Refused
+    # here rather than discovered in the data.
+    if sum(1 for b in all_blocks if b['type'] == 'picoscope') > 1:
+        raise ValueError(
+            "more than one 'action picoscope' block. They would all write "
+            "the same <base>_pico0.dat and interleave their traces. Put "
+            "every channel you want in one block - 'channels A, B, C' - and "
+            "give each its own 'v_max' and 'coupling' in the same order."
+        )
+
     return warnings
 
 
@@ -1206,6 +1456,39 @@ def compile_pipeline_list(raw_pipeline, a2d_counter):
                 ]
             else:
                 p['channels'] = []
+
+        elif t == 'picoscope':
+            label = "'action picoscope'"
+            p['channels'] = [c.upper() for c in (_value_list(body, 'channels') or [])]
+            p['series'] = (_optional_text(body, 'series') or '').lower() or None
+            p['serial'] = _optional_text(body, 'serial')
+            p['resolution'] = _optional_number(body, 'resolution', int)
+
+            # Per channel, in the order 'channels' lists them. A single value
+            # means the same setting on every channel, which the driver
+            # broadcasts.
+            p['v_max'] = _number_list(body, 'v_max', label)
+            coupling = _value_list(body, 'coupling')
+            p['coupling'] = [c.lower() for c in coupling] if coupling else None
+
+            p['sample_rate'] = _optional_number(body, 'sample_rate')
+            p['n_samples'] = _optional_number(body, 'n_samples', int)
+            p['pretrigger'] = _optional_number(body, 'pretrigger')
+            p['timeout'] = _optional_number(body, 'timeout')
+            p['captures'] = _optional_number(body, 'captures', int)
+
+            # 'sweeps' is accepted as the 'scope' block's name for the same
+            # thing, so a config can say either.
+            averages = _optional_number(body, 'averages', int)
+            if averages is None:
+                averages = _optional_number(body, 'sweeps', int)
+            p['averages'] = averages
+
+            # Under the same key the 'scope' block uses, so the orchestrator
+            # hands either instrument its averaging count the same way.
+            p['sweeps'] = averages
+
+            p['trigger'] = _pico_trigger(body, label)
 
         elif t == 'a2d':
             ch_m = _field(body, 'channel', r'(\d+)')

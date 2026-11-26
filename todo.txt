@@ -1,2 +1,15 @@
 --Fix libphidget if statement in install script
 --fix control_piezo CLI
+--PicoScope GUI install cadence (Linux). install.sh step 1.6 installs the
+  four libps*a driver packages only, not the 'picoscope' application. The
+  repo and signing key it adds are the same ones the app comes from, so on
+  a machine that has run install.sh the app is 'sudo apt install picoscope'
+  - which also pulls drivers for every Pico product. Decide whether to make
+  it an opt-in flag (PSCAN_PICO_GUI=1 / --picoscope-gui) or leave it a
+  documented manual step. Not default: it is a full desktop application and
+  Pico support Ubuntu/openSUSE on x86-64 only, so on Debian the package may
+  not resolve at all.
+--No bring-up tool for the PicoScope, the way 'pydaq list' is one for DAQ
+  cards. First contact is a whole scan. A '__main__' in picoscope_driver.py
+  (python -m pscan.picoscope_driver) would enumerate units and capture one
+  trace through the real code path, with no new file.

@@ -108,11 +108,24 @@ cal.to_json('velocity_cal.json')
 
 Use a featureless region. Pick a conservative velocity — half your ceiling.
 
-Scope, by hand:
+Scope, by hand — **on a LeCroy**:
 - `SEQ ON,<segments>` to match what `--dry-run` reports
 - Trigger delay set so the window starts just before the copeak and runs
   through the decay. Confirm via `HORIZ_OFFSET` in the returned WAVEDESC.
 - Capture window from what stage 1 told you
+
+**On a USB PicoScope there is nothing to set by hand.** Segments, window,
+range, coupling and trigger all come from the `action scope_line` block and
+are applied on every line, so what `--dry-run` reports is what runs. Two
+differences to expect in the checks below:
+
+- `trigtime` spacings are *exactly* 100 µs, because they are derived from the
+  delay clock rather than measured — block mode does not timestamp captures.
+  That is recorded per line as `trigtime_source`. It means this stage cannot
+  tell you about trigger jitter on a PicoScope; what it still proves is that
+  no sweep was missed, because the capture count is read back every line.
+- The capture count check replaces the segment-grant check: a short count
+  raises, so again, if it runs, this held.
 
 ```bash
 flyscan --dry-run --counts-per-mm <yours> oneline.con
