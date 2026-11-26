@@ -9,6 +9,13 @@
   documented manual step. Not default: it is a full desktop application and
   Pico support Ubuntu/openSUSE on x86-64 only, so on Debian the package may
   not resolve at all.
+--flyscan: implement 'action count' as repeating the WHOLE image, so the
+  passes can be compared for drift instead of averaged blindly. That is the
+  one loop worth having in a fly scan - averaging at a point is meaningless
+  there, since every segment is already one pixel, and 'bin' covers signal
+  per pixel. Needs a loop around RasterScan.run()'s line loop plus a pass
+  index in the HDF5 line attrs so the passes can be told apart. Until then
+  count > 1 is refused by flyscan/config.py rather than silently ignored.
 --No bring-up tool for the PicoScope, the way 'pydaq list' is one for DAQ
   cards. First contact is a whole scan. A '__main__' in picoscope_driver.py
   (python -m pscan.picoscope_driver) would enumerate units and capture one

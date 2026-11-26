@@ -84,8 +84,9 @@
 ##
 ## --timer is the other half of the point: it breaks each trace down so
 ## you can see what a USB capture really costs per coordinate on this rig,
-## rather than taking an estimate for it. Compare against
-## examples/bringup_6351.con, which does the same for the NI card.
+## rather than taking an estimate for it. Worth recording the numbers in
+## this header once you have them, as the baseline to compare against if
+## the scan ever feels slow.
 ##
 ## EXPECTED OUTPUT
 ##

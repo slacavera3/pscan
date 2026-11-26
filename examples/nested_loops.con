@@ -45,9 +45,13 @@
 ##
 ## A config that does not nest is read exactly as it always was: axes
 ## nest by axis id, lowest outermost, and count applies at each
-## coordinate. examples/bringup_6351.con is one. Nothing written before
-## nesting existed means anything different now, and there is nothing to
-## migrate.
+## coordinate. Nothing written before nesting existed means anything
+## different now, and there is nothing to migrate.
+##
+## There is deliberately no flat EXAMPLE here any more. Existing flat
+## files keep working, but an example is a template - whatever sits in
+## examples/ is what the next file gets written from - so the only
+## examples kept are the ones worth copying. Write new configs nested.
 ##
 ## THE RULES
 ##

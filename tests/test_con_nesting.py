@@ -550,9 +550,40 @@ class TestFlatPlansKeepTodaysOrder(unittest.TestCase):
         self.assertEqual(stripped.count("d2a restore"), 3,
                          "inner restores twice, outer once")
 
-    def test_the_repos_own_bringup_file(self):
-        path = REPO / "examples" / "bringup_6351.con"
-        order = plan_order(build_plan(parse_con_tree(str(path))), iterations=2)
+    def test_an_axis_sweep_with_one_acquisition(self):
+        """The commonest flat shape there is: sweep an output, record at each.
+
+        Written inline rather than read out of examples/. It used to point at
+        examples/bringup_6351.con, the repo's one flat example, which was
+        deleted on purpose - it was being used as a template for new files
+        and so was teaching the flat form to anything that read it. The
+        INVARIANT is still worth pinning, because every .con file in the lab
+        is flat and must keep running exactly as it does; it just should not
+        need a flat file to exist in the repo to be checked.
+        """
+        order = self.order("""
+            action d2a
+            axis 98
+            backend daqmx
+            device Dev1
+            channel 0
+            units volts
+            scan 0.0 10.0 1.0
+            limits 0.0 10.0
+            settle 0.01
+            restore
+            end
+
+            action a2d
+            channel 0
+            backend daqmx
+            device Dev1
+            v_min 0.0
+            v_max 10.0
+            sample_rate 10000
+            n_samples 1000
+            end
+        """)
         self.assertEqual(order,
                          ["d2a[0]", "  a2d", "d2a[1]", "  a2d", "d2a restore"])
 

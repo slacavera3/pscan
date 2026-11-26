@@ -339,22 +339,56 @@ Flags:
 
 ### WHEN EACH ACTION RUNS (read this before writing a .con file)
 
-Blocks are split into three pipelines, and the split is positional, not
-declared. A block runs:
+**An `action ... end` block is a for-loop, and what you write inside it runs
+once per iteration. So the nesting in the file IS the nesting of the scan.**
+
+```
+action apt_stage          <- for each X position
+...
+    action apt_stage      <-     for each Y position
+    ...
+        action count      <-         take 4 traces
+        count 4
+            action a2d    <-             record one
+            ...
+            end
+        end
+    end
+end
+```
+
+Write new files this way. `examples/nested_loops.con` is the worked example
+and states the rules; the short version is that only the axis blocks and
+`count` are loops, a loop must contain something, and every recording block
+must sit at the same depth so that every file from one run has the same trace
+count.
+
+Where you put `count` is a different EXPERIMENT, not a different layout:
+inside both axes it averages a point, around the inner axis it repeats a row,
+around both it repeats the whole image so the passes can be compared for
+drift. That last one cannot be said at all with a single global number.
+
+WHAT A FLAT FILE DOES, FOR THE ONES ALREADY WRITTEN
+
+A config that nests nothing still runs exactly as it always has, and there is
+nothing to migrate. Its shape is inferred instead of written: axes nest by
+axis id, lowest outermost, `count` innermost, and the three pipelines are
+split positionally. A block runs
 
    * at SETUP (once, before anything moves)  if NO core block precedes it
    * at TEARDOWN (once, after the scan)      if NO core block follows it
    * PER COORDINATE (once per grid point)    otherwise
 
-Core blocks are: apt_stage, d2a_phidget, d2a, count, scope, picoscope, a2d,
-webcam, delay, ixon, tucsen. In practice only 'action script' is ever non-core, so
-whether your script runs once or thousands of times depends on where it sits
-relative to the core blocks around it.
+where the core blocks are: apt_stage, d2a_phidget, d2a, count, scope,
+picoscope, a2d, webcam, delay, ixon, tucsen. In practice only `action script`
+is ever non-core, so in a flat file whether your script runs once or
+thousands of times depends on where it sits relative to the core blocks
+around it - which is the part that catches people out, and the main reason to
+nest instead and say what you mean.
 
-This catches people out, so check it with `pscan --dry-run`, which prints the
-three pipelines explicitly. Note that in the template below the script block
-sits between 'a2d'/'scope' and 'ixon', so it runs at EVERY coordinate. To run
-a script once at startup, put it above every core block.
+Either way, check it with `pscan --dry-run`: it prints the pipelines, the
+grid and every output file, and says explicitly whether the config nested or
+was read positionally.
 
 ### DAQ CARDS AND BACKENDS
 
@@ -726,6 +760,38 @@ LeCroy fly path, and all four are deliberate:
 `transfer_rate` defaults to 30 MB/s on USB rather than the LeCroy's 4 MB/s.
 Both are only used to size timeouts and the time estimate - measure yours.
 
+A FLY CONFIG IS FLAT, AND NESTING IT IS REFUSED
+
+pscan's blocks nest, and the nesting IS the scan: where you write a `count`
+block decides whether it averages a point, repeats a row or repeats the
+image. None of that can be true in a fly scan, because its shape is fixed
+rather than written:
+
+  * the slow axis is the only loop there is;
+  * the fast axis is NOT a loop - it is one continuous move per line;
+  * the samples along it are hardware triggers, not Python iterations.
+    Getting Python out of the per-pixel loop is the entire point of flying.
+
+So there is nothing a fly config could put inside a loop, and position
+carries no information: exactly one `apt_fly`, one `apt_stage` and one
+`scope_line` are required, in any order.
+
+Writing one hierarchically is REFUSED with that reason, rather than being
+flattened and run. The reader underneath would flatten it quite happily and
+produce the right answer - which is the problem. Someone who nests is saying
+"placement matters here", and a format whose central rule is true in one
+orchestrator and quietly false in the other is worse than two formats that
+look different.
+
+`action count` above 1 is refused for the same kind of reason: nothing in the
+fly runner reads it, so a config asking for 4 made one pass and wrote a
+quarter of the expected data. It used to warn that it would "fly every line 4
+times", which is an effect that never happened. `count 1` is still accepted
+in silence. For more signal per pixel use `bin <nm>` in `action apt_fly`,
+which averages neighbouring copeaks into one output pixel and whose SNR gain
+`--dry-run` reports; repeating the whole image to compare passes for drift is
+on the to-do list, not implemented.
+
 ### RUNNING THE TESTS
 
    python -m unittest discover -s tests -t .
@@ -753,16 +819,74 @@ modules run anywhere.
 
 ### Configuration File (.con) Template
 
-The orchestrator reads flat .con files. Below is a comprehensive template showing every possible unnested action block. Unknown action types, unknown keys, out-of-range axes and missing required lines are all rejected before any hardware opens, so a typo fails loudly instead of silently falling back to a default.
+Two things follow, and they are not the same kind of thing.
+
+**THE TEMPLATE is the skeleton immediately below: copy that.** It nests,
+because that is how a scan is written.
+
+**THE LONG LISTING AFTER IT IS A KEY REFERENCE, NOT A SCAN.** It is every
+block pscan understands with every key it takes, one after another at the top
+level so each can be read on its own. Do not copy its LAYOUT - a file with
+all of those blocks side by side at one level is a flat config, and the shape
+it would run is inferred rather than stated. Take the keys you need from it
+and put the blocks inside each other, as the skeleton does.
+
+(That distinction is not pedantry. `examples/` used to carry a flat example
+too, and it got used as the template for new files purely by being there, so
+it was deleted. A reference that reads like a template does the same thing.)
+
+Unknown action types, unknown keys, out-of-range axes and missing required
+lines are all rejected before any hardware opens, so a typo fails loudly
+instead of silently falling back to a default.
 
 CRITICAL NOTE FOR LECROY SCOPES: The 'action scope' block should declare 'sweeps' so the driver knows exactly how many trigger pulses to wait for before timing out. 'segments' and 'averages' are accepted as aliases, but prefer 'sweeps' - until recently only 'sweeps' was actually parsed, so older config files written with 'segments' were silently falling back to whatever the scope was already set to.
 
 ## ==========================================
-## pscan Configuration Template
+## THE TEMPLATE - copy this, then add keys from the reference below
+## ==========================================
+##
+##   for each of 3 X positions
+##       for each of 3 Y positions
+##           take 4 traces, recording one a2d each
+##
+## 3 x 3 x 4 = 36 traces. Move the 'count' block out one level and it
+## repeats a ROW instead of averaging a POINT; out two and it repeats the
+## whole IMAGE. See WHEN EACH ACTION RUNS above.
+action apt_stage
+axis 0
+scan 53.555 53.565 0.005
+limits 50.000 57.000
+
+    action apt_stage
+    axis 1
+    scan 37.000 37.010 0.005
+    limits 35.000 40.000
+    restore
+
+        action count
+        count 4
+
+            action a2d
+            channel 1
+            v_min -1.0
+            v_max 1.0
+            terminal rse
+            sample_rate 10000
+            n_samples 100
+            end
+
+        end
+    end
+end
+
+## ==========================================
+## KEY REFERENCE - every block and every key it takes.
+## NOT a scan. Take the keys; nest the blocks as above.
 ## ==========================================
 
 ## 1. LOOP COUNT
-## Defines how many times the acquisition pipeline repeats per coordinate.
+## How many times to repeat whatever is inside it. In a flat file it has no
+## inside, and applies at each coordinate.
 action count
 count 1
 end
@@ -780,7 +904,9 @@ limits 50.000 57.000
 end
 
 ## 3. Y-AXIS HARDWARE
-## 'restore' sends the axis back to start_mm after the scan finishes.
+## 'restore' sends the axis back to start_mm when ITS LOOP ends - so on a
+## nested inner axis that is once per iteration of the axis outside it
+## (after every row), and on the outermost axis it is at the end of the run.
 action apt_stage
 axis 1
 scan 37.000 37.010 0.005

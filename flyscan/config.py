@@ -6,6 +6,27 @@ into a fly scan's setup and teardown phases without a second config format
 to learn. 'action script' and 'action webcam' blocks are parsed by pscan's
 own compiler and mean exactly what they mean there.
 
+FLAT, AND NESTING IS REFUSED RATHER THAN IGNORED
+
+pscan's blocks nest, and the nesting IS the scan: where you write a block
+decides whether 'count' averages a point, repeats a row or repeats the
+image. None of that can be true here, because a fly scan's shape is fixed
+rather than written:
+
+  * the slow axis is the only loop there is;
+  * the fast axis is NOT a loop - it is one continuous move per line;
+  * the samples along it are hardware triggers, not Python iterations.
+    Getting Python out of the per-pixel loop is the entire point of flying.
+
+So there is nothing a fly config could put inside a loop, and position
+carries no information: exactly one apt_fly, one apt_stage and one
+scope_line are required, in any order. The reader underneath this module
+would happily FLATTEN a nested file and run it, which is the problem -
+someone who nests is saying "placement matters here" and it does not. It is
+refused with that reason instead, because a format whose central rule is
+true in one orchestrator and quietly false in the other is worse than two
+formats that look different.
+
 The fly-specific blocks are:
   apt_fly      the fast axis, swept at constant velocity
   scope_line   one Sequence-mode acquisition per line
@@ -23,7 +44,8 @@ import re
 
 from pscan.config_parser import (
     ACTION_SCHEMAS as PSCAN_SCHEMAS,
-    parse_flat_con_file, compile_pipeline_list, compile_stage_parameters,
+    parse_con_tree, flatten_tree, has_nesting,
+    compile_pipeline_list, compile_stage_parameters,
     generate_positions, _field, _flag,
 )
 from flyscan.budget import (DEFAULT_REP_RATE_HZ, ROLE_AC, ROLE_DC,
@@ -328,6 +350,52 @@ def _split_blocks(blocks):
         else:
             teardown.append(block)
     return fly, setup, teardown
+
+
+def _nested_parents(blocks):
+    """Every block in the tree that has blocks written inside it."""
+    found = []
+    for block in blocks:
+        if block['children']:
+            found.append(f"'action {block['type']}'")
+            found.extend(_nested_parents(block['children']))
+    return found
+
+
+def _refuse_nesting(roots):
+    """A fly config is flat. Say why, rather than flattening it silently.
+
+    The reader underneath would flatten a nested file and run it correctly,
+    ignoring the hierarchy - and that is exactly the failure worth refusing:
+    in pscan the hierarchy IS the experiment, so someone who writes one here
+    is relying on a rule that does not hold.
+    """
+    if not has_nesting(roots):
+        return
+
+    parents = _nested_parents(roots)
+    if len(parents) == 1:
+        culprit = f"{parents[0]} has blocks written inside it"
+    else:
+        culprit = (f"{', '.join(parents[:-1])} and {parents[-1]} have "
+                   f"blocks written inside them")
+    raise FlyConfigError(
+        f"this config nests its blocks ({culprit}), and a fly scan is "
+        f"flat.\n"
+        f"  In pscan the nesting IS the scan - where you write a block "
+        f"decides whether 'count' averages a point, repeats a row or "
+        f"repeats the image. A fly scan's shape is fixed instead: the slow "
+        f"axis is the only loop, the fast axis is one continuous move per "
+        f"line, and the samples along it are hardware triggers rather than "
+        f"Python iterations.\n"
+        f"  So there is nothing to put inside a loop here, and position "
+        f"carries no information: write the blocks one after another, in "
+        f"any order. Anything before 'action apt_fly' is setup and anything "
+        f"after it is teardown.\n"
+        f"  This is refused rather than flattened for you because the "
+        f"hierarchy would have meant nothing, and silently meaning nothing "
+        f"is how a config comes to look right and do something else."
+    )
 
 
 def _validate_types(blocks):
@@ -646,7 +714,12 @@ def parse_fly_config(path, counts_per_mm):
     if not os.path.exists(path):
         raise FlyConfigError(f"config file '{path}' not found")
 
-    blocks = parse_flat_con_file(path)
+    # Read as a tree, like pscan does, so that a nested file can be
+    # RECOGNISED and refused. Reading it flat would succeed and quietly
+    # discard the hierarchy, which is the thing worth catching.
+    roots = parse_con_tree(path)
+    _refuse_nesting(roots)
+    blocks = flatten_tree(roots)
     if not blocks:
         raise FlyConfigError(
             f"'{path}' has no action blocks - empty, or fully commented out"
@@ -818,15 +891,47 @@ def parse_fly_config(path, counts_per_mm):
         # rather than a bare ValueError from a geometry class.
         raise FlyConfigError(f"in '{os.path.basename(path)}': {e}") from e
 
+    # 'action count' above 1 is REFUSED, not warned about.
+    #
+    # Nothing in the fly runner reads this value - not cli.py, not
+    # raster.py - so a config asking for 4 used to get exactly one pass and
+    # a warning claiming it would "fly every line 4 times". A warning that
+    # describes an effect which does not happen is worse than no warning:
+    # the data comes back a quarter of the expected size and looks healthy.
+    #
+    # 'count 1' is still accepted in silence, because it means what it says
+    # and every config written from pscan's template carries it.
+    #
+    # What it WOULD mean is a real and useful experiment - repeat the whole
+    # image and compare the passes for drift rather than averaging them
+    # blindly - which is why the message says so instead of pretending the
+    # key is meaningless. It needs a loop around RasterScan.run()'s line
+    # loop; see todo.txt.
+    #
+    # Note what it does NOT mean: averaging at a point. In a fly scan every
+    # segment IS one pixel, so there is no per-point repeat to average -
+    # more signal per pixel comes from 'bin', which averages neighbouring
+    # copeaks into one output pixel after the fact.
     count_block = _exactly_one(fly, 'count', required=False)
     count = 1
     if count_block is not None:
         count = int(_numbers(count_block['body'], 'count', 1,
                              "'action count'")[0])
         if count != 1:
-            warnings.append(
-                f"'action count' is {count}; a fly scan repeats whole lines, "
-                f"so this will fly every line {count} times"
+            raise FlyConfigError(
+                f"'action count' is {count}, and a fly scan cannot repeat "
+                f"yet: nothing in the fly runner acts on this key, so the "
+                f"scan would make ONE pass and the file would be a "
+                f"{count}th of the size you expected.\n"
+                f"  Repeating the whole image - so the passes can be "
+                f"compared for drift instead of averaged blindly - is worth "
+                f"having and is not implemented. There is no per-point "
+                f"repeat to average in a fly scan either: every segment IS "
+                f"one pixel. For more signal per pixel use 'bin <nm>' in "
+                f"the 'action apt_fly' block, which averages neighbouring "
+                f"copeaks into one output pixel and whose SNR gain "
+                f"--dry-run reports.\n"
+                f"  Use 'count 1', or drop the block."
             )
 
     counter = [1]
