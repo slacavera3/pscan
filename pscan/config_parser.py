@@ -78,7 +78,7 @@ ACTION_SCHEMAS = {
         'required': ['channels'],
         'optional': ['series', 'serial', 'resolution', 'v_max', 'coupling',
                      'sample_rate', 'n_samples', 'pretrigger', 'trigger',
-                     'timeout', 'captures', 'averages', 'sweeps'],
+                     'timeout', 'captures', 'segments', 'averages', 'sweeps'],
     },
     'a2d': {
         'required': ['channel'],
@@ -974,7 +974,7 @@ def _validate_picoscope(body, label, present):
                 f"{label} sample_rate must be positive, not {rate:g}"
             )
 
-    for key in ('n_samples', 'captures', 'averages', 'sweeps'):
+    for key in ('n_samples', 'captures', 'segments', 'averages', 'sweeps'):
         if key in present:
             value = _require_number(body, key, label, int)
             if value < 1:
@@ -986,6 +986,12 @@ def _validate_picoscope(body, label, present):
         warnings.append(
             f"{label} declares both 'averages' and 'sweeps', which are the "
             f"same key; 'averages' wins."
+        )
+
+    if 'captures' in present and 'segments' in present:
+        warnings.append(
+            f"{label} declares both 'captures' and 'segments', which are the "
+            f"same key; 'captures' wins."
         )
 
     if 'timeout' in present:
@@ -1475,7 +1481,14 @@ def compile_pipeline_list(raw_pipeline, a2d_counter):
             p['n_samples'] = _optional_number(body, 'n_samples', int)
             p['pretrigger'] = _optional_number(body, 'pretrigger')
             p['timeout'] = _optional_number(body, 'timeout')
-            p['captures'] = _optional_number(body, 'captures', int)
+            # 'segments' is accepted as the 'scope' block's name for the same
+            # thing - and is what the PicoScope GUI's Rapid capture mode calls
+            # it too. 'captures' is the PicoSDK's own word (SetNoOfCaptures),
+            # so it stays the spelling the driver and the log use.
+            captures = _optional_number(body, 'captures', int)
+            if captures is None:
+                captures = _optional_number(body, 'segments', int)
+            p['captures'] = captures
 
             # 'sweeps' is accepted as the 'scope' block's name for the same
             # thing, so a config can say either.

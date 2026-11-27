@@ -344,6 +344,48 @@ class TestPicoScopeBlock(unittest.TestCase):
                     'captures', 'averages', 'trigger'):
             self.assertIsNone(p[key], f"{key} invented a default")
 
+    def test_segments_is_the_same_key_as_captures(self):
+        """One number, three names.
+
+        'segments' is what the LeCroy, pscan's own 'action scope' block and
+        the PicoScope GUI's Rapid capture mode all call it; 'captures' is the
+        PicoSDK's word and so the one the driver uses. A config that says
+        either must mean the same thing, because a user moving between the
+        two scope blocks will write whichever they last saw.
+        """
+        p, warnings = self.compile_block("""
+            action picoscope
+            channels A
+            segments 1000
+            end
+        """)
+        self.assertEqual(p['captures'], 1000)
+        # The untriggered-capture warning is expected and unrelated; what
+        # must not appear is any complaint about the spelling itself.
+        self.assertFalse([w for w in warnings if 'same key' in w], warnings)
+
+    def test_captures_wins_over_segments_and_says_so(self):
+        # Silently picking one would leave a config whose two spellings
+        # disagree looking fine, which is the failure this block exists to
+        # make impossible.
+        p, warnings = self.compile_block("""
+            action picoscope
+            channels A
+            captures 4
+            segments 1000
+            end
+        """)
+        self.assertEqual(p['captures'], 4)
+        self.assertTrue(any('same key' in w for w in warnings), warnings)
+
+    def test_segments_must_be_at_least_one(self):
+        self.assert_rejected("""
+            action picoscope
+            channels A
+            segments 0
+            end
+        """, "segments must be at least 1")
+
     def test_every_key_compiles(self):
         p, _ = self.compile_block("""
             action picoscope

@@ -650,9 +650,17 @@ file.
 
 They compose: `captures 10` with `averages 100` captures 1000 segments and
 writes 10 rows, each the mean of 100. Averaging happens in ADC counts, so
-the single scaling the .m declares still maps the file to volts. 'sweeps' is
-accepted as a synonym for 'averages', because that is what the `action
-scope` block calls the same idea.
+the single scaling the .m declares still maps the file to volts.
+
+Both keys have a synonym, for the same reason: the `action scope` block got
+there first and a config should not depend on which block you last looked
+at. 'sweeps' is accepted for 'averages', and 'segments' for 'captures'. That
+one number has three names in the wild - 'segments' on a LeCroy and in
+`action scope`, 'rapid capture' in the PicoScope GUI, 'captures' in the
+PicoSDK (SetNoOfCaptures) - and the SDK's spelling is what the driver and
+the log use, so an armed line reading "1000 capture(s)" is reporting the
+`segments 1000` you wrote. Writing both spellings in one block warns and
+takes 'captures'.
 
 The ceiling is the unit's capture memory split that many ways, which the
 driver asks about and reports as a refusal naming the numbers - it will not
@@ -1070,9 +1078,11 @@ pretrigger 10             ## percent of the record BEFORE the trigger (default 0
 trigger B 1.5 rising
 timeout 2.0               ## seconds to wait for a capture before padding the trace
 ##
-## captures: rapid-block segments WRITTEN per trace (scp.multitraces)
+## captures: rapid-block segments WRITTEN per trace (scp.multitraces) - what
+##   the PicoScope GUI calls a rapid capture. 'segments' is accepted as a
+##   synonym, because that is what 'action scope' and the LeCroy call it.
 ## averages: segments averaged into each written row (scp.n_averages).
-## 'sweeps' is accepted as a synonym for 'averages'.
+##   'sweeps' is accepted as a synonym.
 captures 10
 averages 4
 end

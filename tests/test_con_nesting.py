@@ -590,11 +590,11 @@ class TestFlatPlansKeepTodaysOrder(unittest.TestCase):
     def test_the_picoscope_bringup_file_is_written_as_a_nest(self):
         """And stays one.
 
-        The scope block sitting INSIDE the axis block is what says it runs
-        once per voltage. Written flat it happens to produce the same six
-        traces today, through the positional rule, which is exactly why a
-        flattened version of this file would not fail anything else - hence
-        the explicit assertion that it nests.
+        The scope block sitting INSIDE the loop is what says it runs once per
+        repeat. Written flat it happens to produce the same traces today,
+        through the positional rule, which is exactly why a flattened version
+        of this file would not fail anything else - hence the explicit
+        assertion that it nests.
         """
         path = REPO / "examples" / "bringup_picoscope.con"
         roots = parse_con_tree(str(path))
@@ -603,7 +603,7 @@ class TestFlatPlansKeepTodaysOrder(unittest.TestCase):
         order = plan_order(build_plan(roots), iterations=2)
         self.assertEqual(
             order,
-            ["d2a[0]", "  picoscope", "d2a[1]", "  picoscope", "d2a restore"],
+            ["count[0]", "  picoscope", "count[1]", "  picoscope"],
         )
 
 

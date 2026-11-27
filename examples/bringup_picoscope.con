@@ -1,44 +1,95 @@
 ## =====================================================================
-## USB PicoScope bring-up - DAQ analog out into a scope input
+## USB PicoScope bring-up - 10 kHz square wave on channel A
 ## =====================================================================
 ##
 ## The first thing to run on a rig that has never had a PicoScope on it.
-## It drives ao0 on the PCIe-6351 from 0 to +5 V in 1 V steps and captures
-## a trace on PicoScope channel A at every step. With ao0 wired to A it is
-## SELF-CHECKING: trace N must read N volts, so a wrong range, a wrong
-## scaling or a wrong channel is obvious without a meter.
+## It takes repeated triggered, segmented captures of a square wave on
+## channel A and writes nothing but scope data: no stage moves, no DAQ
+## output, nothing else that could be the thing that is broken.
 ##
-##   >>> WIRE AO 0 TO PICOSCOPE CHANNEL A with a BNC cable before running.
+##   >>> FEED THE SQUARE WAVE INTO CHANNEL A and leave the generator
+##   >>> running. Everything below assumes 10 kHz, 0 to +150 mV.
 ##
-##   >>> AND CHECK NOTHING ELSE IS ON ao0. This drives a real +5 V. If a
-##   >>> galvo, piezo or amplifier is connected, change 'scan' and
-##   >>> 'limits' to a safe span first.
+## A square wave is SELF-CHECKING in two independent ways, which is why it
+## is a better bring-up signal than a DC level: the two flat levels test
+## the range and the volts scaling, and the edge position tests the
+## trigger and the timebase. Either one being wrong is obvious in the data
+## without a meter and without the GUI.
 ##
-## Without the cable it still runs and still proves the mechanics, but A
-## floats and every trace reads near zero.
+## >>> CLOSE THE PICOSCOPE GUI FIRST. <<<
+##
+## The PicoSDK hands a unit to ONE process at a time, and PicoScope 7
+## holds it for as long as it is connected to the scope. With the GUI open
+## pscan reports "no PicoScope was found on USB", which reads exactly like
+## a dead cable. Closing the window is enough; there is no service left
+## behind. Nothing else about the GUI matters here either - see WHAT THE
+## GUI DOES NOT CARRY OVER below.
 ##
 ## WHAT THIS IS ACTUALLY TESTING, in order:
 ##
 ##   1. pscan can find and open the unit at all (the PicoSDK libraries are
-##      installed, the cable is in, the serial is readable);
-##   2. the range and coupling in this file reach the hardware;
+##      installed, the cable is in, the GUI is not holding it);
+##   2. the range, the coupling and the trigger in this file reach the
+##      hardware - a trigger that never fires is immediately visible as a
+##      dropped trace rather than as a hang;
 ##   3. the ADC counts in the .dat convert to the right volts through
 ##      scp.vgain - which is the one thing that is silently wrong if the
 ##      range handling is wrong;
-##   4. a trace lands per coordinate, in step with the axis.
+##   4. segmented capture at a realistic depth: 1000 segments per trace,
+##      each separately triggered, captured back to back into the unit's
+##      own memory and transferred in one go;
+##   5. a trace lands per coordinate, in step with the loop.
+##
+## THIS IS NOT A SMALL RUN - see THE SIZE OF THIS below before starting
+## it. If the only question is whether the scope opens at all, cut
+## 'segments' to 10 and 'count' to 5 for the first pass and put them back
+## afterwards.
+##
+## WHAT THE GUI DOES NOT CARRY OVER
+##
+## None of it. The GUI's settings live in the application, not in the
+## unit, and pscan opens the hardware from scratch - which is why this
+## block spells out every setting that a LeCroy would be asked to report
+## about itself. Two consequences worth being explicit about:
+##
+##   * Rapid capture is how the GUI exposes segmented memory, and pscan
+##     does not need to be told to use it: it ALWAYS acquires in rapid
+##     block mode (MemorySegments / SetNoOfCaptures / GetValuesBulk), even
+##     for a single segment. The DEPTH comes from 'segments' below, and
+##     nowhere else.
+##   * 5 us/div is a GUI screen setting with no equivalent here. A record
+##     is a sample rate and a number of samples, so the length is written
+##     as 'n_samples' - which at 20 MS/s works out to the same 50 us.
+##
+## ONE WORD, THREE NAMES. The same number is called 'segments' by the
+## LeCroy and by pscan's own 'action scope' block, 'rapid captures' by the
+## PicoScope GUI, and 'captures' by the PicoSDK (SetNoOfCaptures). This
+## block accepts 'segments' or 'captures' for it; they are one key. The
+## driver and the log say "capture(s)" because that is the SDK's word, so
+## do not read that line as reporting something other than what is
+## written here.
 ##
 ## HOW TO READ THIS FILE
 ##
-## The scope block sits INSIDE the axis block, and that is what says it
-## runs once per voltage:
+## The scope block sits INSIDE the count block, and that is what says it
+## runs once per repeat:
 ##
-##   for each of 6 ao0 levels          <- action d2a
-##       capture one trace            <- action picoscope
+##   for each of 100 repeats            <- action count
+##       capture one trace             <- action picoscope
+##         ... of 1000 segments        <- 'segments', inside the block
 ##
-## 6 x 1 = 6 traces. See examples/nested_loops.con for the general rules;
-## the two that matter here are that only a loop (an axis block, or
-## 'count') may contain other blocks, and that every recording block must
-## sit at the same depth.
+## There is no axis in this file on purpose: the only loop is 'count', so
+## nothing physical moves and a bad trace cannot be blamed on a stage. See
+## examples/nested_loops.con for the general rules; the two that matter
+## here are that only a loop (an axis block, or 'count') may contain other
+## blocks, and that every recording block must sit at the same depth.
+##
+## Note that 'count' and 'segments' are NOT interchangeable, even though
+## both multiply the number of records. 1000 segments are one armed
+## acquisition: the unit triggers, stores and rearms by itself, with no
+## software in between, and the whole 2 MB comes back in a single
+## transfer. 100 counts are 100 separate acquisitions, each going through
+## pscan's whole per-coordinate path. The split below tests both.
 ##
 ## Run it in this order:
 ##
@@ -46,13 +97,16 @@
 ##   pscan --timer   examples/bringup_picoscope.con
 ##
 ## --dry-run opens nothing and prints the nest, the grid and the output
-## files. Do it first; it catches a typo in this file before anything
-## drives 5 V. It also prints the line
+## files. Do it first; it catches a typo in this file before the hardware
+## is touched. It also prints the line
 ##
 ##   This config NESTS its blocks, so the file decides the order
 ##
 ## which is how you confirm the hierarchy parsed as written rather than
-## being read by the flat positional rule.
+## being read by the flat positional rule. What --dry-run echoes back is
+## what is WRITTEN here - "+/-0.15V, 1000 samples @ 20 MS/s" - because it
+## opens nothing and so cannot know what the unit will round those to.
+## The armed line in a real run is the one that reports what took.
 ##
 ## WHAT THE OPENING LOG SHOULD SAY. There is no 'pydaq list' for a
 ## PicoScope - the first run IS the detection - so read these two lines
@@ -60,14 +114,32 @@
 ##
 ##   -> PicoScope 5244D (serial GQ123/456), ps5000a driver 2.1.x, via
 ##      /opt/picoscope/lib/libps5000a.so.2
-##   -> PicoScope armed: A at +/-5V, 1000 samples @ 1 MS/s (asked 1 MS/s),
-##      1 capture(s)
+##   -> PicoScope armed: A at +/-0.2V, 1000 samples @ 20.83 MS/s
+##      (asked 20 MS/s), 1000 capture(s)
 ##
 ## The model and serial are read off the unit, not out of this file, so
 ## they confirm WHICH box answered. The second line is the configuration
-## that actually took: if the achieved rate differs from the asked rate,
-## the unit has no such timebase and the delay axis in the .m is the
-## achieved one.
+## that actually took, and two things in it are expected to differ from
+## what is written below:
+##
+##   +/-0.2V, not 0.15      Pico ranges are a fixed ladder and symmetric
+##                          about ground: 10, 20, 50, 100, 200, 500 mV and
+##                          up. There is no 150 mV range, so pscan takes
+##                          the narrowest one that CONTAINS 150 mV. It
+##                          never widens silently past that - a 'v_max' no
+##                          range can hold is refused with the numbers.
+##   20.83 MS/s, not 20     the timebase ladder is discrete too (on a
+##                          5000A at 8 bits the rungs near here are 48 ns
+##                          and 56 ns, so 50 ns does not exist). pscan
+##                          takes the nearest rung that is NOT SLOWER than
+##                          asked, so a record is never quietly stretched.
+##                          The achieved interval is what goes in scp.hint
+##                          and is what the check below uses. It also
+##                          makes the record 48 us rather than 50.
+##
+## If instead the achieved rate comes back far below 20 MS/s, the unit has
+## no timebase that fast for this many samples and channels, and the log
+## says so in a WARNING of its own.
 ##
 ## IF IT DOES NOT OPEN, the message says which of three things happened:
 ##
@@ -75,194 +147,286 @@
 ##       installed. Run 'bash install.sh' with the scope plugged in; see
 ##       README under OSCILLOSCOPES. Nothing to do with the cable.
 ##   "no PicoScope was found on USB"  the libraries are there and no unit
-##       answered. Check the cable and the light. A 2000/3000 series unit
+##       answered. THE GUI BEING OPEN IS THE USUAL CAUSE - check that
+##       first, then the cable and the light. A 2000/3000 series unit
 ##       WITHOUT an 'A' in the model number uses a different PicoSDK
 ##       library and is not driven by pscan at all.
 ##   "N PicoScope units are attached"  more than one is plugged in, and
 ##       pscan refuses to guess which one you meant. It prints the exact
 ##       'series' and 'serial' lines to paste into the block below.
 ##
-## --timer is the other half of the point: it breaks each trace down so
-## you can see what a USB capture really costs per coordinate on this rig,
-## rather than taking an estimate for it. Worth recording the numbers in
-## this header once you have them, as the baseline to compare against if
-## the scan ever feels slow.
+## IF IT OPENS AND THEN REFUSES TO ARM, the likely message is
+##
+##   "this unit holds N sample(s) per segment when its memory is split
+##    1000 ways ... but the block asks for 1000"
+##
+## which is capture memory, not a fault. 1000 segments of 1000 samples
+## needs ONE MEGASAMPLE of buffer. Anything from a 3000A upwards has far
+## more than that; a small 2000A may not, and the message gives the real
+## number so 'segments' can be set to what the unit will actually hold.
+## pscan asks the unit before arming rather than shortening the record
+## behind your back.
+##
+## THE SIZE OF THIS
+##
+##   per trace     1000 segments x 1000 samples x int16 = 2 MB,
+##                 and 1000 triggers
+##   whole run     100 traces -> 200 MB in bringup_picoscope_pico0.dat
+##
+## 1000 triggers at 10 kHz is at best 100 ms of wall clock, and the 2 MB
+## then has to cross USB, so budget somewhere around 0.2 s per trace and
+## tens of seconds for the run. That is a guess; --timer is what replaces
+## it with the real number, and getting that number for a full-depth
+## segmented capture is half the reason to run this at all. Worth writing
+## the result into this header once you have it, as the baseline to
+## compare against if a real scan ever feels slow.
 ##
 ## EXPECTED OUTPUT
 ##
-##   bringup_picoscope_pico0.dat   6 traces x 1000 samples x int16 = 12000 bytes
+##   bringup_picoscope_pico0.dat   100 x 1000 x 1000 x int16 = 200000000
+##                                 bytes
 ##   bringup_picoscope_pico0.m     the geometry and the volts scaling
 ##
-## There is no _trigtime.dat: this capture is untriggered, and a PicoScope
-## writes no trigger-time sidecar even when it is triggered. See README.
+## There is no _trigtime.dat. A PicoScope writes no trigger-time sidecar
+## even when it is triggered, which is the one format difference from a
+## LeCroy Sequence run; see README under OSCILLOSCOPES. It matters here:
+## WITHOUT IT THERE IS NO RECORD OF WHEN EACH SEGMENT AROSE, so the 10 kHz
+## cannot be recovered from the segment spacing. See the note under the
+## frequency check below.
 ##
-## The .m should say points_per_trace=1000, n_traces=6, n_channels=1,
-## multitraces=1 and n_averages=[1]. Check the data without leaving the
-## shell - the mean of each trace should climb 0, 1, 2, 3, 4, 5:
+## The .m should say points_per_trace=1000, n_traces=100000,
+## n_channels=1, multitraces=1000 and n_averages=[1]. n_traces counts
+## SEGMENTS, not coordinates: 100 repeats x 1000 segments x 1 channel.
+##
+## CHECK THE DATA WITHOUT LEAVING THE SHELL. Reads only the first few
+## segments, so it does not pull 200 MB through memory:
 ##
 ##   python3 -c "
 ##   import re, numpy as np
 ##   m = open('bringup_picoscope_pico0.m').read()
-##   g = float(re.search(r'scp\.vgain=\[([^,\]]+)', m).group(1))
-##   o = float(re.search(r'scp\.voff=\[([^,\]]+)', m).group(1))
-##   d = np.fromfile('bringup_picoscope_pico0.dat', dtype=np.int16).reshape(-1, 1000)
-##   for i, t in enumerate(d):
-##       v = g * t.astype(float) - o
-##       print(f'{i:3d}  set {i:5.1f} V   read {v.mean():+8.4f} V   sd {v.std():.5f}')
+##   num = lambda k: float(re.search(r'scp\.'+k+r'=\[?([^,;\]]+)', m).group(1))
+##   g, o, dt = num('vgain'), num('voff'), num('hint')
+##   n, pre = 1000, 100
+##   d = np.fromfile('bringup_picoscope_pico0.dat', dtype=np.int16, count=4*n)
+##   d = g * d.reshape(-1, n).astype(float) - o
+##   print(f'{dt*1e9:.2f} ns/sample, record {n*dt*1e6:.1f} us')
+##   for i, s in enumerate(d):
+##       lo, hi = s[:pre-10].mean(), s[pre+10:].mean()
+##       mid = 0.5 * (lo + hi)
+##       x = np.flatnonzero((s[:-1] < mid) & (s[1:] >= mid))
+##       at = x[0] if len(x) else -1
+##       print(f'  seg {i}  before {lo*1e3:+7.2f} mV  after {hi*1e3:+7.2f} mV'
+##             f'  step {(hi-lo)*1e3:6.2f} mV  edge at sample {at} (want {pre})')
 ##   "
 ##
-## A reading that is a constant FACTOR out (every trace 2x or 0.5x) is a
-## range problem. A reading that is right but noisy at the millivolt level
-## is just 8-bit resolution on a +/-5 V range - 39 mV per count - which is
-## why a real measurement uses the narrowest range that fits the signal.
+## At 20.83 MS/s a 1000-sample record is 48 us, which is UNDER half the
+## 100 us period - so each segment holds the rising edge and the high
+## level after it, and nothing else. That is the same window the GUI shows
+## at 5 us/div, and it is enough to check the levels, the trigger and the
+## edge placement, but NOT the frequency: one edge cannot give a period.
+## To check the 10 kHz itself, run once with 'segments 10' and
+## 'n_samples 4000' - 192 us is two full periods, three edges - and then
+## put this file back.
 ##
-## Reload in MATLAB exactly as a LeCroy run: same .dat layout, same .m
-## fields. That is the point of the format being shared.
+## WHAT THE ANSWERS MEAN
+##
+##   before ~0, after ~150 mV, edge     everything works. Go and write the
+##     at sample 100 every time         real config.
+##   edge at sample 0 or missing        'pretrigger' did not take, or the
+##                                      trigger fired on the wrong thing.
+##   both levels near 0                 either the cable is not in A, or
+##                                      'coupling' is ac - see the note on
+##                                      that line.
+##   levels a constant FACTOR out       a range problem: every segment 2x
+##     (all 2x, all 0.5x)               or 0.5x is the classic symptom of
+##                                      the wrong range index.
+##   levels flat-topped at +/-200 mV    the input clipped. The log warns
+##                                      about this by itself; widen
+##                                      'v_max'.
+##   first segments fine, later ones    look at the END of the file rather
+##     flat                             than the start - a padded trace is
+##                                      flat, and so is a dead cable.
+##                                      Check for a _dropped.txt first.
+##   "did not finish a capture within"  the trigger stopped firing part
+##                                      way through the 1000. With the
+##                                      generator running, suspect
+##                                      'timeout' before suspecting the
+##                                      scope - 1000 segments is a long
+##                                      wait by design.
+##
+## At +/-200 mV on an 8-bit unit one count is 1.56 mV, so expect the flat
+## levels to sit within a couple of mV of nominal and no closer. That is
+## resolution, not a fault - and it is why a real measurement uses the
+## narrowest range the signal fits inside. A 5000A can do better here
+## without changing the range at all; see the 'resolution' note below.
+##
+## Reload in MATLAB exactly as a LeCroy Sequence run: same .dat layout,
+## same .m fields, segments in the same order. That is the point of the
+## format being shared.
 
 ## ---------------------------------------------------------------------
-## THE SWEEP: ao0 over 0..5 V in 1 V steps, 6 points.
+## 100 REPEATS, so this is a scan and not a single shot.
 ##
-## Deliberately 0..5 and not 0..10, so the whole sweep sits inside the
-## +/-5 V scope range below and nothing has to be guessed about headroom.
-##
-## 'device Dev1' is whatever 'pydaq list' reported. 'restore' returns ao0
-## to 0 V when this loop ends rather than leaving the card driving 5 V
-## into the scope afterwards.
-##
-## Axis 98, not the default 99: 99 prints as "Z/piezo" in the log, which
-## would be misleading here. In a nested file the number no longer decides
-## the order - the nesting does - but it still names the axis in the log
-## and is what 'restore' belongs to.
+## 'count' is the loop here only because nothing physical should move
+## during a scope bring-up. A hundred passes over the same signal answer
+## the question one acquisition cannot: is it REPEATABLE, or did one of
+## them come back short, padded, or at a different amplitude. Compare the
+## passes, do not average them - which is exactly why this is 'count 100'
+## and not 'averages 100' inside the block below.
 ## ---------------------------------------------------------------------
-action d2a
-axis 98
-backend daqmx
-device Dev1
-channel 0
-units volts
-scan 0.0 5.0 1.0
-limits 0.0 5.0
-settle 0.01
-restore
+action count
+count 100
 
     ## -----------------------------------------------------------------
-    ## ONE CAPTURE AT EACH LEVEL. Inside the axis block, so it runs once
-    ## per voltage; that is the whole of what the nesting says.
+    ## ONE TRACE OF 1000 SEGMENTS PER REPEAT.
     ##
     ## Every setting is here because a USB scope has no front panel to
-    ## inherit one from - that is the difference from 'action scope'.
+    ## inherit one from - that is the difference from 'action scope', and
+    ## it is why nothing set in the GUI matters.
     ##
     ## 'series'/'serial' are commented out: with one unit attached pscan
     ## finds it and names it in the log. Uncomment and paste in what the
     ## error prints if you ever have two plugged in.
     ##
-    ## 'v_max 5.0' is the FULL SCALE in volts, so the range is +/-5 V.
-    ## pscan picks the narrowest range the unit offers that contains it,
-    ## and refuses rather than quietly widening if nothing fits. For a
-    ## real photodiode measurement, drop this to the smallest value your
-    ## signal fits inside: the range is the resolution.
+    ## 'v_max 0.15' is the FULL SCALE in volts, so this asks for a range
+    ## that reaches 150 mV and gets +/-200 mV, the narrowest rung that
+    ## contains it. Write the signal's real amplitude here and let pscan
+    ## pick; do not round up to a range yourself.
     ##
-    ## 'coupling dc' MATTERS HERE and is the classic bring-up trap: AC
-    ## coupling removes exactly the DC level this file is trying to
-    ## measure, so every trace would read ~0 V and look like a dead
-    ## cable.
+    ## 'coupling dc' MATTERS HERE and is the classic bring-up trap. This
+    ## square wave swings 0 to +150 mV, so its average is +75 mV: AC
+    ## coupling would subtract exactly that, shifting the trace to
+    ## +/-75 mV about ground - which also puts it under the 75 mV trigger
+    ## threshold below, so the capture would then time out rather than
+    ## read wrong. One wrong word, two symptoms.
     ##
-    ## 'trigger none' is deliberate, not an omission. A DC level has no
-    ## edge to trigger on, so each capture starts the moment pscan asks
-    ## for it. Writing it explicitly is what distinguishes "I meant
-    ## untriggered" from "I forgot" - leaving the line out does the same
-    ## thing but prints a config warning. For anything PULSED, see the
-    ## block at the bottom.
+    ## 'sample_rate 20e6' is a REQUEST. See the log note above: the unit
+    ## rounds it up to the nearest timebase it has, and scp.hint in the .m
+    ## is the interval actually used.
     ##
-    ## 1000 samples at 1 MS/s is a 1 ms record, far more than a DC level
-    ## needs; it is sized so --timer reports something representative of
-    ## a real capture rather than of an empty one.
+    ## 'n_samples 1000' is the record LENGTH, which replaces 5 us/div:
+    ## 1000 samples at 20 MS/s is 50 us, the same window as 5 us/div
+    ## across ten divisions. It is under half a period of a 10 kHz wave,
+    ## so a segment holds one rising edge and the high level after it -
+    ## see the note on the frequency check above.
+    ##
+    ## 'pretrigger 10' keeps the first 10% of the record (100 samples,
+    ## about 5 us) from BEFORE the trigger, so the low level and the
+    ## rising edge that started the capture are both in the data. With 0
+    ## the record starts at the edge and the first sample is already
+    ## climbing - and there would be nothing to check the edge placement
+    ## against.
+    ##
+    ## 'trigger A 0.075 rising' triggers on the signal itself. The level
+    ## is in VOLTS, absolute, not a percentage and not ADC counts, and
+    ## 75 mV is mid-swing of a 0..150 mV wave. Mid-swing on purpose: a
+    ## threshold near either flat level will double-trigger on overshoot
+    ## or ringing, and one outside the swing never fires at all. It must
+    ## also lie inside the range the source channel can see, which pscan
+    ## checks before arming.
+    ##
+    ## 'segments 1000' is the rapid capture depth - the GUI's Rapid
+    ## capture count, the PicoSDK's SetNoOfCaptures, and the same key as
+    ## 'captures'. A thousand separately triggered records are stored in
+    ## the unit's own memory and transferred over USB in one go, which is
+    ## the whole reason the mode exists: no software round trip between
+    ## segments. They are written as a thousand consecutive rows of the
+    ## .dat, exactly as LeCroy Sequence mode writes them, and
+    ## scp.multitraces records the thousand.
+    ##
+    ## Each segment still needs its own trigger. At 10 kHz the wave offers
+    ## a rising edge every 100 us while each record is 48 us long, so the
+    ## unit has roughly half a period to rearm in; whether it catches
+    ## every edge or every other one is a property of the model, not a
+    ## fault, and it sets whether a trace takes 100 ms or 200 ms. 'timeout'
+    ## below has to cover whichever it turns out to be.
+    ##
+    ## 'averages 1' keeps the segments separate. 'averages N' would mean
+    ## N segments into ONE written row, which is faster than N traces
+    ## because neither the stage nor the software ever sees them - but it
+    ## cannot be undone later, so it has no place in a bring-up. Note that
+    ## averages MULTIPLIES segments when the memory is split, so raising
+    ## it here is not free.
+    ##
+    ## 'timeout 10.0' is the wait for the WHOLE acquisition, all thousand
+    ## segments, not one - which is why it is 10 s here and not the 5 that
+    ## suits a single capture. A thousand triggers at 10 kHz is around
+    ## 0.1-0.2 s when the generator is running, so 10 s is roughly fifty
+    ## times the expected wait: long enough that only a real failure
+    ## reaches it, short enough that a dead generator does not stall the
+    ## run for a minute. A capture that does not finish in time is a
+    ## DROPPED trace, not a hang - see the bottom of this file.
+    ##
+    ## 'resolution 12' is commented out because it only exists on the
+    ## 5000A series, which has a switchable ADC; on anything else the line
+    ## is ignored with a warning. If this is a 5000A, uncomment it once
+    ## the run above is correct: 12 bits at 20 MS/s is well within what
+    ## the unit will do on one channel, and it turns 1.56 mV per count
+    ## into 0.1 mV per count on the same +/-200 mV range. Change one thing
+    ## at a time, though - not during first contact.
     ## -----------------------------------------------------------------
     action picoscope
     ## series ps5000a
     ## serial GQ123/456
+    ## resolution 12
     channels A
-    v_max 5.0
+    v_max 0.15
     coupling dc
-    sample_rate 1e6
+    sample_rate 20e6
     n_samples 1000
-    trigger none
-    captures 1
+    pretrigger 10
+    trigger A 0.075 rising
+    segments 1000
     averages 1
-    timeout 5.0
+    timeout 10.0
     end
 
 end
 
 ## ---------------------------------------------------------------------
-## WHERE 'count' WOULD GO, AND WHAT IT WOULD MEAN
+## A DROPPED TRACE IS NOT A HANG
 ##
-## Two placements, two different experiments. Both give 24 traces; they
-## are not the same measurement.
-##
-## AVERAGE EACH POINT - count inside the axis, around the scope block:
-##
-##   action d2a
-##   axis 98
-##   ...
-##       action count
-##       count 4
-##           action picoscope
-##           ...
-##           end
-##       end
-##   end
-##
-## REPEAT THE WHOLE SWEEP - count outside the axis. For a bring-up this
-## is the more useful of the two: it tells you whether trace N reads N
-## volts EVERY time, which is the drift and repeatability question, and
-## the four passes can be compared instead of averaged blindly:
-##
-##   action count
-##   count 4
-##       action d2a
-##       axis 98
-##       ...
-##           action picoscope
-##           ...
-##           end
-##       end
-##   end
-##
-## Note that averaging inside the scope block is a third thing again:
-## 'averages 100' means the UNIT captures 100 segments and pscan means
-## them into one written row, which is faster than four pscan traces
-## because the stage and the software never see them - but it also cannot
-## be undone later, and it says nothing about drift.
+## A capture that does not complete does not stop the run: after 'timeout'
+## seconds the whole trace is padded, its index is recorded in
+## bringup_picoscope_dropped.txt, and the scan carries on. Ten in a row
+## aborts it. If that file exists after a run, read it before analysing
+## anything - a padded trace looks like a flat line, which is also what a
+## dead cable looks like. At this depth that matters more than usual: one
+## missed trigger anywhere in a thousand pads the entire 2 MB trace, not
+## just the segment that missed.
 ##
 ## ---------------------------------------------------------------------
-## NEXT, ONCE THE ABOVE READS 0..5 V CORRECTLY
+## WHERE TO GO FROM HERE
 ##
-## Replace the picoscope block with something like this for a real pulsed
-## measurement. The nesting does not change.
+## ADD AN AXIS. Replace the 'count' block with the real scan axis and the
+## scope block does not change at all; that is the point of the nesting:
 ##
-##     action picoscope
-##     channels A, B
-##     v_max 0.2, 5.0          ## signal tight, monitor wide
-##     coupling dc, dc
-##     sample_rate 50e6
-##     n_samples 5000
-##     pretrigger 10           ## keep 10% of the record BEFORE the trigger
-##     trigger B 1.5 rising    ## or 'trigger ext 1.5 rising' for EXT in
-##     captures 1              ## segments WRITTEN per trace (scp.multitraces)
-##     averages 100            ## segments AVERAGED into each row (scp.n_averages)
-##     timeout 5.0             ## a missed trigger pads the trace and carries on
-##     end
+##   action apt_stage            ## or d2a, or pi_stage
+##   axis 0
+##   ...
+##       action picoscope
+##       ...
+##       end
+##   end
 ##
-## Two things to know before trusting that one:
+## Mind the arithmetic when you do: 1000 segments is 2 MB per coordinate,
+## so a 100 x 100 raster of this block is 20 GB. Segment depth is the
+## number to think hardest about in a real config, and it is the reason
+## this file is worth running before one gets written.
 ##
-##   * captures and averages both take more than one capture per trace.
-##     'captures' writes them all, as LeCroy Sequence mode does;
-##     'averages' means them into one row. They compose, and the ceiling
-##     is the unit's capture memory split that many ways - pscan asks and
-##     refuses with the numbers rather than shortening the record.
-##   * a trigger that never fires is a DROPPED trace, not a hang: after
-##     'timeout' seconds the trace is padded, its index is recorded in
-##     bringup_picoscope_dropped.txt, and the scan carries on. Ten in a
-##     row aborts the run. If that file exists after a scan, read it
-##     before analysing anything.
+## Keep 'count' as well if each point should be repeated - but mind WHERE
+## it goes. Inside the axis it repeats a point, outside it repeats the
+## whole scan; examples/nested_loops.con works that difference through.
+##
+## ADD THE SECOND CHANNEL. Per-channel keys take one value per channel,
+## in the order 'channels' lists them:
+##
+##   channels A, B
+##   v_max 0.15, 5.0           ## signal tight, monitor wide
+##   coupling dc, dc
+##   trigger A 0.075 rising    ## still on A; B just rides along
+##
+## Both channels are transferred in full for every segment, so this
+## doubles both the file and the USB cost per trace - 4 MB a trace here.
+## It also halves the capture memory available per segment, which at this
+## depth is the limit you will meet first.
